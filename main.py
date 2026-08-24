@@ -1,10 +1,11 @@
+# Full system test
+
 import time
 import sys
 
 from gpiozero import Buzzer
-from gpiozero import OutputDevice
-from hardware.motor import Motor
-from hardware.dual_camera import DualCamera
+from hardware import Motor
+from hardware import DualCamera,Relay
 
 
 def test_buzzer():
@@ -28,7 +29,7 @@ def test_relay():
     print("\n[2/5] === Testing Relay (Lighting/Trigger) ===")
     try:
         # NOTE: If your relay turns ON when LOW, change active_high to False
-        relay = OutputDevice(pin=17, active_high=True, initial_value=False)
+        relay = Relay(pin=17, active_high=True, initial_value=False)
 
         print("Turning relay ON...")
         relay.on()
@@ -85,7 +86,7 @@ def test_system_integration():
     print("Simulating a 3D Scan sequence...")
     try:
         buzzer = Buzzer(pin=22)
-        lights = OutputDevice(pin=17, active_high=True, initial_value=False)
+        lights = Relay(pin=17, active_high=True, initial_value=False)
         motor = Motor(dir_pin=20, step_pin=21, mode_pins=(14, 15, 18))
         hw_cam = DualCamera(camera_id0=0, camera_id1=1)
 
@@ -113,7 +114,7 @@ def test_system_integration():
 
         # 6. Shut down step
         print("6. Shutting off lights and signaling completion...")
-        lights.turn_off()
+        lights.off()
         buzzer.beep(on_time=0.1, off_time=0.1, n=2)
 
         # Cleanup
@@ -149,3 +150,89 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+#### Motor Test
+
+# import time
+
+# from hardware.motor import Motor
+
+
+# motor_x = Motor(dir_pin=20, step_pin=21)
+
+# print("Pornire motor...")
+# motor_x.enable()
+# while True:
+#     # Un Nema17 standard are 200 de pași pe rotație completă (fără microstepping)
+#     print("Se rotește 200 de pași în sens orar...")
+#     motor_x.move(steps=200, clockwise=True, delay=0.01)
+
+#     time.sleep(1)
+
+#     print("Se rotește 400 de pași în sens anti-orar, mai rapid...")
+#     motor_x.move(steps=400, clockwise=False, delay=0.01)
+
+#     time.sleep(1)
+
+
+
+#### 100% working Motor test
+# from gpiozero import DigitalOutputDevice
+# from time import sleep
+#
+# # Definim pinii de control
+# # ATENȚIE: Înlocuiește aceste numere cu pinii GPIO reali pe care îi folosești pe Raspberry Pi!
+# # Exemplu: dacă folosești pinii de data trecută, pune STEP_PIN = 21, DIR_PIN = 20.
+# STEP_PIN = 21
+# DIR_PIN = 20
+# EN_PIN = 16
+#
+# # Setăm pinii ca ieșiri
+# step_pin = DigitalOutputDevice(STEP_PIN)
+# dir_pin = DigitalOutputDevice(DIR_PIN)
+# en_pin = DigitalOutputDevice(EN_PIN)
+#
+# # Activăm motorul (DRV8825 este activ pe starea LOW)
+# en_pin.off()
+#
+# print("Sistem pornit. Incepem testul in 2 secunde...")
+# sleep(2)
+#
+# try:
+#     # Echivalentul funcției loop() din Arduino
+#     while True:
+#         # --- ROTAȚIE ÎNTR-UN SENS ---
+#         print("-> Motorul ar trebui sa se invarta la DREAPTA (sens orar)...")
+#         dir_pin.on()
+#
+#         # Executăm 200 de pași
+#         for _ in range(1000):
+#             step_pin.on()
+#             sleep(0.001)  # 1000 microsecunde = 0.001 secunde
+#             step_pin.off()
+#             sleep(0.001)
+#
+#         print("-> Pauza de 1 secunda. Motorul sta pe loc.")
+#         sleep(1)
+#
+#         # --- ROTAȚIE ÎN SENS OPUS ---
+#         print("-> Motorul ar trebui sa se invarta la STANGA (sens anti-orar)...")
+#         dir_pin.off()
+#
+#         # Executăm 200 de pași înapoi
+#         for _ in range(1000):
+#             step_pin.on()
+#             sleep(0.001)
+#             step_pin.off()
+#             sleep(0.001)
+#
+#         print("-> Pauza. Ciclul s-a terminat.")
+#         print("-----------------------------------")
+#         sleep(2)
+#
+# except KeyboardInterrupt:
+#     # Când apeși CTRL+C pentru a opri scriptul, tăiem curentul la motor pentru siguranță
+#     print("\nTest oprit de utilizator. Dezactivare motor.")
+#     en_pin.on()

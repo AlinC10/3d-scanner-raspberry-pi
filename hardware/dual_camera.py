@@ -1,7 +1,7 @@
 import time
 import threading
 from typing import Optional
-from camera import Camera
+from .camera import Camera
 
 
 class DualCamera:

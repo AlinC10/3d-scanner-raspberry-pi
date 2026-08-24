@@ -19,6 +19,11 @@ Currently, the development is focused strictly on the **CLI/Hardware layer**. AP
 *   **Optics:** 2x Arducam B0272 12MP IMX477 Motorized Focus HQ Cameras. 
     *   Mounted on a horizontal bracket at a 30° to 45° angle to each other.
     *   Hardware synchronized via XVS (Master-Slave configuration) to ensure simultaneous capture from both angles.
+    *   Features
+        *   12MP IMX477 High Quality Camera - The same image sensor used in Raspberry Pi High Quality Camera. Natively works with existing commands, codes and examples.
+        *   I2C Focus Control - The focusing process is controlled via software instead of your bare hands. Use keyboard arrows keys to adjust the focus to the best or OpenCV autofocus examples to automate it.
+        *   Focus Distance: 80mm to infinity
+
 *   **Kinematics (Motors & Mechanics):** 2x NEMA17 Stepper Motors (1.5A, 1.8°/step) driven by **DRV8825** drivers.
     *   **Z-Axis Motor:** Moves the dual-camera bracket vertically. Uses a T8x8 (P2) trapezoidal lead screw with an MGN9 linear guide rail system.
     *   **Turntable Motor:** Rotates the central scanning platform. Supported by a heavy-duty unidirectional axial bearing (120/155mm).
@@ -73,6 +78,6 @@ The system supports two hardcoded sequences that the AI must help implement and 
 
 ## 5. AI CODING GUIDELINES & CONSTRAINTS
 *   **Hardware Isolation:** Keep all GPIO and hardware-specific logic inside the `/hardware` directory classes. `main.py` should only instantiate these objects and call high-level methods like `scanner.start_object_scan()`.
-*   **Libraries:** Rely on `picamera2` for optics and `RpiMotorLib` for steppers. Assume standard Python built-ins (`time`, `os`, `threading`) are available; do not list them as requirements unless explaining a specific concurrency model.
+*   **Libraries:** Rely on `picamera2` for optics and `RpiMotorLib` for steppers. Assume standard Python built-ins (`time`, `os`, `threading`) are available; do not list them as requirements unless explaining a specific concurrency model. Check every library used to be compatible with the `Raspberry PI 5` (can check library documentation, GitHub repository), and if is not compatible, do not use it and search for alternatives.
 *   **Non-blocking Execution:** The hardware sequences (especially camera capture) must be designed to eventually allow concurrent operations (e.g., adding pictures to a queue for background cloud upload). Use threading or asyncio where appropriate, but keep the initial CLI implementations simple and robust.
 *   **Error Handling:** Motors missing steps, endstops failing, or cameras dropping frames must be caught. Provide safe fallbacks (e.g., immediately stop motors if a limit switch is bypassed).
