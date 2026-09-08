@@ -3,29 +3,33 @@
 ## 📋 Task Breakdown 
 
 ### 🔧 HARDWARE (Real-World Actions)
-* [ ] [Line the MDF Enclosure & Turntable with Black Velvet](#hw-velvet)
+* [ ] [Prep environment for flipped scanning (Undercuts)](#hw-flipped)
 * [ ] [Surface the Turntable with Matte Black Rubber / Silicone](#hw-rubber)
 * [ ] [Implement Hardware Cross-Polarization (Kill Glare)](#hw-polarization)
-* [ ] [Prep environment for flipped scanning (Undercuts)](#hw-flipped)
+* [ ] [Line the MDF Enclosure & Turntable with Black Velvet](#hw-velvet)
 
 ### 💻 SOFTWARE (Code, Cloud, Automation)
+* [ ] [Lock AE, AWB, and Focus before scanning](#sw-ae-awb)
+* [ ] [Set output format to High-Quality JPEG](#sw-jpeg)
+* [ ] [Add "Backlash Compensation" for Lens Motor](#sw-backlash)
+* [ ] [Enforce strict "No Digital Zoom" policy](#sw-zoom)
+* [ ] [Setup Concurrent Streams and "Stop-Settle-Shoot" logic](#sw-stop-settle)
+* [ ] [File & Metadata Processing (Pre-Meshroom)](#sw-metadata)
+* [ ] [Build an Asynchronous Upload Queue](#sw-upload)
+* [ ] [Implement Mode 1: Universal Mode (24cm Fixed Focus)](#sw-mode1)
 * [ ] [Configure turntable for 18° jumps](#sw-turntable)
 * [ ] [Implement Z-Axis top detection (OpenCV)](#sw-zaxis)
-* [ ] [Add "Backlash Compensation" for Lens Motor](#sw-backlash)
-* [ ] [Lock AE, AWB, and Focus before scanning](#sw-ae-awb)
-* [ ] [Enforce strict "No Digital Zoom" policy](#sw-zoom)
 * [ ] [Perform OpenCV Pre-calculated Lens Calibration](#sw-calibration)
-* [ ] [Set output format to High-Quality JPEG](#sw-jpeg)
 * [ ] [Optional: Downscale resolution to 6MP for faster processing](#sw-downscale)
-* [ ] [Setup Concurrent Streams and "Stop-Settle-Shoot" logic](#sw-stop-settle)
-* [ ] [Implement Mode 1: Universal Mode (24cm Fixed Focus)](#sw-mode1)
 * [ ] [Implement Mode 2: High-Fidelity Mode (Focus Stacking)](#sw-mode2)
 * [ ] [Implement Hybrid Enfuse Stacking Pipeline](#sw-enfuse)
 * [ ] [Implement 3-Step Process Throttling for `enfuse`](#sw-throttle)
 * [ ] [Implement "Blur Rejector" Safety Check](#sw-blur)
-* [ ] [Build an Asynchronous Upload Queue](#sw-upload)
-* [ ] [Configure a Custom Bounding Box in Meshroom](#sw-bbox)
-* [ ] [Implement "Empty Box" Automatic Masking](#sw-emptybox)
+
+### 🧹 Potentially Not Needed with Meshroom 2025.1 Turntable Pipeline
+* [ ] [Configure a Custom Bounding Box in Meshroom](#sw-bbox) *(Redundant: AI masking removes the MDF background natively)*
+* [ ] [Implement "Empty Box" Automatic Masking](#sw-emptybox) *(Redundant: Handled automatically by the Segment Anything pipeline)*
+
 
 ---
 
@@ -104,6 +108,15 @@ cam.set_controls({
 
 ## 4. 🧠 Software: Capture Logic & Working Modes
 *Status: Python CLI Scripting* | *Depends on: Cameras and Motors calibrated*
+<a id="sw-metadata"></a>
+* [ ] **File & Metadata Processing (Pre-Meshroom)**
+*   **Details:**
+       *   [ ] **EXIF Modification (Python Script):** Write a Python script to modify the `Camera Model` metadata field (e.g., from "IMX477" to "IMX477_Cam2") exclusively for Camera 2's photos. This forces Meshroom to calculate distinct lens profiles for the slight focus differences.
+       *   [ ] **File name synchronization:** Ensure that photos taken at the exact same moment (same turntable angle) have identical names for both cameras (e.g., both should be named `0001.jpg`).
+       *   [ ] **Rig folder structure setup:** Arrange the images into the required folder hierarchy to "lock" the 30° angle between the cameras. Documentation: [Multi-Camera Rig Meshroom](https://meshroom-manual.readthedocs.io/en/latest/faq/multi-camera-rig/multi-camera-rig.html)
+    *   Parent folder `rig/`
+    *   Sub-folder `rig/0/` -> contains Camera 1 images
+    *   Sub-folder `rig/1/` -> contains Camera 2 images (with the modified metadata)
 
 <a id="sw-stop-settle"></a>
 * [ ] **Setup Concurrent Streams and "Stop-Settle-Shoot" logic**
@@ -204,6 +217,12 @@ upload_queue.put(None)
 uploader_thread.join()
 ```
 
+<a id="hw-flipped"></a>
+* [ ] **Prep environment for flipped scanning (Undercuts)**
+* **Details:** To scan undercuts, you will need to scan the object, flip it, and scan it again. When processing both halves of an object (right-side up and upside down), dump all photos into Meshroom simultaneously as a single batch. It will automatically detect overlapping textures and seal the mesh.
+
+
+## 6. 🧹 Potentially Not Needed with Meshroom 2025.1 Turntable Pipeline
 <a id="sw-bbox"></a>
 * [ ] **Configure a Custom Bounding Box in Meshroom (`Meshing` Node)**
 * **Details:** Meshroom is "scale agnostic" and cannot natively ignore things "past 35cm". Because your hardware is fixed inside an MDF box, apply a **Custom Bounding Box** inside the Meshroom pipeline.
@@ -234,7 +253,3 @@ Open your `.mg` JSON template and inject those parameters into the `Meshing` nod
 <a id="sw-emptybox"></a>
 * [ ] **Implement "Empty Box" Automatic Masking**
 * **Details:** Even with Black Velvet, dust or seams might be visible due to the 15° camera tilt. Once the scan is complete and the object is removed, take one final "Empty Box" photo of the bare turntable. Upload this empty frame alongside the dataset. Meshroom uses this as a direct comparative mask to automatically erase any static background noise instantly on the RTX 5090.
-
-<a id="hw-flipped"></a>
-* [ ] **Prep environment for flipped scanning (Undercuts)**
-* **Details:** To scan undercuts, you will need to scan the object, flip it, and scan it again. When processing both halves of an object (right-side up and upside down), dump all photos into Meshroom simultaneously as a single batch. It will automatically detect overlapping textures and seal the mesh.
