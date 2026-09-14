@@ -1,242 +1,244 @@
-import time
-import threading
-from typing import Optional
-from .camera import Camera
+import logging
+from typing import Optional, List, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
+from camera import ArducamIMX477
+from camera.config import (
+    DEFAULT_QUALITY, 
+    DEFAULT_PHOTO_RESOLUTION, 
+    DEFAULT_VIDEO_RESOLUTION, 
+    DEFAULT_PREVIEW_RESOLUTION
+)
+
+log = logging.getLogger(__name__)
 
 class DualCamera:
     """
-    Controls two cameras simultaneously using threading to minimize capture delay.
-    Perfect for stereo 3D scanning.
+    Controls two Arducam IMX477 cameras simultaneously using multi-threading.
+    
+    This is intended to be used before migrating to a hardware-synchronized 
+    XVS (Master-Slave) configuration. It provides a thread pool to dispatch
+    identical commands (capture, focus, config) to both cameras in parallel.
     """
 
-    def __init__(self, camera_id0: int = 0, camera_id1: int = 1) -> None:
-        """
-        Initialize dual camera controllers.
-
-        :param camera_id0: CSI port index for the first camera (defaults to 0).
-        :type camera_id0: int
-        :param camera_id1: CSI port index for the second camera (defaults to 1).
-        :type camera_id1: int
-        """
-        print("Initializing Dual Cameras... (This may take a few seconds)")
-        self.cam0: Camera = Camera(camera_id=camera_id0)
-        self.cam1: Camera = Camera(camera_id=camera_id1)
-        print("Both cameras initialized successfully.")
-
-    def take_photos(self, path0: str = "cam0_photo.jpg", path1: str = "cam1_photo.jpg") -> None:
-        """
-        Triggers both cameras simultaneously using threads.
-
-        :param path0: File path to save the photo from camera 0.
-        :type path0: str
-        :param path1: File path to save the photo from camera 1.
-        :type path1: str
-        """
-        t0 = threading.Thread(target=self.cam0.take_photo, args=(path0,))
-        t1 = threading.Thread(target=self.cam1.take_photo, args=(path1,))
-
-        t0.start()
-        t1.start()
-
-        # Wait for both independent captures to finish
-        t0.join()
-        t1.join()
-        print(f"Dual capture complete: {path0} & {path1}")
-
-    def start_dual_video(
+    def __init__(
         self,
-        path0: str = "cam0_vid.mp4",
-        path1: str = "cam1_vid.mp4",
-        duration_sec: int = 5,
-    ) -> None:
+        camera_id_1: int = 0,
+        camera_id_2: int = 1,
+        quality: int = DEFAULT_QUALITY,
+        size: Optional[Tuple[int, int]] = None,
+        video_size: Optional[Tuple[int, int]] = None,
+        preview_size: Optional[Tuple[int, int]] = None,
+        rotation_1: int = 0,
+        rotation_2: int = 0,
+    ):
         """
-        Records video on both cameras simultaneously.
-
-        :param path0: File path to save the video from camera 0.
-        :type path0: str
-        :param path1: File path to save the video from camera 1.
-        :type path1: str
-        :param duration_sec: Duration in seconds to record video.
-        :type duration_sec: int
+        Initializes the dual camera setup.
         """
-        t0 = threading.Thread(target=self.cam0.start_video, args=(path0, duration_sec))
-        t1 = threading.Thread(target=self.cam1.start_video, args=(path1, duration_sec))
+        log.info("Initializing DualCamera (CSI %d and %d)", camera_id_1, camera_id_2)
+        
+        self.cam1 = ArducamIMX477(
+            camera_id=camera_id_1, 
+            quality=quality, 
+            size=size,
+            video_size=video_size,
+            preview_size=preview_size,
+            rotation=rotation_1
+        )
+        self.cam2 = ArducamIMX477(
+            camera_id=camera_id_2, 
+            quality=quality, 
+            size=size,
+            video_size=video_size,
+            preview_size=preview_size,
+            rotation=rotation_2
+        )
+        
+        self.cameras = [self.cam1, self.cam2]
+        
+        # Use a ThreadPoolExecutor with 2 workers to run camera operations concurrently
+        self._executor = ThreadPoolExecutor(max_workers=2)
 
-        t0.start()
-        t1.start()
-        t0.join()
-        t1.join()
+    def __enter__(self):
+        return self
 
-    def auto_focus(self) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Shutdown the thread pool and safely close both cameras."""
+        self._executor.shutdown(wait=True)
+        for cam in self.cameras:
+            cam.close()
+        log.info("DualCamera closed.")
+
+    # ── Properties ───────────────────────────────────────────────────────────
+
+    @property
+    def quality(self) -> int:
+        return self.cam1.quality
+
+    @quality.setter
+    def quality(self, quality: int):
+        self.cam1.quality = quality
+        self.cam2.quality = quality
+
+    # ── Configuration & State ────────────────────────────────────────────────
+
+    def rotate(self, direction: str) -> List[int]:
+        """Rotates both cameras."""
+        futures = [self._executor.submit(cam.rotate, direction) for cam in self.cameras]
+        return [f.result() for f in futures]
+
+    def apply_settings(self, **kwargs):
+        """Apply image controls (exposure, gain, awb, etc.) to both cameras concurrently."""
+        futures = [self._executor.submit(cam.apply_settings, **kwargs) for cam in self.cameras]
+        for f in futures:
+            f.result()
+
+    def prepare_scan(self, **kwargs) -> List[dict]:
         """
-        Autofocuses both cameras simultaneously.
+        Prepare and lock both cameras concurrently for scanning.
+        You can pass `focus=(300, 500)` to set different focus values on each camera.
         """
-        t0 = threading.Thread(target=self.cam0.auto_focus)
-        t1 = threading.Thread(target=self.cam1.auto_focus)
-        t0.start()
-        t1.start()
-        t0.join()
-        t1.join()
+        focus_val = kwargs.pop("focus", None)
+        
+        if isinstance(focus_val, (tuple, list)) and len(focus_val) == 2 and isinstance(focus_val[0], (int, str, type(None))):
+            # If a valid tuple is passed, give each camera its own focus parameter
+            kwargs1 = kwargs.copy()
+            kwargs1["focus"] = focus_val[0]
+            
+            kwargs2 = kwargs.copy()
+            kwargs2["focus"] = focus_val[1]
+            
+            f1 = self._executor.submit(self.cam1.prepare_scan, **kwargs1)
+            f2 = self._executor.submit(self.cam2.prepare_scan, **kwargs2)
+            return [f1.result(), f2.result()]
+        else:
+            # Pass the exact same focus value (int, "auto", or None) to both
+            kwargs["focus"] = focus_val
+            futures = [self._executor.submit(cam.prepare_scan, **kwargs) for cam in self.cameras]
+            return [f.result() for f in futures]
 
-    def fix_focus(self, focus_value: float | int = 5.0) -> None:
+    def lock_auto_features(self, settle_time: float = 2.0) -> List[dict]:
+        """Lock the current AE/AWB settings on both cameras concurrently."""
+        futures = [self._executor.submit(cam.lock_auto_features, settle_time) for cam in self.cameras]
+        return [f.result() for f in futures]
+
+    # ── Focus ────────────────────────────────────────────────────────────────
+
+    def focus_set(self, position: int | Tuple[int, int]):
         """
-        Sets same manual focus on both cameras.
-
-        :param focus_value: Manual focus distance / lens position value.
-        :type focus_value: float
+        Set absolute focus position.
+        Pass an int to set both cameras to the same position.
+        Pass a tuple like (300, 400) to set independent positions for cam1 and cam2.
         """
-        self.cam0.fix_focus(focus_value)
-        self.cam1.fix_focus(focus_value)
-
-    def lock_exposure(self) -> None:
+        if isinstance(position, (tuple, list)) and len(position) == 2:
+            f1 = self._executor.submit(self.cam1.focus_set, position[0])
+            f2 = self._executor.submit(self.cam2.focus_set, position[1])
+            f1.result(); f2.result()
+        else:
+            futures = [self._executor.submit(cam.focus_set, position) for cam in self.cameras]
+            for f in futures:
+                f.result()
+            
+    def focus_step(self, delta: int | Tuple[int, int]):
         """
-        Locks exposure on both cameras.
+        Step focus by delta.
+        Pass an int to step both cameras equally.
+        Pass a tuple like (10, -10) to step them independently.
         """
-        self.cam0.lock_exposure()
-        self.cam1.lock_exposure()
+        if isinstance(delta, (tuple, list)) and len(delta) == 2:
+            f1 = self._executor.submit(self.cam1.focus_step, delta[0])
+            f2 = self._executor.submit(self.cam2.focus_step, delta[1])
+            f1.result(); f2.result()
+        else:
+            futures = [self._executor.submit(cam.focus_step, delta) for cam in self.cameras]
+            for f in futures:
+                f.result()
 
-    def auto_exposure(self) -> None:
-        """
-        Re-enables auto exposure on both cameras.
-        """
-        self.cam0.auto_exposure()
-        self.cam1.auto_exposure()
+    def focus_reset(self):
+        """Reset focus to infinity for both cameras concurrently."""
+        futures = [self._executor.submit(cam.focus_reset) for cam in self.cameras]
+        for f in futures:
+            f.result()
 
-    def close(self) -> None:
-        """
-        Closes both cameras properly.
-        """
-        print("Shutting down Dual Cameras...")
-        self.cam0.close()
-        self.cam1.close()
+    def focus_sweep_autofocus(self, step: int = 30, roi: tuple = (0.3, 0.3, 0.4, 0.4)) -> List[int]:
+        """Perform software sweep autofocus on both cameras concurrently."""
+        futures = [self._executor.submit(cam.focus_sweep_autofocus, step=step, roi=roi) for cam in self.cameras]
+        return [f.result() for f in futures]
 
+    # ── Capture ──────────────────────────────────────────────────────────────
 
-class HardwareSyncDualCamera:
-    """
-    Controls two cameras simultaneously using PERFECT 0-millisecond hardware sync (XVS pins).
-    Prerequisites:
-    1. XVS and GND pins are physically jumped via wire between both cameras.
-    2. Pi /boot/firmware/config.txt is configured to set cam1 as the Sync Slave.
-    """
-
-    def __init__(self, master_id: int = 0, slave_id: int = 1) -> None:
-        """
-        Initialize hardware-synchronized dual cameras.
-
-        :param master_id: Camera ID for the master camera (defaults to 0).
-        :type master_id: int
-        :param slave_id: Camera ID for the slave camera (defaults to 1).
-        :type slave_id: int
-        """
-        print("Initializing Hardware-Synced Dual Cameras...")
-        self.master_id: int = master_id
-        self.slave_id: int = slave_id
-
-        self.master_cam: Optional[Camera] = None
-        self.slave_cam: Optional[Camera] = None
-
-        # CRITICAL STARTUP SEQUENCE FOR HARDWARE SYNC:
-        # A slave camera strictly wait for the XVS electrical pulse from the master to begin streaming frames.
-        # If the master starts before the slave is listening, the slave might timeout and crash.
-        # If the slave is initiated normally, it will "hang" blocking the code until the master starts.
-        # Therefore, we MUST start them using background threads so they initialize properly.
-
-        def start_slave() -> None:
-            print(f"[Hardware Sync] Starting Slave Camera ({self.slave_id}) - Waiting for XVS...")
-            self.slave_cam = Camera(camera_id=self.slave_id)
-
-        def start_master() -> None:
-            print(f"[Hardware Sync] Starting Master Camera ({self.master_id}) - Sending XVS pulse...")
-            self.master_cam = Camera(camera_id=self.master_id)
-
-        # 1. Placed Slave camera in a listening/waiting state
-        t_slave = threading.Thread(target=start_slave)
-        t_slave.start()
-
-        # 2. Give the OS a tiny fraction of a second to ensure the Slave is fully waiting
-        time.sleep(0.1)
-
-        # 3. Start the Master camera (sending the XVS pulse, waking up the slave perfectly in sync)
-        t_master = threading.Thread(target=start_master)
-        t_master.start()
-
-        # Wait until both are fully online
-        t_slave.join()
-        t_master.join()
-        print("Hardware Sync Cameras initialized successfully! Streams are locked together.")
-
-    def take_photos(
+    def capture_photo(
         self,
-        master_path: str = "cam0_photo.jpg",
-        slave_path: str = "cam1_photo.jpg",
-    ) -> None:
+        output_prefix: str = "dual_photo",
+        output_dir: str = ".",
+        meshroom_rig: bool = True,
+        resolution=None,
+        quality: Optional[int] = None,
+        raw: bool = False,
+        show_preview: bool = False,
+        preview_duration: float = 2.0,
+    ) -> List[str]:
         """
-        Triggers both cameras. The python trigger delay doesn't matter anymore,
-        because the cameras' hardware buffers are perfectly frame-locked by the XVS wire.
+        Capture photos from both cameras concurrently.
+        If meshroom_rig=True, outputs will be saved to output_dir/0/ and output_dir/1/
+        with identical filenames for proper Meshroom rig detection.
+        
+        Returns:
+            List of saved JPEG file paths.
+        """
+        import os
+        futures = []
+        
+        for cam in self.cameras:
+            if meshroom_rig:
+                # Create the rig folders (0 and 1)
+                rig_folder = os.path.join(output_dir, str(cam.camera_id))
+                os.makedirs(rig_folder, exist_ok=True)
+                # Meshroom requires identical filenames in different folders
+                out_file = os.path.join(rig_folder, f"{output_prefix}.jpg")
+            else:
+                out_file = os.path.join(output_dir, f"{output_prefix}_cam{cam.camera_id}.jpg")
+                
+            f = self._executor.submit(
+                cam.capture_photo,
+                output=out_file,
+                resolution=resolution,
+                quality=quality,
+                raw=raw,
+                show_preview=show_preview,
+                preview_duration=preview_duration
+            )
+            futures.append(f)
+            
+        return [f.result() for f in futures]
 
-        :param master_path: File path to save master camera image.
-        :type master_path: str
-        :param slave_path: File path to save slave camera image.
-        :type slave_path: str
+    def record_video(
+        self,
+        output_prefix: str = "dual_video",
+        duration: float = 10.0,
+        resolution=None,
+        quality: int = 25,
+    ) -> List[str]:
         """
-        # We still use threads so Python doesn't block sequentially,
-        # but the actual image capture timing is governed by the linked sensors.
-        t_slave = threading.Thread(target=self.slave_cam.take_photo, args=(slave_path,))
-        t_master = threading.Thread(target=self.master_cam.take_photo, args=(master_path,))
-
-        # Slave readies first, then master triggers
-        t_slave.start()
-        time.sleep(0.01)
-        t_master.start()
-
-        t_slave.join()
-        t_master.join()
-        print(f"Perfect Hardware Sync capture complete: {master_path} & {slave_path}")
-
-    def auto_focus(self) -> None:
+        Record videos from both cameras concurrently.
+        Outputs will be automatically suffixed with their respective camera IDs.
+        
+        Returns:
+            List of saved MP4 file paths.
         """
-        Autofocuses both cameras simultaneously.
-        """
-        t_slave = threading.Thread(target=self.slave_cam.auto_focus)
-        t_master = threading.Thread(target=self.master_cam.auto_focus)
-
-        t_slave.start()
-        t_master.start()
-        t_slave.join()
-        t_master.join()
-
-    def fix_focus(self, focus_value: float| int = 5.0) -> None:
-        """
-        Sets same manual focus on both cameras.
-
-        :param focus_value: Manual focus distance / lens position value.
-        :type focus_value: float
-        """
-        self.slave_cam.fix_focus(focus_value)
-        self.master_cam.fix_focus(focus_value)
-
-    def lock_exposure(self) -> None:
-        """
-        Locks exposure on both cameras.
-        """
-        self.slave_cam.lock_exposure()
-        self.master_cam.lock_exposure()
-
-    def auto_exposure(self) -> None:
-        """
-        Re-enables auto exposure on both cameras.
-        """
-        self.slave_cam.auto_exposure()
-        self.master_cam.auto_exposure()
-
-    def close(self) -> None:
-        """
-        Closes both cameras properly.
-        """
-        print("Shutting down Hardware Sync Dual Cameras...")
-        # Master should stop streaming first to stop pulsing,
-        # or Slave stopped first. Usually stopping slave first is safer
-        # so it doesn't crash when XVS disappears.
-        self.slave_cam.close()
-        self.master_cam.close()
+        futures = []
+        for cam in self.cameras:
+            out_file = f"{output_prefix}_cam{cam.camera_id}.mp4"
+            f = self._executor.submit(
+                cam.record_video,
+                output=out_file,
+                duration=duration,
+                resolution=resolution,
+                quality=quality
+            )
+            futures.append(f)
+            
+        return [f.result() for f in futures]

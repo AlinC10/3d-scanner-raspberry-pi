@@ -1,6 +1,8 @@
 .venv
 .env
 
+.lgd-nfy0
+
 __pycache__
 **/__pycache__
 *.py[cod]
