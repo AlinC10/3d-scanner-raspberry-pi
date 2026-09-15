@@ -2,7 +2,6 @@ import os
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from database import db 
-from ocr_processing import extract_text_ocr
 
 def delete_document_from_db(filename, delete_physically=True):
     print(f"\n--- [DELETE] Starting deletion for: {filename} ---")
@@ -40,13 +39,6 @@ def process_document(file_path):
     if extension == 'pdf':
         loader = PyPDFLoader(file_path)
         documents = loader.load()
-        
-        extracted_text = "".join([doc.page_content for doc in documents]).strip()
-        if len(extracted_text) < 50:
-            ocr_documents = extract_text_ocr(file_path)
-            if ocr_documents: 
-                documents = ocr_documents
-                
     elif extension == 'docx':
         loader = Docx2txtLoader(file_path)
         documents = loader.load()
