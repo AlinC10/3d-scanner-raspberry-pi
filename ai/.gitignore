@@ -1,0 +1,4 @@
+.env
+uploads/
+chroma_database/
+__pycache__/
