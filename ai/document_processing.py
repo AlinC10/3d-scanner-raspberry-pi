@@ -27,15 +27,16 @@ def delete_document_from_db(filename, delete_physically=True):
         
     return False
 
+
 def process_document(file_path):
     filename = os.path.basename(file_path)
     print(f"\n--- [UPLOAD] Starting processing for: {filename} ---")
-    
+
     delete_document_from_db(filename, delete_physically=False)
-    
+
     extension = filename.split('.')[-1].lower()
     documents = []
-    
+
     if extension == 'pdf':
         loader = PyPDFLoader(file_path)
         documents = loader.load()
@@ -47,14 +48,23 @@ def process_document(file_path):
         documents = loader.load()
     else:
         raise Exception(f"Extension .{extension} is not supported.")
-        
+
     if not documents or all(len(doc.page_content.strip()) == 0 for doc in documents):
         raise Exception("Could not extract text from document (it is completely empty or an unreadable image).")
-        
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_documents(documents)
-    
-    db.add_documents(chunks)
-    print(f"[SUCCESS] Saved {len(chunks)} fresh chunks!\n")
-    
-    return len(chunks)
+
+    # ---> FILTRUL NOU ADAUGAT <---
+    # Eliminam orice fragment gol, cu tip gresit (None) sau care contine doar spatii libere
+    valid_chunks = [chunk for chunk in chunks if
+                    chunk.page_content and isinstance(chunk.page_content, str) and chunk.page_content.strip()]
+
+    if not valid_chunks:
+        raise Exception("Nu am putut genera fragmente de text valide din acest document.")
+
+    # Adaugam in baza de date doar fragmentele validate
+    db.add_documents(valid_chunks)
+    print(f"[SUCCESS] Saved {len(valid_chunks)} fresh chunks!\n")
+
+    return len(valid_chunks)
