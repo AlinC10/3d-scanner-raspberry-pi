@@ -12,3 +12,4 @@ def get_system_connectivity_status():
         "ethernet": ethernet.get_status()
     }
 ```
+* [ ] **Save network credentials and verify them before asking for the password** 

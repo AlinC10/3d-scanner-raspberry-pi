@@ -46,6 +46,12 @@ To stream video to mobile devices with ultra-low latency and low CPU usage, we u
    tar -xvzf mediamtx_v1.6.0_linux_arm64v8.tar.gz
    ./mediamtx
    ```
+   
+### Camera rotation front-end
+```html
+<!-- Instant, 0% Pi CPU overhead rotation -->
+<video src="..." style="transform: rotate(90deg);"></video>
+```
 
 ### FastAPI Server Integration
 

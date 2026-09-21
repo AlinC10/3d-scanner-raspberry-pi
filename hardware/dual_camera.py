@@ -242,3 +242,19 @@ class DualCamera:
             futures.append(f)
             
         return [f.result() for f in futures]
+
+    def start_stream(self, bitrate: int = 2_000_000):
+        if not isinstance(bitrate, int):
+            raise TypeError("Bitrate needs to be an integer (int)")
+
+        futures = []
+        for cam in self.cameras:
+            f = self._executor.submit(cam.start_stream, bitrate=bitrate)
+            futures.append(f)
+
+        # return URL to the streams
+        return [f.result() for f in futures]
+
+    def stop_stream(self):
+        for cam in self.cameras:
+            self._executor.submit(cam.start_stream)

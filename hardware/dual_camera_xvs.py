@@ -105,6 +105,24 @@ class DualCameraXVS:
         
         return [f_master.result(), f_slave.result()]
 
+    def start_stream(self, bitrate: int = 2_000_000):
+        if not isinstance(bitrate, int):
+            raise TypeError("Bitrate needs to be an integer (int)")
+
+        f_slave = self._executor.submit(self.slave.start_stream, bitrate=bitrate)
+
+        time.sleep(0.1)
+
+        f_master = self._executor.submit(self.master.start_stream, bitrate=bitrate)
+
+        # return URL to the streams
+        return [f_master.result(), f_slave.result()]
+
+    def stop_stream(self):
+        self._executor.submit(self.slave.stop_stream)
+
+        self._executor.submit(self.master.stop_stream)
+
     def lock_auto_features(self, settle_time: float = 2.0) -> List[dict]:
         futures = [self._executor.submit(cam.lock_auto_features, settle_time) for cam in self.cameras]
         return [f.result() for f in futures]

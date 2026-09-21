@@ -9,18 +9,18 @@
 * [ ] [Line the MDF Enclosure & Turntable with Black Velvet](#hw-velvet)
 
 ### 💻 SOFTWARE (Code, Cloud, Automation)
-* [ ] [Lock AE, AWB, and Focus before scanning](#sw-ae-awb)
-* [ ] [Set output format to High-Quality JPEG](#sw-jpeg)
+* [x] [Lock AE, AWB, and Focus before scanning](#sw-ae-awb)
+* [x] [Set output format to High-Quality JPEG](#sw-jpeg)
 * [ ] [Add "Backlash Compensation" for Lens Motor](#sw-backlash)
-* [ ] [Enforce strict "No Digital Zoom" policy](#sw-zoom)
-* [ ] [Setup Concurrent Streams and "Stop-Settle-Shoot" logic](#sw-stop-settle)
+* [x] [Enforce strict "No Digital Zoom" policy](#sw-zoom)
+* [x] [Setup Concurrent Streams and "Stop-Settle-Shoot" logic](#sw-stop-settle)
 * [ ] [File & Metadata Processing (Pre-Meshroom)](#sw-metadata)
 * [ ] [Build an Asynchronous Upload Queue](#sw-upload)
 * [ ] [Implement Mode 1: Universal Mode (24cm Fixed Focus)](#sw-mode1)
 * [ ] [Configure turntable for 18° jumps](#sw-turntable)
 * [ ] [Implement Z-Axis top detection (OpenCV)](#sw-zaxis)
 * [ ] [Perform OpenCV Pre-calculated Lens Calibration](#sw-calibration)
-* [ ] [Optional: Downscale resolution to 6MP for faster processing](#sw-downscale)
+* [x] [Optional: Downscale resolution to 6MP for faster processing](#sw-downscale)
 * [ ] [Implement Mode 2: High-Fidelity Mode (Focus Stacking)](#sw-mode2)
 * [ ] [Implement Hybrid Enfuse Stacking Pipeline](#sw-enfuse)
 * [ ] [Implement 3-Step Process Throttling for `enfuse`](#sw-throttle)
@@ -77,7 +77,7 @@
 *Status: Baseline Calibration* | *Depends on: Hardware & Mechanics powered on*
 
 <a id="sw-ae-awb"></a>
-* [ ] **Lock AE, AWB, and Focus before scanning**
+* [x] **Lock AE, AWB, and Focus before scanning**
 * **Details:** Meshroom fails if lighting or focus changes between photos. Turn on your LEDs, wait 2-3 seconds for auto-exposure to adjust, then lock the settings via `picamera2` before starting the motor loop.
 ```python
 # After letting the camera run for 2 seconds to calculate the room light:
@@ -89,7 +89,7 @@ cam.set_controls({
 ```
 
 <a id="sw-zoom"></a>
-* [ ] **Enforce strict "No Digital Zoom" policy**
+* [x] **Enforce strict "No Digital Zoom" policy**
 * **Details:** The Arducam B0272 has a fixed focal length. Never apply digital zoom or Region of Interest (ROI) cropping via `picamera2`. Digital cropping destroys the Principal Point of the lens and throws away 12MP resolution, causing Meshroom to miscalculate the optical distortion model. 
 
 <a id="sw-calibration"></a>
@@ -97,11 +97,11 @@ cam.set_controls({
 * **Details:** Don't force Meshroom to guess your Arducam's lens distortion on every scan. Print a "ChArUco" black-and-white checkerboard. Put it in the scanner and take 20 photos at different angles. Run a one-time OpenCV script to calculate the mathematical curvature of your lens (`.json`). Feed this into Meshroom's `CameraInit` node to massively decrease the RTX 5090's solving time.
 
 <a id="sw-jpeg"></a>
-* [ ] **Set output format to High-Quality JPEG**
+* [x] **Set output format to High-Quality JPEG**
 * **Details:** Use maximum-quality JPEGs (Quality 95-100) instead of PNG or RAW formats. High-quality JPEG compression is invisible to Meshroom's algorithms, but shrinks an 80-image scan from ~2GB down to ~400MB.
 
 <a id="sw-downscale"></a>
-* [ ] **Optional: Downscale resolution to 6MP for faster processing**
+* [x] **Optional: Downscale resolution to 6MP for faster processing**
 * **Details:** If you need Meshroom to process the final 3D model 2-3x faster, lower the capture resolution from 12MP to roughly 6MP (approx. 2800 × 2100). You preserve the necessary overlapping geometry while feeding the GPU 50% less pixel data.
 
 ---
@@ -119,7 +119,7 @@ cam.set_controls({
     *   Sub-folder `rig/1/` -> contains Camera 2 images (with the modified metadata)
 
 <a id="sw-stop-settle"></a>
-* [ ] **Setup Concurrent Streams and "Stop-Settle-Shoot" logic**
+* [x] **Setup Concurrent Streams and "Stop-Settle-Shoot" logic**
 * **Details:** Configure `picamera2` to output a low-res preview stream for monitoring and instantly capture 12MP high-res frames without pausing the video. Avoid continuous rotation to prevent motion blur; instead, use a loop that pauses briefly to let vibrations settle.
 ```python
 # 1. Start the Live Stream
