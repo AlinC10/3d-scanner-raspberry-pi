@@ -205,8 +205,8 @@ class DualCamera:
             f = self._executor.submit(
                 cam.capture_photo,
                 output=out_file,
-                resolution=resolution,
-                quality=quality,
+                resolution=resolution or cam.size,
+                quality=quality or cam.quality,
                 raw=raw,
                 show_preview=show_preview,
                 preview_duration=preview_duration
@@ -236,8 +236,8 @@ class DualCamera:
                 cam.record_video,
                 output=out_file,
                 duration=duration,
-                resolution=resolution,
-                quality=quality
+                resolution=resolution or cam.video_size,
+                quality=quality or cam.quality
             )
             futures.append(f)
             

@@ -72,6 +72,32 @@ class Motor:
         if self.en_device:
             self.en_device.on()
 
+    def angle_to_steps_conversion(self, angle: int | float = 18, step_type: str = "Full"):
+        # Determine multiplier based on step_type
+        if "/" in step_type:
+            num, den = step_type.split("/")
+            num, den = int(num), int(den)
+        elif step_type == "Half":
+            num, den = 1, 2
+        else:
+            num, den = 1, 1
+
+        step_angle = self.nema17_step_angle * num / den
+
+        # Calculate exactly how many steps this requires
+        steps_float = angle / step_angle
+
+        # Check if the required steps is a whole number (allowing a tiny margin for float math precision)
+        if abs(steps_float - round(steps_float)) > 1e-4:
+            raise MotorError(
+                f"Cannot rotate exactly {angle}° using '{step_type}' microstepping. "
+                f"This requires {steps_float:.2f} steps, which is not a whole integer. "
+                f"Please choose a different step_type (e.g. 1/8, 1/16) or change the angle."
+            )
+
+        steps = round(steps_float)
+        return steps
+
     def rotate_angle(
             self,
             clockwise: bool = True,
@@ -84,29 +110,7 @@ class Motor:
         Rotates the motor by a specific angle. Verifies if the requested angle
         is perfectly divisible by the given step_type. If not, raises an error.
         """
-        # Determine multiplier based on step_type
-        if "/" in step_type:
-            num, den = step_type.split("/")
-            num, den = int(num), int(den)
-        elif step_type == "Half":
-            num, den = 1, 2
-        else:
-            num, den = 1, 1
-        
-        step_angle = self.nema17_step_angle * num / den
-        
-        # Calculate exactly how many steps this requires
-        steps_float = angle / step_angle
-        
-        # Check if the required steps is a whole number (allowing a tiny margin for float math precision)
-        if abs(steps_float - round(steps_float)) > 1e-4:
-            raise MotorError(
-                f"Cannot rotate exactly {angle}° using '{step_type}' microstepping. "
-                f"This requires {steps_float:.2f} steps, which is not a whole integer. "
-                f"Please choose a different step_type (e.g. 1/8, 1/16) or change the angle."
-            )
-            
-        steps = round(steps_float)
+        steps = self.angle_to_steps_conversion(angle, step_type)
         
         if steps > 0:
             self.rotate(

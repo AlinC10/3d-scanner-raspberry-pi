@@ -4,6 +4,7 @@ from typing import Optional
 import threading
 import time
 from queue import Queue
+import queue
 
 from camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY, \
     DEFAULT_VIDEO_RESOLUTION
@@ -13,6 +14,7 @@ from endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
 from motor import Motor
 from relay import Relay
 import cloud.cloudflare_r2 as r2
+from system import file_control as fc
 
 
 class ScannerError(Exception):
@@ -50,6 +52,7 @@ class Scanner:
 
         self._level = 0
 
+        # used for uploading the images when they are captured
         self.upload_queue = Queue()
         self._upload_thread: Optional[threading.Thread] = None
 
@@ -66,6 +69,63 @@ class Scanner:
     @property
     def level(self):
         return self._level
+
+    def _upload_worker(self):
+        """Background thread worker that uploads photos one by one."""
+        while True:
+            file_path = self.upload_queue.get()
+
+            if file_path is None:
+                self.upload_queue.task_done()
+                break
+
+            try:
+                # Calculate the relative path from the root input_images folder
+                # to preserve camera directory structure (e.g. "0/lvl_1_shot_0.jpg")
+                path_obj = Path(file_path)
+                camera_dir = path_obj.parent.name # usually "0" or "1"
+                filename = path_obj.name
+                
+                # VERY IMPORTANT: Prefix with "rig/" so the downstream download code
+                # (download_every_img_from_bucket with rig_mode=True) retrieves it correctly!
+                cloud_key = f"rig/{camera_dir}/{filename}"
+
+                print(f"[UploadWorker] Uploading {file_path} to R2 as {cloud_key} ...")
+                
+                # You MUST pass object_name=cloud_key here, otherwise boto3 just uses the filename!
+                r2.upload_file(file_path, object_name=cloud_key)
+
+            except Exception as e:
+                print(f"[UploadWorker] Failed to upload {file_path}: {e}")
+            finally:
+                self.upload_queue.task_done()
+
+    def start_upload_worker(self):
+        """Starts the background worker thread."""
+        if self._upload_thread is None or not self._upload_thread.is_alive():
+            # Clear any stale items from previous runs
+            while not self.upload_queue.empty():
+                try: 
+                    self.upload_queue.get_nowait()
+                    self.upload_queue.task_done()
+                except queue.Empty: 
+                    break
+
+            self._upload_thread = threading.Thread(target=self._upload_worker, daemon=True)
+            self._upload_thread.start()
+
+    def stop_upload_worker(self, wait_for_completion: bool = True):
+        """Signals the worker to stop after remaining uploads finish."""
+        if self._upload_thread and self._upload_thread.is_alive():
+            # Send the sentinel 'None' to signal the loop to terminate
+            self.upload_queue.put(None)
+
+            if wait_for_completion:
+                # Wait until all queued items have been processed
+                self.upload_queue.join()
+                self._upload_thread.join()
+
+            self._upload_thread = None
 
     def move_z_up(self, steps: int = 20, delay: float = 0.001, step_type: str = "Full"):
         """Move Z-axis UP. Blocked if the top endstop is already active."""
@@ -207,9 +267,11 @@ class Scanner:
     def scan(
         self, 
         angle: float = 18.0, 
-        step_type: str = "Full", 
-        z_move_mm: float = 10.0, 
-        z_step_type: str = "Full"
+        step_type: str = "Full",
+        delay_turntable: float = 0.0005,
+        z_move_mm: float = 100.0,
+        z_step_type: str = "Full",
+        delay_z_motor: float = 0.0005
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.
@@ -219,13 +281,24 @@ class Scanner:
             if self.state != ScannerState.PREPARED:
                 raise RuntimeError("System must be prepared before scanning.")
 
+            steps = self.turntable_motor.angle_to_steps_conversion(angle, step_type)
+
+            if not isinstance(steps, int):
+                raise ValueError(f"""Angle should be a multiple of 1.8 * step_type to obtain an integer number for 
+                steps. Current angles and number of steps: {angle} degrees -> {steps} steps""")
+
             self.state = ScannerState.RUNNING
             self.turntable_motor.enable()
             self.z_axis_motor.enable()
             
-            library_dir = str(Path(__file__).resolve().parent.parent.joinpath("library"))
-            os.makedirs(library_dir, exist_ok=True)
+            images_dir = str(Path(__file__).resolve().parent.parent / "input_images")
 
+            fc.create_clean_dir(images_dir)
+
+            self.start_upload_worker()
+
+            # move z-axis to the next floor
+            degrees_to_rotate = (z_move_mm / T8_THREADED_ROD_STEP) * 360.0
             try:
                 self._level = 1
                 
@@ -236,32 +309,35 @@ class Scanner:
                     for shot in range(total_shots):
                         # 1. Capture 2 photos using DualCamera / DualCameraXVS (Master & Slave)
                         if self.dual_cameras:
-                            self.dual_cameras.capture_photo(
+                            photo_paths = self.dual_cameras.capture_photo(
                                 output_prefix=f"lvl_{self._level}_shot_{shot}",
-                                output_dir=library_dir,
-                                meshroom_rig=self.xvs
+                                output_dir=images_dir,
+                                meshroom_rig=True
                             )
+                        # check runpod uploads/downloads of the rig images for the output_dir
 
-                        # 2. Rotate turntable to next position
-                        self.turntable_motor.rotate_angle(
+                        # 2. Enqueue each photo path for background upload!
+                        for path in photo_paths:
+                            self.upload_queue.put(path)
+
+                        # 3. Rotate turntable to next position
+                        self.turntable_motor.rotate(
                             clockwise=True,
-                            angle=angle,
-                            delay=0.002,
+                            steps=steps,
+                            delay=delay_turntable,
                             step_type=step_type,
                             verbose=False
                         )
-                        time.sleep(0.5)  # Let object settle so the next photo isn't blurry
+                        time.sleep(0.2)  # Let object settle so the next photo isn't blurry
 
                     # If endstop was triggered during the slice, exit loop
                     if self.up_endstop.is_active:
                         break
-                        
-                    # 3. Move Z-axis to the next floor
-                    degrees_to_rotate = (z_move_mm / T8_THREADED_ROD_STEP) * 360.0
+
                     try:
                         self.move_z_up_angle(
                             angle=degrees_to_rotate,
-                            delay=0.001,
+                            delay=delay_z_motor,
                             step_type=z_step_type
                         )
                     except TopEndstopTriggered:
@@ -274,6 +350,8 @@ class Scanner:
                 raise ScannerError(f"Error during scan: {str(e)}")
             finally:
                 self.cleanup()
+                # 3. Tell the worker that no more images are coming and wait for remaining uploads
+                self.stop_upload_worker(wait_for_completion=True)
 
     def cleanup(self):
         """Forces the system safely back to an idle state."""

@@ -195,14 +195,14 @@ class DualCameraXVS:
         # SLAVE FIRST
         f_slave = self._executor.submit(
             self.slave.capture_photo,
-            output=out_slave, resolution=resolution, quality=quality,
+            output=out_slave, resolution=resolution or self.slave.size, quality=quality or self.slave.quality,
             raw=raw, show_preview=show_preview, preview_duration=preview_duration
         )
         
         # MASTER SECOND
         f_master = self._executor.submit(
             self.master.capture_photo,
-            output=out_master, resolution=resolution, quality=quality,
+            output=out_master, resolution=resolution or self.master.size, quality=quality or self.master.quality,
             raw=raw, show_preview=show_preview, preview_duration=preview_duration
         )
             
@@ -221,7 +221,7 @@ class DualCameraXVS:
         # SLAVE FIRST
         f_slave = self._executor.submit(
             self.slave.record_video,
-            output=out_slave, duration=duration, resolution=resolution, quality=quality
+            output=out_slave, duration=duration, resolution=resolution or self.slave.video_size, quality=quality or self.slave.quality
         )
         
         # time.sleep(0.1)
@@ -229,7 +229,7 @@ class DualCameraXVS:
         # MASTER SECOND
         f_master = self._executor.submit(
             self.master.record_video,
-            output=out_master, duration=duration, resolution=resolution, quality=quality
+            output=out_master, duration=duration, resolution=resolution or self.master.video_size, quality=quality or self.master.quality
         )
             
         return [f_master.result(), f_slave.result()]
