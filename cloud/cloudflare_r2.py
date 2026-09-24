@@ -27,15 +27,42 @@ s3 = boto3.client(
 # and after that will be deleted
 R2_PIPELINE_IMAGES_BUCKET="photogrammetry-pipeline"
 
-INPUT_IMAGES="./input_images"
-# Rig mode: images split into ./input_images/rig/0/ (Camera 1) and ./input_images/rig/1/ (Camera 2)
-RIG_IMAGES="./input_images/rig"
+from pathlib import Path
+
+# Base directory is the project root (parent of 'cloud')
+BASE_DIR = str(Path(__file__).resolve().parent.parent)
+
+INPUT_IMAGES = os.path.join(BASE_DIR, "input_images")
+# Rig mode: images split into input_images/rig/0/ (Camera 1) and input_images/rig/1/ (Camera 2)
+RIG_IMAGES = os.path.join(INPUT_IMAGES, "rig")
 # Two-sides mode: two rig directories for scanning both sides of an object
-TWO_SIDES_RIG1="./input_images/rig1"
-TWO_SIDES_RIG2="./input_images/rig2"
+TWO_SIDES_RIG1 = os.path.join(INPUT_IMAGES, "rig1")
+TWO_SIDES_RIG2 = os.path.join(INPUT_IMAGES, "rig2")
 
-OUTPUT_DIR="./output"
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
+def file_exists_and_is_new(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, after_timestamp: float = 0.0) -> bool:
+  """
+  Check if an object exists in R2 and was modified after a specific UNIX timestamp.
+  :param object_name: S3 object name
+  :type object_name: str
+  :param bucket: Bucket to check
+  :type bucket: str
+  :param after_timestamp: UNIX timestamp to check against
+  :type after_timestamp: float
+  :return: True if file exists and is newer than after_timestamp
+  :rtype: bool
+  """
+  try:
+      response = s3.head_object(Bucket=bucket, Key=object_name)
+      # LastModified is a datetime object, convert to UNIX timestamp
+      last_modified = response['LastModified'].timestamp()
+      return last_modified >= after_timestamp
+  except ClientError as e:
+      if e.response['Error']['Code'] == '404':
+          return False
+      logging.error("[R2] head_object error for %s: %s", object_name, e)
+      return False
 
 def delete_file(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
   """

@@ -53,3 +53,14 @@ The `_PREPARE_ALLOWED` and `_TERMINAL` tuple definitions are now class-level att
   - Upgraded the `_upload_worker` in `hardware/scanner.py` to use a **Retry with Backoff** pattern, ensuring brief Wi-Fi glitches (5-15s) no longer drop captured photos.
   - Replaced the hard 120s static queue timeout with a **Stalled Progress Watchdog** in `stop_upload_worker()`. The orchestrator now tracks the timestamp of the last successful upload, allowing massive scans to complete gracefully over slow connections while still failing fast (in 45s) on permanent network disconnects.
   - Added OS-level socket timeout constraints to `boto3` via `botocore.config.Config` inside `cloud/cloudflare_r2.py` (`connect_timeout=5`, `read_timeout=15`). This prevents Python threads from indefinitely hanging in I/O wait on broken TCP sockets.
+
+- **Completed Steps 8-10 (Cloud Architecture Fixes):**
+  - **Dynamic Paths:** Refactored relative paths in `cloud/cloudflare_r2.py` (like `./input_images`) to absolute paths using `Path(__file__).resolve().parent.parent`.
+  - **Pipeline Validation:** Added `file_exists_and_is_new(object_name, bucket, after_timestamp)` to query the `LastModified` attribute in R2, preventing stale downloads.
+  - **Import Routing:** Corrected imports in `runpod.py` to use absolute module paths (`cloud.cloudflare_r2`).
+  - **Cost Management:** Implemented `terminate_pod()` using RunPod's `podTerminate` GraphQL mutation to fully delete pods and disk volumes after jobs finish, stopping idle billing.
+
+- **Completed Steps 11-12 (RunPod Architecture Resilience):**
+  - **Cooperative Cancellation:** Injected `cancel_event` threading flags into `runpod.py`'s `launch_job` polling loop, using `wait(timeout=15)` to allow instantaneous termination of the GPU pod if the user hits the emergency stop button during cloud processing.
+  - **Runaway Billing Protection:** Added a strict 60-minute hard limit on the RunPod API polling loop. If a job hangs without exiting, the pod is forcefully terminated to protect the account from infinite charges.
+  - **OOM RAM Heuristic Upgrades:** Greatly improved Out-Of-Memory detection in `runpod.py`. If a pod exits in under 120 seconds, it's caught as a failure. If it survives longer, it verifies success against R2 (`r2.file_exists_and_is_new`). If either check fails, the orchestrator accurately assumes a RAM exhaustion event and gracefully retries on the next, larger GPU in the fallback list.

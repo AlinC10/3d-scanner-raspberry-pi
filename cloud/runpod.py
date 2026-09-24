@@ -2,9 +2,9 @@ import os
 import json
 import time
 import requests
-from ram_heuristic import calculate_required_ram
+from cloud.ram_heuristic import calculate_required_ram
 import csv
-import cloudflare_r2 as r2
+import cloud.cloudflare_r2 as r2
 
 try:
     from dotenv import load_dotenv
@@ -135,32 +135,31 @@ def get_pod_logs(pod_id: str) -> str:
     return response.get("podLog", {}).get("stepLog", "")
 
 
-def stop_pod(pod_id: str) -> str:
+def terminate_pod(pod_id: str) -> str:
     """
-    Stop a running pod on RunPod.
-    :param pod_id: The ID of the pod to stop.
+    Terminate a running pod on RunPod. This completely deletes the pod and disk to stop all billing.
+    :param pod_id: The ID of the pod to terminate.
     :type pod_id: str
-    :return: The desired status of the pod after stopping.
+    :return: The status of the pod after termination.
     :rtype: str
     """
     mutation = """
-    mutation StopPod($podId: String!) {
-      podStop(input: {podId: $podId}) {
-        id
-        desiredStatus
-      }
+    mutation TerminatePod($podId: String!) {
+      podTerminate(input: {podId: $podId})
     }
     """
     data = gql(mutation, {"podId": pod_id})
-    return data["podStop"]["desiredStatus"]
+    # podTerminate returns a boolean or null usually, we can just return success string
+    return "TERMINATED"
 
 
-def launch_job(job: dict):
+def launch_job(job: dict, cancel_event=None):
     """
     Launch a processing job on a dynamically provisioned pod based on RAM requirements.
 
     :param job: The job configuration and details.
     :type job: dict
+    :param cancel_event: Optional threading.Event to instantly cancel execution.
     :return: True if the job completed successfully.
     :rtype: bool
     """
@@ -186,11 +185,6 @@ def launch_job(job: dict):
     # Define GPU fallback strategy based on required RAM and Secure Cloud availability
     if ram_min_gb > 64:
         # High RAM needs:
-        # 1. Try 5090 (sometimes it has 94GB)
-        # 2. Try L40 (Ada Lovelace, very fast, huge 250GB RAM at $0.82/hr)
-        # 3. Try RTX 6000 Ada Generation (Ada Lovelace, very fast)
-        # 4. Try RTX 3090 (Ampere, slower but very cheap at $0.50/hr and often has 125GB RAM)
-        # 5. Fallback to RTX A6000 (Ampere, similar speed to 3090)
         gpu_fallback_list = [
             "NVIDIA GeForce RTX 5090",
             "NVIDIA L40",
@@ -216,16 +210,15 @@ def launch_job(job: dict):
             "NVIDIA RTX A6000"
         ]
 
-    # Prepare environment variables for the pod
-    env = {
-        "JOB_JSON": json.dumps(job),
-        "RAM_MIN_GB": str(ram_min_gb),
-    }
-
     # Loop continuously until we successfully run a pod
     attempt = 1
     original_len = len(gpu_fallback_list)
+    
     while True:
+        if cancel_event and cancel_event.is_set():
+            print("Job cancelled by user before pod creation.")
+            return False
+            
         for target_gpu in gpu_fallback_list:
             print(f"\n--- Attempt {attempt} (Targeting: {target_gpu}) ---")
 
@@ -244,6 +237,7 @@ def launch_job(job: dict):
                 if os.getenv(key):
                     env[key] = os.getenv(key)
 
+            job_start_time = time.time()
             try:
                 pod_id = create_pod(env, target_gpu)
                 print(f"Created pod: {pod_id}")
@@ -255,13 +249,30 @@ def launch_job(job: dict):
                     gpu_fallback_list.extend(complementary_gpus_list)
 
                 attempt += 1
-                time.sleep(2)
+                if cancel_event and cancel_event.wait(timeout=2):
+                    return False
+                elif not cancel_event:
+                    time.sleep(2)
                 continue
 
             print("Waiting for pod to start and complete...")
             uptime = 0
+            max_loop_timeout = 60 * 60  # 60 minutes
+            
             while True:
-                time.sleep(15)
+                if cancel_event:
+                    if cancel_event.wait(timeout=15):
+                        print("Job cancelled by user. Terminating pod immediately.")
+                        terminate_pod(pod_id)
+                        return False
+                else:
+                    time.sleep(15)
+                    
+                if time.time() - job_start_time > max_loop_timeout:
+                    print("Pod exceeded maximum runtime of 60 minutes. Terminating to prevent runaway billing.")
+                    terminate_pod(pod_id)
+                    return False
+
                 pod_data = get_pod_status(pod_id)
                 status = pod_data["desiredStatus"]
 
@@ -276,14 +287,18 @@ def launch_job(job: dict):
                     break
 
             print(f"Stopping/cleaning up pod {pod_id}...")
-            stop_pod(pod_id)
+            terminate_pod(pod_id)
 
-            # If the pod exited in under 120 seconds, we assume it failed the RAM check.
+            # Check if pod ran successfully using the uptime RAM heuristic and R2 payload validation
             if uptime > 120:
-                print("Pod ran for a significant amount of time. Assuming job success!")
-                return True
+                print("Pod ran for a significant amount of time. Verifying R2 for output.zip...")
+                if r2.file_exists_and_is_new("output.zip", after_timestamp=job_start_time):
+                    print("Success! output.zip is present and fresh.")
+                    return True
+                else:
+                    print("Failure! output.zip is missing or stale. The job likely failed via OOM kill. Retrying on next GPU...")
             else:
-                print("Pod exited very quickly. RAM check likely failed on this host. Retrying...")
+                print("Pod exited very quickly (under 120s). RAM check likely failed on this host. Retrying...")
 
                 if attempt == 4 * original_len:
                     gpu_fallback_list.extend(complementary_gpus_list)
