@@ -257,4 +257,4 @@ class DualCamera:
 
     def stop_stream(self):
         for cam in self.cameras:
-            self._executor.submit(cam.start_stream)
+            self._executor.submit(cam.stop_stream)

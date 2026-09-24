@@ -20,7 +20,7 @@ GRAPHQL_URL = "https://api.runpod.io/graphql"
 IMAGE_NAME = "yourdockerhubuser/meshroom-runner:latest"
 
 
-# We will determine GPU dynamically now, so remove the global GPU_TYPE_ID
+# determine GPU dynamically
 # GPU_TYPE_ID = "NVIDIA GeForce RTX 5090"
 
 def gql(query: str, variables: dict | None = None) -> dict:

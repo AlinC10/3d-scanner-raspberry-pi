@@ -2,5 +2,5 @@ from fastapi import APIRouter
 
 router = APIRouter(
     prefix="/scanning",
-    tags=["scanning"],
+    tags=["Scanning"],
 )

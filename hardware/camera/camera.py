@@ -799,21 +799,23 @@ class ArducamIMX477:
         if not getattr(self.picam2, "started", False):
             raise RuntimeError("Camera must be started (e.g. via prepare_scan) before streaming.")
 
+        full_url = f"{rtsp_url}cam{self.camera_id}"
         if getattr(self.picam2, "recording", False):
             log.warning("Camera %d is already streaming/recording.", self.camera_id)
-            return
+            return full_url
 
         encoder = H264Encoder(bitrate=bitrate)
 
         # Handle rotation directly in FFmpeg so Python doesn't waste CPU
         ffmpeg_opts = "-f rtsp -rtsp_transport tcp"
 
-        output = FfmpegOutput(f"{ffmpeg_opts} {rtsp_url}cam{self.camera_id}")
+        full_url = f"{rtsp_url}cam{self.camera_id}"
+        output = FfmpegOutput(f"{ffmpeg_opts} {full_url}")
         # Stream from 'lores' so 'main' remains available for full-resolution photo captures!
         self.picam2.start_recording(encoder, output, name="lores")
-        log.info("Live stream started on %s", rtsp_url)
+        log.info("Live stream started on %s", full_url)
 
-        return rtsp_url
+        return full_url
 
     def stop_stream(self):
         """Stops the H.264 RTSP stream."""

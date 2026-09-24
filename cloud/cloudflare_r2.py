@@ -7,11 +7,20 @@ import zipfile
 
 load_dotenv()
 
+from botocore.config import Config
+
+R2_CONFIG = Config(
+    connect_timeout=5,          # Fail fast if unable to open socket
+    read_timeout=15,            # Fail if transfer stalls
+    retries={'max_attempts': 1} # Disable internal blind retries; our worker controls backoff
+)
+
 s3 = boto3.client(
   service_name="s3",
   endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
   aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
   aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
+  config=R2_CONFIG
 )
 
 # R2 bucket that will only be used for hosting images that will be used in the Meshroom pipeline
