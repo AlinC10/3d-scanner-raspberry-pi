@@ -6,8 +6,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from config import *
-from focuser import Focuser
+from .config import *
+from .focuser import Focuser
 
 # ── Third-party ──────────────────────────────────────────────────────────────
 try:

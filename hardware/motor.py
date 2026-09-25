@@ -45,11 +45,10 @@ class Motor:
 
         self.flt_device = None
         if flt_pin is not None:
-            # active_state=False means is_active=True when pin is LOW (fault condition)
+            # pull_up=True automatically implies active-low (is_active=True when pin is LOW on fault)
             self.flt_device = DigitalInputDevice(
                 pin=flt_pin,
                 pull_up=True,
-                active_state=False,
                 bounce_time=0.1
             )
             self.flt_device.when_activated = self.handle_driver_fault

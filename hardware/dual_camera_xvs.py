@@ -3,8 +3,8 @@ import time
 from typing import Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
-from camera import ArducamIMX477
-from camera.config import DEFAULT_QUALITY
+from .camera import ArducamIMX477
+from hardware.camera.config import DEFAULT_QUALITY
 
 log = logging.getLogger(__name__)
 

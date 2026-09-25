@@ -3,7 +3,7 @@ import time
 import logging
 import json
 from pathlib import Path
-from config import (
+from .config import (
     VCM_I2C_ADDR,
     VCM_I2C_BUS,
     VCM_MAX_POS,

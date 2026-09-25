@@ -2,8 +2,8 @@ import logging
 from typing import Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
-from camera import ArducamIMX477
-from camera.config import (
+from .camera import ArducamIMX477
+from hardware.camera.config import (
     DEFAULT_QUALITY, 
     DEFAULT_PHOTO_RESOLUTION, 
     DEFAULT_VIDEO_RESOLUTION, 

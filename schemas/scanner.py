@@ -1,5 +1,28 @@
 from pydantic import BaseModel, Field
 from typing import Annotated, Literal
+from hardware.camera.config import AF_ROI, AF_STEP
+
+
+class CameraConfig(BaseModel):
+    photo_resolution: tuple[int, int] | None = None
+    preview_resolution: tuple[int, int] | None = None
+    quality: int | None = None
+    focus: int | str | None = None
+    rotation: int | None = None
+    show_preview: bool = False
+    settle_time: float = 2.0
+    exposure_time: int | None = None
+    analogue_gain: float | None = None
+    colour_gains: tuple[float, float] | None = None
+    awb_mode: str | None = "auto"
+    brightness: float | None = None
+    contrast: float | None = None
+    saturation: float | None = None
+    sharpness: float | None = None
+    autofocus_step: int = AF_STEP
+    autofocus_roi: tuple = AF_ROI
+    keep_running: bool = False
+
 
 class PrepareRequest(BaseModel):
     enable_stream: Annotated[bool, Field(
@@ -10,6 +33,8 @@ class PrepareRequest(BaseModel):
         le=10_000_000,
         description="The bitrate for the camera livestream in bps (e.g., 2000000 for 2 Mbps)."
     )] = 2_000_000
+
+    camera_config: Annotated[CameraConfig | None, Field()] = None
 
 
 class MotorConfig(BaseModel):

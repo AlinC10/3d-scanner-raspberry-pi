@@ -7,13 +7,13 @@ import time
 from queue import Queue
 import queue
 
-from camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY, \
+from hardware.camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY, \
     DEFAULT_VIDEO_RESOLUTION
-from dual_camera import DualCamera
-from dual_camera_xvs import DualCameraXVS
-from endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
-from motor import Motor
-from relay import Relay
+from .dual_camera import DualCamera
+from .dual_camera_xvs import DualCameraXVS
+from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
+from .motor import Motor
+from .relay import Relay
 import cloud.cloudflare_r2 as r2
 from system import file_control as fc
 
@@ -47,8 +47,8 @@ class Scanner:
         self.turntable_motor = Motor(dir_pin=24, step_pin=23, mode_pins=(25, 8, 7), en_pin=18, flt_pin=4)
         self.z_axis_motor = Motor(dir_pin=19, step_pin=26, mode_pins=(13, 6, 5), en_pin=21, flt_pin=12)
 
-        self.up_endstop = Endstop(pin=2, pull_up=True, active_state=False, bounce_time=0.02)
-        self.down_endstop = Endstop(pin=3, pull_up=True, active_state=False, bounce_time=0.02)
+        self.up_endstop = Endstop(pin=2, pull_up=True, bounce_time=0.02)
+        self.down_endstop = Endstop(pin=3, pull_up=True, bounce_time=0.02)
 
         # Wire up safety interrupts: Any endstop hit immediately stops the Z-axis motor mid-loop
         self.up_endstop.when_pressed = self.z_axis_motor.stop
