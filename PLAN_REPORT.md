@@ -64,3 +64,14 @@ The `_PREPARE_ALLOWED` and `_TERMINAL` tuple definitions are now class-level att
   - **Cooperative Cancellation:** Injected `cancel_event` threading flags into `runpod.py`'s `launch_job` polling loop, using `wait(timeout=15)` to allow instantaneous termination of the GPU pod if the user hits the emergency stop button during cloud processing.
   - **Runaway Billing Protection:** Added a strict 60-minute hard limit on the RunPod API polling loop. If a job hangs without exiting, the pod is forcefully terminated to protect the account from infinite charges.
   - **OOM RAM Heuristic Upgrades:** Greatly improved Out-Of-Memory detection in `runpod.py`. If a pod exits in under 120 seconds, it's caught as a failure. If it survives longer, it verifies success against R2 (`r2.file_exists_and_is_new`). If either check fails, the orchestrator accurately assumes a RAM exhaustion event and gracefully retries on the next, larger GPU in the fallback list.
+
+## Phase C: FastAPI Orchestration
+
+- **Completed Steps 13-14 (Singleton & `/prepare` API):**
+  - **Singleton Pattern:** Defined `scanner = Scanner()` at the root of `router/scanner.py` to ensure the global hardware state is safely shared across all HTTP endpoints.
+  - **Decoupled API Design:** Implemented `POST /scanning/prepare`. This allows the UI to trigger the lighting, motor homing, S3 bucket sanitization, and camera live stream separately from the mechanical scan, providing a safe framing workflow.
+
+- **Completed Steps 15-16 (Orchestrator Pipeline & State API):**
+  - **Asynchronous Execution (`/start`):** Built `POST /scanning/start`. It validates the rig is `PREPARED`, instantly returns `202 Accepted`, and shifts the massive workload (mechanical scan -> RunPod launch -> R2 download) into a `fastapi.BackgroundTasks` runner to prevent orphaned HTTP threading.
+  - **State Machine UI Polling (`/status`):** Built `GET /scanning/status` to expose `scanner.state` (e.g. `PROCESSING`, `DOWNLOADING`, `ERROR`) and `total_photos` natively to the frontend polling loop.
+  - **Emergency Stop API (`/cancel`):** Built `POST /scanning/cancel`. Instantly fires `scanner.emergency_stop()`, which cuts motor power, sets `_cancel_event` to kill any active RunPod GraphQL polling loops, terminates active cloud pods, and forces the state to `CANCELLED`.

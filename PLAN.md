@@ -67,7 +67,7 @@ Establish a robust, asynchronous execution pipeline connecting the local `scanne
 ---
 
 ### Phase C: FastAPI Orchestration
-*Files modified: `router/scanning.py`*
+*Files modified: `router/scanner.py`*
 
 **Step 13: Define Singleton Hardware State**
 - Initialize a global `scanner = Scanner()` instance to manage hardware throughout the FastAPI application lifespan.

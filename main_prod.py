@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 import router.system
 import router.ai
 import router.library
-import router.scanning
+import router.scanner
 
 from system.exception import SystemConnectionError
 
@@ -17,7 +17,7 @@ async def system_connection_error_handler(request: Request, exc: SystemConnectio
     )
 
 
-routers = [router.system, router.ai, router.library, router.scanning]
+routers = [router.system, router.ai, router.library, router.scanner]
 
 for router in routers:
     app.include_router(router.router)
