@@ -83,6 +83,7 @@ class DualCameraXVS:
         Prepare and lock both cameras concurrently for scanning.
         """
         focus_val = kwargs.pop("focus", None)
+        rotation_val = kwargs.pop("rotation", None)
         kwargs_master = kwargs.copy()
         kwargs_slave = kwargs.copy()
         
@@ -92,6 +93,13 @@ class DualCameraXVS:
         else:
             kwargs_master["focus"] = focus_val
             kwargs_slave["focus"] = focus_val
+
+        if isinstance(rotation_val, (tuple, list)) and len(rotation_val) == 2 and isinstance(rotation_val[0], (int, str, type(None))):
+            kwargs_master["rotation"] = rotation_val[0]
+            kwargs_slave["rotation"] = rotation_val[1]
+        else:
+            kwargs_master["rotation"] = rotation_val
+            kwargs_slave["rotation"] = rotation_val
 
         # START SEQUENCE IS CRITICAL FOR XVS:
         # 1. Start the Slave camera thread FIRST. It will block waiting for XVS.

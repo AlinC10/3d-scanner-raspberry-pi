@@ -1,27 +1,40 @@
 from pydantic import BaseModel, Field
 from typing import Annotated, Literal
-from hardware.camera.config import AF_ROI, AF_STEP
+from hardware.camera.config import AF_ROI, AF_STEP, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_VIDEO_RESOLUTION, DEFAULT_PHOTO_RESOLUTION, DEFAULT_QUALITY
 
 
-class CameraConfig(BaseModel):
-    photo_resolution: tuple[int, int] | None = None
-    preview_resolution: tuple[int, int] | None = None
-    quality: int | None = None
-    focus: int | str | None = None
-    rotation: int | None = None
-    show_preview: bool = False
-    settle_time: float = 2.0
-    exposure_time: int | None = None
-    analogue_gain: float | None = None
-    colour_gains: tuple[float, float] | None = None
-    awb_mode: str | None = "auto"
-    brightness: float | None = None
-    contrast: float | None = None
-    saturation: float | None = None
-    sharpness: float | None = None
-    autofocus_step: int = AF_STEP
-    autofocus_roi: tuple = AF_ROI
-    keep_running: bool = False
+class DualCameraConfig(BaseModel):
+    master_id: Annotated[Literal[0, 1], Field(description="Camera ID for the master camera.")] = 0
+    slave_id: Annotated[Literal[0, 1], Field(description="Camera ID for the slave camera.")] = 1
+
+    quality: Annotated[int, Field(ge=10, le=100, description="JPEG quality for captured photos.")] = DEFAULT_QUALITY
+    photo_resolution: Annotated[tuple[int, int], Field(description="Resolution for still captures (W, H).")] = DEFAULT_PHOTO_RESOLUTION
+    video_resolution: Annotated[tuple[int, int], Field(description="Resolution for video streaming (W, H).")] = DEFAULT_VIDEO_RESOLUTION
+    preview_resolution: Annotated[tuple[int, int], Field(description="Resolution for the live preview (W, H).")] = DEFAULT_PREVIEW_RESOLUTION
+
+    rotation: Annotated[
+        Literal[0, 90, 180, 270] | tuple[Literal[0, 90, 180, 270], Literal[0, 90, 180, 270]] | list[Literal[0, 90, 180, 270]] | None,
+        Field(description="Rotation degrees for the cameras.")
+    ] = 0
+
+    focus: Annotated[int | str | tuple[int, int] | list[int] | None, Field(description="Focus value, 'auto', or tuple/list for dual independent focus.")] = None
+
+    show_preview: Annotated[bool, Field(description="Whether to show the native camera preview window.")] = False
+    settle_time: Annotated[float, Field(ge=0.0, description="Time in seconds to wait for auto-exposure/auto-white-balance to settle.")] = 2.0
+    
+    exposure_time: Annotated[int | None, Field(description="Manual exposure time in microseconds.")] = None
+    analogue_gain: Annotated[float | None, Field(description="Manual analogue gain.")] = None
+    colour_gains: Annotated[tuple[float, float] | None, Field(description="Manual AWB gains (red, blue).")] = None
+    awb_mode: Annotated[str | None, Field(description="Auto white balance mode.")] = "auto"
+    
+    brightness: Annotated[float | None, Field(ge=-1.0, le=1.0, description="Brightness adjustment.")] = None
+    contrast: Annotated[float | None, Field(description="Contrast adjustment.")] = None
+    saturation: Annotated[float | None, Field(description="Saturation adjustment.")] = None
+    sharpness: Annotated[float | None, Field(description="Sharpness adjustment.")] = None
+    
+    autofocus_step: Annotated[int, Field(description="Step size for contrast-based autofocus routines.")] = AF_STEP
+    autofocus_roi: Annotated[tuple[float, float, float, float], Field(description="Region of interest for autofocus (x, y, w, h).")] = AF_ROI
+    keep_running: Annotated[bool, Field(description="Keep the camera event loop running. (Required True for streams).")] = False
 
 
 class PrepareRequest(BaseModel):
@@ -34,13 +47,10 @@ class PrepareRequest(BaseModel):
         description="The bitrate for the camera livestream in bps (e.g., 2000000 for 2 Mbps)."
     )] = 2_000_000
 
-    camera_config: Annotated[CameraConfig | None, Field()] = None
+    camera_config: Annotated[DualCameraConfig, Field(description="Configuration block for the dual camera array.")]
 
 
 class MotorConfig(BaseModel):
-    step_type: Annotated[Literal["Full", "Half", "1/4", "1/8", "1/16"], Field(
-        description="Stepper motor microstepping resolution (e.g., 'Full', 'Half', '1/4')."
-    )] = "Full"
     delay: Annotated[float, Field(
         ge=0.00005,
         description="Delay in seconds between step pulses for the motor."
@@ -59,8 +69,8 @@ class MechanicalConfig(BaseModel):
         description="The distance in millimeters the Z-axis should move UP between rotational slices."
     )] = 100.0
     
-    turntable: MotorConfig = Field(default_factory=MotorConfig)
-    z_axis: MotorConfig = Field(default_factory=lambda: MotorConfig(delay=0.0001))
+    turntable: MotorConfig
+    z_axis: MotorConfig
 
 
 class CloudConfig(BaseModel):
@@ -89,3 +99,21 @@ class StartRequest(BaseModel):
     )] = "meshroom-job"
     mechanical: MechanicalConfig = Field(default_factory=MechanicalConfig)
     cloud: CloudConfig = Field(default_factory=CloudConfig)
+class PrepareResponse(BaseModel):
+    status: str = "accepted"
+    message: str = "Live stream started. Rig homing and camera tuning in progress."
+    state: str = "preparing"
+    stream_urls: list[str] | None = None
+
+class StatusResponse(BaseModel):
+    state: str
+    total_photos: int = 0
+    stream_urls: list[str] | None = None
+
+class CancelResponse(BaseModel):
+    status: str = "success"
+    state: str = "cancelled"
+
+class StartResponse(BaseModel):
+    status: str = "accepted"
+    message: str = "Scan started"

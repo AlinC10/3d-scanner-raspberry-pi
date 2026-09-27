@@ -1,5 +1,4 @@
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 import threading
@@ -44,8 +43,8 @@ T8_THREADED_ROD_STEP = 8 # mm
 
 class Scanner:
     def __init__(self, xvs: bool = True):
-        self.turntable_motor = Motor(dir_pin=24, step_pin=23, mode_pins=(25, 8, 7), en_pin=18, flt_pin=4)
-        self.z_axis_motor = Motor(dir_pin=19, step_pin=26, mode_pins=(13, 6, 5), en_pin=21, flt_pin=12)
+        self.turntable_motor = Motor(dir_pin=24, step_pin=23, en_pin=18, step_type="1/4")
+        self.z_axis_motor = Motor(dir_pin=19, step_pin=26, en_pin=21, step_type="1/16")
 
         self.up_endstop = Endstop(pin=2, pull_up=True, bounce_time=0.02)
         self.down_endstop = Endstop(pin=3, pull_up=True, bounce_time=0.02)
@@ -66,6 +65,7 @@ class Scanner:
 
         self._level = 0
         self.total_photos = 0
+        self.stream_urls = None
 
         # used for uploading the images when they are captured
         self.upload_queue = Queue()
@@ -87,12 +87,16 @@ class Scanner:
     def level(self):
         return self._level
 
-    def _upload_worker(self):
+    def _upload_worker(self, stop_event: threading.Event):
         """Background thread worker that uploads photos one by one."""
-        while True:
-            file_path = self.upload_queue.get()
+        while not stop_event.is_set():
+            try:
+                # Use a timeout to periodically check stop_event even if queue is empty
+                file_path = self.upload_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
 
-            if file_path is None:
+            if file_path is None or stop_event.is_set():
                 self.upload_queue.task_done()
                 break
 
@@ -113,7 +117,7 @@ class Scanner:
                 delays = [3, 7, 15]
 
                 for attempt in range(max_retries):
-                    if self._cancel_event.is_set():
+                    if self._cancel_event.is_set() or stop_event.is_set():
                         break
 
                     try:
@@ -127,9 +131,9 @@ class Scanner:
                         if attempt < max_retries - 1:
                             delay = delays[attempt]
                             log.warning("[UploadWorker] Network hiccup (%s). Retrying %s in %ds...", e, file_path, delay)
-                            # Wait using _cancel_event for instant abort on cancel
-                            if self._cancel_event.wait(timeout=delay):
-                                break # User cancelled mid-sleep
+                            # Wait using stop_event for instant abort on cancel
+                            if stop_event.wait(timeout=delay):
+                                break # Thread killed mid-sleep
                         else:
                             log.error("[UploadWorker] Failed to upload %s after %d attempts: %s", file_path, max_retries, e)
                             self._upload_failed = True
@@ -152,27 +156,37 @@ class Scanner:
 
             self._last_upload_time = time.time()
             self._upload_failed = False
-            self._upload_thread = threading.Thread(target=self._upload_worker, daemon=True)
+            self._worker_stop_event = threading.Event()
+            self._upload_thread = threading.Thread(target=self._upload_worker, args=(self._worker_stop_event,), daemon=True)
             self._upload_thread.start()
 
     def stop_upload_worker(self, wait_for_completion: bool = True, stall_timeout: float = 45.0):
         """Signals the worker to stop after remaining uploads finish, with a stalled-progress watchdog."""
         if self._upload_thread and self._upload_thread.is_alive():
-            # Send the sentinel 'None' to signal the loop to terminate
+            # Send the sentinel 'None' to signal the loop to terminate gracefully
             self.upload_queue.put(None)
+            
+            if not wait_for_completion:
+                # Instantly abort the specific thread, bypassing the queue
+                if hasattr(self, '_worker_stop_event'):
+                    self._worker_stop_event.set()
 
             if wait_for_completion:
                 # Poll the queue until all tasks are marked done
                 while self.upload_queue.unfinished_tasks > 0:
                     if self._cancel_event.is_set():
                         log.warning("[UploadWorker] Scan cancelled, abandoning remaining queue.")
+                        if hasattr(self, '_worker_stop_event'):
+                            self._worker_stop_event.set()
                         break
 
                     if time.time() - self._last_upload_time > stall_timeout:
                         log.error("[UploadWorker] Uploads stalled for >%ds (network offline). Aborting.", stall_timeout)
                         with self._lock:
-                            if self.state not in ScannerState._TERMINAL:
+                            if self.state not in ScannerState.TERMINAL:
                                 self.state = ScannerState.ERROR
+                        if hasattr(self, '_worker_stop_event'):
+                            self._worker_stop_event.set()
                         break
                         
                     time.sleep(1.0)
@@ -182,31 +196,43 @@ class Scanner:
 
             self._upload_thread = None
 
-    def move_z_up(self, steps: int = 20, delay: float = 0.001, step_type: str = "Full"):
+    def move_z_up(self, steps: int = 20, delay: float = 0.001, step_type: Optional[str] = None):
         """Move Z-axis UP. Blocked if the top endstop is already active."""
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
 
         self.z_axis_motor.rotate(clockwise=True, steps=steps, delay=delay, step_type=step_type)
 
-    def move_z_down(self, steps: int = 20, delay: float = 0.001, step_type: str = "Full"):
+    def move_z_down(self, steps: int = 20, delay: float = 0.001, step_type: Optional[str] = None):
         """Move Z-axis DOWN. Blocked if the bottom endstop is already active."""
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
 
         self.z_axis_motor.rotate(clockwise=False, steps=steps, delay=delay, step_type=step_type)
         
-    def move_z_up_angle(self, angle: float, delay: float = 0.001, step_type: str = "Full"):
+    def move_z_up_angle(self, angle: float= 18.0, delay: float = 0.001, step_type: Optional[str] = None):
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
             
         self.z_axis_motor.rotate_angle(clockwise=True, angle=angle, delay=delay, step_type=step_type)
 
-    def move_z_down_angle(self, angle: float, delay: float = 0.001, step_type: str = "Full"):
+    def move_z_down_angle(self, angle: float= 18.0, delay: float = 0.001, step_type: Optional[str] = None):
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
             
         self.z_axis_motor.rotate_angle(clockwise=False, angle=angle, delay=delay, step_type=step_type)
+
+    def move_z_up_distance(self, distance: float= 100.0, delay: float = 0.001, step_type: Optional[str] = None):
+        if self.up_endstop.is_active:
+            raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
+
+        self.z_axis_motor.rotate_distance(clockwise=True, distance=distance, delay=delay, step_type=step_type)
+
+    def move_z_down_distance(self, distance: float= 100.0, delay: float = 0.001, step_type: Optional[str] = None):
+        if self.down_endstop.is_active:
+            raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
+
+        self.z_axis_motor.rotate_distance(clockwise=False, distance=distance, delay=delay, step_type=step_type)
 
     def home_z_axis(self):
         """The z-axis motor will rotate until it will reach the bottom (home) endstop."""
@@ -223,29 +249,26 @@ class Scanner:
             self.z_axis_motor.stop()
             self.z_axis_motor.disable()
 
+    def move_z_to_top(self, delay: float = 0.0005):
+        """The z-axis motor will rotate UP until it reaches the top endstop."""
+        self.z_axis_motor.enable()
 
-    def prepare_scan(self, enable_stream: bool = True, bitrate: int = 2_000_000, **kwargs):
+        try:
+            while True:
+                self.move_z_up(steps=20, delay=delay)
+        except TopEndstopTriggered:
+            pass
+        except Exception as e:
+            raise ScannerError(f"Motor Error in move_z_to_top: {str(e)}")
+        finally:
+            self.z_axis_motor.stop()
+            self.z_axis_motor.disable()
+
+
+    def setup_and_stream(self, enable_stream: bool = True, bitrate: int = 2_000_000, **kwargs) -> list[str] | None:
         """
-        Prepare mode: Homing, Lights On, Cameras initialized and focused (Live Stream Ready).
-         Function prepare_scan parameters
-            # photo_resolution: tuple[int, int] | None = None,
-            # preview_resolution: tuple[int, int] | None = None,
-            # quality: int | None = None,
-            # focus: int | str | None = None,
-            # rotation: int | None = None,
-            # show_preview: bool = False,
-            # settle_time: float = 2.0,
-            # exposure_time: int | None = None,
-            # analogue_gain: float | None = None,
-            # colour_gains: tuple[float, float] | None = None,
-            # awb_mode: str | None = "auto",
-            # brightness: float | None = None,
-            # contrast: float | None = None,
-            # saturation: float | None = None,
-            # sharpness: float | None = None,
-            # autofocus_step: int = AF_STEP,
-            # autofocus_roi: tuple = AF_ROI,
-            # keep_running: bool = False
+        Phase 1: Initializes cameras, gets initial stream image, and starts livestream.
+        Returns the stream_urls immediately so the frontend can connect.
         """
         # Lock only for state validation and transition
         with self._lock:
@@ -253,36 +276,25 @@ class Scanner:
                 raise RuntimeError(f"Cannot prepare. Scanner is currently {self.state}")
             self.state = ScannerState.PREPARING
             self._cancel_event.clear()
+            self.stream_urls = None
 
-        # Lock released — safe for emergency_stop() to intervene from another thread
         try:
             self.lights.on()
-
-            # home the motor
-            self.home_z_axis()
-
-            # Clean up the cloud bucket before capturing new assets
-            try:
-                r2.delete_all_files_from_bucket()
-            except Exception as e:
-                raise ScannerError(f"Cloud sanitization failed: {e}")
 
             # retrieve cameras arguments
             master_id = kwargs.pop("master_id", kwargs.pop("camera_id_1", 0))
             slave_id = kwargs.pop("slave_id", kwargs.pop("camera_id_2", 1))
 
             quality = kwargs.get("quality", DEFAULT_QUALITY)
-            photo_resolution = kwargs.get("size", DEFAULT_PHOTO_RESOLUTION)
-            video_resolution = kwargs.get("video_size", DEFAULT_VIDEO_RESOLUTION)
-            preview_resolution = kwargs.get("preview_size", DEFAULT_PREVIEW_RESOLUTION)
-            rotation = kwargs.get("rotation", 0)
+            photo_resolution = kwargs.get("photo_resolution", DEFAULT_PHOTO_RESOLUTION)
+            video_resolution = kwargs.pop("video_resolution", DEFAULT_VIDEO_RESOLUTION)
+            preview_resolution = kwargs.get("preview_resolution", DEFAULT_PREVIEW_RESOLUTION)
 
             camera_kwargs = {
                 "quality": quality,
                 "size": photo_resolution,
                 "video_size": video_resolution,
                 "preview_size": preview_resolution,
-                "rotation": rotation
             }
 
             if self.xvs:
@@ -301,25 +313,64 @@ class Scanner:
             # keep_running=True is required so the livestream can work!
             kwargs["keep_running"] = True
 
-            # prepare cameras for scanning
+            # prepare cameras for scanning (initial setup facing whatever direction)
             self.dual_cameras.prepare_scan(**kwargs)
 
-            url = None
             if enable_stream:
-                # return URL to the streams
-                url = self.generate_livestream(bitrate)
+                self.stream_urls = self.generate_livestream(bitrate)
 
-            self.state = ScannerState.PREPARED
-            self._level = 0
-            return url
+            return self.stream_urls
 
         except Exception as e:
             self.cleanup()
-            raise ScannerError(f"Error in prepare_scan: {str(e)}")
+            raise ScannerError(f"Error in setup_and_stream: {str(e)}")
+
+    def finish_preparation(self, **kwargs):
+        """
+        Phase 2 & 3: Homes carriage, cleans R2, recalibrates cameras in front of the object.
+        Designed to run as a background task.
+        """
+        try:
+            # Pop off initialization arguments that would crash ArducamIMX477
+            kwargs.pop("master_id", None)
+            kwargs.pop("slave_id", None)
+            kwargs.pop("video_resolution", None)
+
+            # home the motor
+            self.home_z_axis()
+            if self._cancel_event.is_set(): return
+
+            self.move_z_up_distance(distance=30.0)
+            if self._cancel_event.is_set(): return
+
+            # Clean up the cloud bucket before capturing new assets
+            try:
+                r2.delete_all_files_from_bucket()
+            except Exception as e:
+                raise ScannerError(f"Cloud sanitization failed: {e}")
+
+            if self._cancel_event.is_set(): return
+
+            # Recalibrate AE/AWB and focus in front of the illuminated object
+            kwargs["keep_running"] = True
+            self.dual_cameras.prepare_scan(**kwargs)
+            
+            with self._lock:
+                if self.state != ScannerState.CANCELLED:
+                    self.state = ScannerState.PREPARED
+                    self._level = 0
+                    log.info("[Scanner] Preparation fully completed!")
+
+        except Exception as e:
+            log.error(f"Background preparation failed: {e}")
+            self.cleanup()
+            with self._lock:
+                if self.state != ScannerState.CANCELLED:
+                    self.state = ScannerState.ERROR
 
     def generate_livestream(self, bitrate: int = 2_000_000):
         """"""
-        if self.state not in ("prepared", "scanning") or self.dual_cameras is None:
+        if self.state not in (ScannerState.PREPARING, ScannerState.PREPARED) or self.dual_cameras is None:
             return
 
         if not self.is_streaming:
@@ -330,13 +381,23 @@ class Scanner:
                 self.cleanup()
                 raise ScannerError(f"generate_livestream error: {str(e)}")
 
+    def stop_stream(self):
+        """Stops the live stream and releases the camera devices."""
+        if self.dual_cameras:
+            try:
+                self.dual_cameras.stop_stream()
+                self.dual_cameras.close()
+            except Exception as e:
+                log.warning("[Scanner] Error stopping stream: %s", e)
+            finally:
+                self.dual_cameras = None
+                self.stream_urls = None
+
     def scan(
         self, 
         angle: float = 18.0, 
-        step_type: str = "Full",
         delay_turntable: float = 0.0005,
         z_move_mm: float = 100.0,
-        z_step_type: str = "Full",
         delay_z_motor: float = 0.0005
     ):
         """
@@ -348,12 +409,14 @@ class Scanner:
         with self._lock:
             if self.state != ScannerState.PREPARED:
                 raise RuntimeError("System must be prepared before scanning.")
+            if self.dual_cameras is None:
+                raise ScannerError("Dual Camera System is not initialized. Run prepare_scan() before scan().")
 
             # Reset cancellation flag and photo counter for a fresh scan
             self._cancel_event.clear()
             self.total_photos = 0
 
-            steps = self.turntable_motor.angle_to_steps_conversion(angle, step_type)
+            steps = self.turntable_motor.angle_to_steps_conversion(angle)
 
             if not isinstance(steps, int):
                 raise ValueError(f"""Angle should be a multiple of 1.8 * step_type to obtain an integer number for 
@@ -372,7 +435,7 @@ class Scanner:
         self.start_upload_worker()
 
         # move z-axis to the next floor
-        degrees_to_rotate = (z_move_mm / T8_THREADED_ROD_STEP) * 360.0
+        z_steps = self.z_axis_motor.distance_to_step_conversion(distance=z_move_mm)
         try:
             self._level = 1
             
@@ -391,15 +454,14 @@ class Scanner:
                         break
 
                     # 1. Capture 2 photos using DualCamera / DualCameraXVS (Master & Slave)
-                    if self.dual_cameras:
-                        photo_paths = self.dual_cameras.capture_photo(
-                            output_prefix=f"lvl_{self._level}_shot_{shot}",
-                            output_dir=images_dir,
-                            meshroom_rig=True
-                        )
+                    photo_paths = self.dual_cameras.capture_photo(
+                        output_prefix=f"lvl_{self._level}_shot_{shot}",
+                        output_dir=images_dir,
+                        meshroom_rig=True
+                    )
 
-                        # Track total physical images for the RAM heuristic
-                        self.total_photos += len(photo_paths)
+                    # Track total physical images for the RAM heuristic
+                    self.total_photos += len(photo_paths)
 
                     # 2. Enqueue each photo path for background upload!
                     for path in photo_paths:
@@ -414,7 +476,6 @@ class Scanner:
                         clockwise=True,
                         steps=steps,
                         delay=delay_turntable,
-                        step_type=step_type,
                         verbose=False
                     )
                     time.sleep(0.2)  # Let object settle so the next photo isn't blurry
@@ -428,10 +489,9 @@ class Scanner:
                     break
 
                 try:
-                    self.move_z_up_angle(
-                        angle=degrees_to_rotate,
+                    self.move_z_up(
+                        steps=z_steps,
                         delay=delay_z_motor,
-                        step_type=z_step_type
                     )
                 except TopEndstopTriggered:
                     # Reached the ceiling, break out of the scan loop
@@ -465,6 +525,7 @@ class Scanner:
             self.dual_cameras.stop_stream()
             self.dual_cameras.close()
             self.dual_cameras = None
+            self.stream_urls = None
 
         # Lock only for updating the state securely
         with self._lock:
@@ -486,6 +547,7 @@ class Scanner:
         self.lights.off()
 
         self._level = 0
+        self.stream_urls = None
 
         if self.dual_cameras:
             self.dual_cameras.stop_stream()

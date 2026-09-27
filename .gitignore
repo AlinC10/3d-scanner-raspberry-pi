@@ -1,5 +1,6 @@
 .venv
 .env
+**/.env
 
 .lgd-nfy0
 
@@ -9,3 +10,5 @@ __pycache__
 
 .idea
 **/.idea
+
+ai/Annex-A-Detailed-Software-Requirements-Specification-SRS.pdf

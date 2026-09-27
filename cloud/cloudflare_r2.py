@@ -1,31 +1,33 @@
 import logging
-import boto3
 import os
-from dotenv import load_dotenv
-from botocore.exceptions import ClientError
+import shutil
 import zipfile
+
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
 
 load_dotenv()
 
 from botocore.config import Config
 
 R2_CONFIG = Config(
-    connect_timeout=5,          # Fail fast if unable to open socket
-    read_timeout=15,            # Fail if transfer stalls
-    retries={'max_attempts': 1} # Disable internal blind retries; our worker controls backoff
+    connect_timeout=5,  # Fail fast if unable to open socket
+    read_timeout=15,  # Fail if transfer stalls
+    retries={'max_attempts': 1}  # Disable internal blind retries; our worker controls backoff
 )
 
 s3 = boto3.client(
-  service_name="s3",
-  endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
-  aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
-  aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
-  config=R2_CONFIG
+    service_name="s3",
+    endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
+    aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
+    config=R2_CONFIG
 )
 
 # R2 bucket that will only be used for hosting images that will be used in the Meshroom pipeline
 # and after that will be deleted
-R2_PIPELINE_IMAGES_BUCKET="photogrammetry-pipeline"
+R2_PIPELINE_IMAGES_BUCKET = "photogrammetry-pipeline"
 
 from pathlib import Path
 
@@ -41,404 +43,421 @@ TWO_SIDES_RIG2 = os.path.join(INPUT_IMAGES, "rig2")
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
-def file_exists_and_is_new(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, after_timestamp: float = 0.0) -> bool:
-  """
-  Check if an object exists in R2 and was modified after a specific UNIX timestamp.
-  :param object_name: S3 object name
-  :type object_name: str
-  :param bucket: Bucket to check
-  :type bucket: str
-  :param after_timestamp: UNIX timestamp to check against
-  :type after_timestamp: float
-  :return: True if file exists and is newer than after_timestamp
-  :rtype: bool
-  """
-  try:
-      response = s3.head_object(Bucket=bucket, Key=object_name)
-      # LastModified is a datetime object, convert to UNIX timestamp
-      last_modified = response['LastModified'].timestamp()
-      return last_modified >= after_timestamp
-  except ClientError as e:
-      if e.response['Error']['Code'] == '404':
-          return False
-      logging.error("[R2] head_object error for %s: %s", object_name, e)
-      return False
+
+def file_exists_and_is_new(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET,
+                           after_timestamp: float = 0.0) -> bool:
+    """
+    Check if an object exists in R2 and was modified after a specific UNIX timestamp.
+    :param object_name: S3 object name
+    :type object_name: str
+    :param bucket: Bucket to check
+    :type bucket: str
+    :param after_timestamp: UNIX timestamp to check against
+    :type after_timestamp: float
+    :return: True if file exists and is newer than after_timestamp
+    :rtype: bool
+    """
+    try:
+        response = s3.head_object(Bucket=bucket, Key=object_name)
+        # LastModified is a datetime object, convert to UNIX timestamp
+        last_modified = response['LastModified'].timestamp()
+        return last_modified >= after_timestamp
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        logging.error("[R2] head_object error for %s: %s", object_name, e)
+        return False
+
 
 def delete_file(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-  """
-  Delete a file from an S3 bucket.
-  :param object_name: S3 object name
-  :type object_name: str
-  :param bucket: Bucket to delete from
-  :type bucket: str
-  :return: True if file was deleted, else False
-  :rtype: bool
-  """
-  # Delete the file
-  try:
-      s3.delete_object(Bucket=bucket, Key=object_name)
-  except ClientError as e:
-      logging.error(e)
-      return False
-  return True
+    """
+    Delete a file from an S3 bucket.
+    :param object_name: S3 object name
+    :type object_name: str
+    :param bucket: Bucket to delete from
+    :type bucket: str
+    :return: True if file was deleted, else False
+    :rtype: bool
+    """
+    # Delete the file
+    try:
+        s3.delete_object(Bucket=bucket, Key=object_name)
+    except ClientError as e:
+        logging.error(e)
+        return False
+    return True
+
 
 def delete_all_files_from_bucket(bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> None:
-  """
-  Delete all files from R2 bucket.
-  :param bucket: Bucket to delete from
-  :type bucket: str
-  :return: None
-  :rtype: None
-  """
-  response = s3.list_objects_v2(Bucket=bucket)
+    """
+    Delete all files from R2 bucket.
+    :param bucket: Bucket to delete from
+    :type bucket: str
+    :return: None
+    :rtype: None
+    """
+    response = s3.list_objects_v2(Bucket=bucket)
 
-  if 'Contents' in response:
-      # 2. Build a list of files to delete
-      objects_to_delete = [
-          {'Key': obj['Key']}
-          for obj in response['Contents']
-      ]
+    if 'Contents' in response:
+        # 2. Build a list of files to delete
+        objects_to_delete = [
+            {'Key': obj['Key']}
+            for obj in response['Contents']
+        ]
 
-      # 3. Delete them all in one batch operation (Free operation!)
-      if objects_to_delete:
-          s3.delete_objects(
-              Bucket=bucket,
-              Delete={'Objects': objects_to_delete}
-          )
-          print(f"Cleaned up {len(objects_to_delete)} old files. Bucket is ready for the next scan!")
+        # 3. Delete them all in one batch operation (Free operation!)
+        if objects_to_delete:
+            s3.delete_objects(
+                Bucket=bucket,
+                Delete={'Objects': objects_to_delete}
+            )
+            print(f"Cleaned up {len(objects_to_delete)} old files. Bucket is ready for the next scan!")
 
-      return
+        return
 
-  print("No files found in the bucket.")
+    print("No files found in the bucket.")
+
 
 def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_name: str | None = None) -> bool:
-  """
-  Upload a file to an S3 bucket
-  :param file_name: File to upload
-  :type file_name: str
-  :param bucket: Bucket to upload to
-  :type bucket: str
-  :param object_name: S3 object name. If not specified then file_name is used
-  :type object_name: str | None
-  :return: True if file was uploaded, else False
-  :rtype: bool
-  """
+    """
+    Upload a file to an S3 bucket
+    :param file_name: File to upload
+    :type file_name: str
+    :param bucket: Bucket to upload to
+    :type bucket: str
+    :param object_name: S3 object name. If not specified then file_name is used
+    :type object_name: str | None
+    :return: True if file was uploaded, else False
+    :rtype: bool
+    """
 
-  # If S3 object_name was not specified, use file_name
-  if object_name is None:
-      object_name = os.path.basename(file_name)
+    # If S3 object_name was not specified, use file_name
+    if object_name is None:
+        object_name = os.path.basename(file_name)
 
-  # Upload the file
-  try:
-      s3.upload_file(file_name, bucket, object_name)
-  except ClientError as e:
-      logging.error(e)
-      return False
-  return True
+    # Upload the file
+    try:
+        s3.upload_file(file_name, bucket, object_name)
+    except ClientError as e:
+        logging.error(e)
+        return False
+    return True
+
 
 def create_output_zip(folder_path: str, zip_path: str) -> str:
-  """
-  Builds a structured ZIP from the pipeline output directory.
+    """
+    Builds a structured ZIP from the pipeline output directory.
 
-  ZIP layout:
-      obj/high/       <- all files from Texturing_1/
-      obj/low/        <- all files from Texturing_2/
-      glb/high_model.glb
-      glb/low_model.glb
-      stl/high_model.stl
-      stl/low_model.stl
-      3mf/high_model.3mf
-      3mf/low_model.3mf
-  :param folder_path: Absolute or relative path to the output directory.
-  :type folder_path: str
-  :param zip_path: Destination path for the .zip file.
-  :type zip_path: str
-  :return: zip_path on success, raises on error.
-  :rtype: str
-  """
-  texturing1_dir = os.path.join(folder_path, "Texturing_1")
-  texturing2_dir = os.path.join(folder_path, "Texturing_2")
-  glb_file = os.path.join(folder_path, "low_model.glb")
-  high_glb_file = os.path.join(folder_path, "high_model.glb")
-  high_stl_file = os.path.join(folder_path, "high_model.stl")
-  low_stl_file = os.path.join(folder_path, "low_model.stl")
+    ZIP layout:
+        obj/high/       <- all files from Texturing_1/
+        obj/low/        <- all files from Texturing_2/
+        glb/high_model.glb
+        glb/low_model.glb
+        stl/high_model.stl
+        stl/low_model.stl
+        3mf/high_model.3mf
+        3mf/low_model.3mf
+    :param folder_path: Absolute or relative path to the output directory.
+    :type folder_path: str
+    :param zip_path: Destination path for the .zip file.
+    :type zip_path: str
+    :return: zip_path on success, raises on error.
+    :rtype: str
+    """
+    texturing1_dir = os.path.join(folder_path, "Texturing_1")
+    texturing2_dir = os.path.join(folder_path, "Texturing_2")
+    glb_file = os.path.join(folder_path, "low_model.glb")
+    high_glb_file = os.path.join(folder_path, "high_model.glb")
+    high_stl_file = os.path.join(folder_path, "high_model.stl")
+    low_stl_file = os.path.join(folder_path, "low_model.stl")
 
-  os.makedirs(os.path.dirname(os.path.abspath(zip_path)), exist_ok=True)
-  with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-      # --- obj/high/ : everything inside Texturing_1/ ---
-      if os.path.isdir(texturing1_dir):
-          for fname in os.listdir(texturing1_dir):
-              fpath = os.path.join(texturing1_dir, fname)
-              if os.path.isfile(fpath):
-                  zipf.write(fpath, os.path.join("obj", "high", fname))
-      else:
-          logging.warning("[ZIP] Texturing_1 directory not found: %s", texturing1_dir)
+    os.makedirs(os.path.dirname(os.path.abspath(zip_path)), exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        # --- obj/high/ : everything inside Texturing_1/ ---
+        if os.path.isdir(texturing1_dir):
+            for fname in os.listdir(texturing1_dir):
+                fpath = os.path.join(texturing1_dir, fname)
+                if os.path.isfile(fpath):
+                    zipf.write(fpath, os.path.join("obj", "high", fname))
+        else:
+            logging.warning("[ZIP] Texturing_1 directory not found: %s", texturing1_dir)
 
-      # --- obj/low/ : everything inside Texturing_2/ ---
-      if os.path.isdir(texturing2_dir):
-          for fname in os.listdir(texturing2_dir):
-              fpath = os.path.join(texturing2_dir, fname)
-              if os.path.isfile(fpath):
-                  zipf.write(fpath, os.path.join("obj", "low", fname))
-      else:
-          logging.warning("[ZIP] Texturing_2 directory not found: %s", texturing2_dir)
+        # --- obj/low/ : everything inside Texturing_2/ ---
+        if os.path.isdir(texturing2_dir):
+            for fname in os.listdir(texturing2_dir):
+                fpath = os.path.join(texturing2_dir, fname)
+                if os.path.isfile(fpath):
+                    zipf.write(fpath, os.path.join("obj", "low", fname))
+        else:
+            logging.warning("[ZIP] Texturing_2 directory not found: %s", texturing2_dir)
 
-      # --- glb/low_model.glb ---
-      if os.path.isfile(glb_file):
-          zipf.write(glb_file, os.path.join("glb", "low_model.glb"))
-      else:
-          logging.warning("[ZIP] GLB file not found: %s", glb_file)
+        # --- glb/low_model.glb ---
+        if os.path.isfile(glb_file):
+            zipf.write(glb_file, os.path.join("glb", "low_model.glb"))
+        else:
+            logging.warning("[ZIP] GLB file not found: %s", glb_file)
 
-      # --- glb/high_model.glb ---
-      if os.path.isfile(high_glb_file):
-          zipf.write(high_glb_file, os.path.join("glb", "high_model.glb"))
+        # --- glb/high_model.glb ---
+        if os.path.isfile(high_glb_file):
+            zipf.write(high_glb_file, os.path.join("glb", "high_model.glb"))
 
-      # --- stl/high_model.stl ---
-      if os.path.isfile(high_stl_file):
-          zipf.write(high_stl_file, os.path.join("stl", "high_model.stl"))
-      else:
-          logging.warning("[ZIP] High STL file not found: %s", high_stl_file)
+        # --- stl/high_model.stl ---
+        if os.path.isfile(high_stl_file):
+            zipf.write(high_stl_file, os.path.join("stl", "high_model.stl"))
+        else:
+            logging.warning("[ZIP] High STL file not found: %s", high_stl_file)
 
-      # --- stl/low_model.stl ---
-      if os.path.isfile(low_stl_file):
-          zipf.write(low_stl_file, os.path.join("stl", "low_model.stl"))
-      else:
-          logging.warning("[ZIP] Low STL file not found: %s", low_stl_file)
+        # --- stl/low_model.stl ---
+        if os.path.isfile(low_stl_file):
+            zipf.write(low_stl_file, os.path.join("stl", "low_model.stl"))
+        else:
+            logging.warning("[ZIP] Low STL file not found: %s", low_stl_file)
 
-      # --- 3mf/high_model.3mf ---
-      high_3mf_file = os.path.join(folder_path, "high_model.3mf")
-      if os.path.isfile(high_3mf_file):
-          zipf.write(high_3mf_file, os.path.join("3mf", "high_model.3mf"))
-      else:
-          logging.warning("[ZIP] High 3MF file not found: %s", high_3mf_file)
+        # --- 3mf/high_model.3mf ---
+        high_3mf_file = os.path.join(folder_path, "high_model.3mf")
+        if os.path.isfile(high_3mf_file):
+            zipf.write(high_3mf_file, os.path.join("3mf", "high_model.3mf"))
+        else:
+            logging.warning("[ZIP] High 3MF file not found: %s", high_3mf_file)
 
-      # --- 3mf/low_model.3mf ---
-      low_3mf_file = os.path.join(folder_path, "low_model.3mf")
-      if os.path.isfile(low_3mf_file):
-          zipf.write(low_3mf_file, os.path.join("3mf", "low_model.3mf"))
-      else:
-          logging.warning("[ZIP] Low 3MF file not found: %s", low_3mf_file)
+        # --- 3mf/low_model.3mf ---
+        low_3mf_file = os.path.join(folder_path, "low_model.3mf")
+        if os.path.isfile(low_3mf_file):
+            zipf.write(low_3mf_file, os.path.join("3mf", "low_model.3mf"))
+        else:
+            logging.warning("[ZIP] Low 3MF file not found: %s", low_3mf_file)
 
-      # --- stats.json ---
-      stats_file = os.path.join(folder_path, "stats.json")
-      if os.path.isfile(stats_file):
-          zipf.write(stats_file, "stats.json")
+        # --- stats.json ---
+        stats_file = os.path.join(folder_path, "stats.json")
+        if os.path.isfile(stats_file):
+            zipf.write(stats_file, "stats.json")
 
-  logging.info("[ZIP] Successfully created %s", zip_path)
-  return zip_path
+    logging.info("[ZIP] Successfully created %s", zip_path)
+    return zip_path
+
 
 def upload_generated_obj(folder_path: str, object_name: str = "output.zip",
-                        bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-  """
-  Zips the pipeline output directory and uploads it to R2.
+                         bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
+    """
+    Zips the pipeline output directory and uploads it to R2.
 
-  ZIP structure:
-      obj/high/       <- Texturing_1 contents (OBJ + PNG textures)
-      obj/low/        <- Texturing_2 contents (OBJ + JPG textures)
-      glb/high_model.glb
-      glb/low_model.glb
-      stl/high_model.stl
-      stl/low_model.stl
-      3mf/high_model.3mf
-      3mf/low_model.3mf
-  :param folder_path: Relative or absolute path to the output directory.
-  :type folder_path: str
-  :param object_name: Key used when storing the file in R2.
-  :type object_name: str
-  :param bucket: Bucket to download from
-  :type bucket: str
-  :return: True if upload succeeded, False otherwise.
-  :rtype: bool
-  """
-  zip_path = os.path.join(folder_path, "output.zip")
+    ZIP structure:
+        obj/high/       <- Texturing_1 contents (OBJ + PNG textures)
+        obj/low/        <- Texturing_2 contents (OBJ + JPG textures)
+        glb/high_model.glb
+        glb/low_model.glb
+        stl/high_model.stl
+        stl/low_model.stl
+        3mf/high_model.3mf
+        3mf/low_model.3mf
+    :param folder_path: Relative or absolute path to the output directory.
+    :type folder_path: str
+    :param object_name: Key used when storing the file in R2.
+    :type object_name: str
+    :param bucket: Bucket to download from
+    :type bucket: str
+    :return: True if upload succeeded, False otherwise.
+    :rtype: bool
+    """
+    zip_path = os.path.join(folder_path, "output.zip")
 
-  print(f"  [R2] Building zip archive -> {zip_path}")
-  try:
-      create_output_zip(folder_path, zip_path)
-  except Exception as e:
-      logging.error("[R2] Failed to create zip: %s", e)
-      return False
+    print(f"  [R2] Building zip archive -> {zip_path}")
+    try:
+        create_output_zip(folder_path, zip_path)
+    except Exception as e:
+        logging.error("[R2] Failed to create zip: %s", e)
+        return False
 
-  size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-  print(f"  [R2] Zip ready ({size_mb:.1f} MB). Uploading as '{object_name}'...")
+    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    print(f"  [R2] Zip ready ({size_mb:.1f} MB). Uploading as '{object_name}'...")
 
-  success = upload_file(zip_path, bucket, object_name)
-  if success:
-      print(f"  [R2] Upload complete: {object_name}")
-  else:
-      print(f"  [R2] Upload FAILED for: {object_name}")
+    success = upload_file(zip_path, bucket, object_name)
+    if success:
+        print(f"  [R2] Upload complete: {object_name}")
+    else:
+        print(f"  [R2] Upload FAILED for: {object_name}")
 
-  return success
+    return success
+
 
 def download_file(object_name: str, file_name: str | None = None, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-  """
-  Download a file from an S3 bucket
-  :param object_name: S3 object name
-  :type object_name: str
-  :param file_name: File to download. If not specified then object_name is used
-  :type file_name: str | None
-  :param bucket: Bucket to download from
-  :type bucket: str
-  :return: True if file was downloaded, else False
-  :rtype: bool
-  """
+    """
+    Download a file from an S3 bucket
+    :param object_name: S3 object name
+    :type object_name: str
+    :param file_name: File to download. If not specified then object_name is used
+    :type file_name: str | None
+    :param bucket: Bucket to download from
+    :type bucket: str
+    :return: True if file was downloaded, else False
+    :rtype: bool
+    """
 
-  # If file_name was not specified, use object_name
-  if file_name is None:
-      file_name = object_name
+    # If file_name was not specified, use object_name
+    if file_name is None:
+        file_name = object_name
 
-  # Download the file
-  try:
-      # s3.download_file('amzn-s3-demo-bucket', 'OBJECT_NAME', 'FILE_NAME')
-      s3.download_file(bucket, object_name, file_name)
-  except ClientError as e:
-      logging.error(e)
-      return False
-  return True
+    # Download the file
+    try:
+        # s3.download_file('amzn-s3-demo-bucket', 'OBJECT_NAME', 'FILE_NAME')
+        s3.download_file(bucket, object_name, file_name)
+    except ClientError as e:
+        logging.error(e)
+        return False
+    return True
+
 
 def download_every_img_from_bucket(local_dir: str = INPUT_IMAGES,
                                    bucket: str = R2_PIPELINE_IMAGES_BUCKET,
                                    rig_mode: bool = False,
                                    two_sides_mode: bool = False):
-  """
-  Download all images from the R2 bucket to a local directory.
+    """
+    Download all images from the R2 bucket to a local directory.
 
-  Single mode (rig_mode=False, two_sides_mode=False):
-      Downloads all objects flat into `local_dir/`.
-      R2 keys: IMG_0001.jpg  →  local_dir/IMG_0001.jpg
+    Single mode (rig_mode=False, two_sides_mode=False):
+        Downloads all objects flat into `local_dir/`.
+        R2 keys: IMG_0001.jpg  →  local_dir/IMG_0001.jpg
 
-  Rig mode (rig_mode=True):
-      Downloads all objects preserving subfolder structure into RIG_IMAGES.
-      R2 keys: rig/0/0001.jpg  →  input_images/rig/0/0001.jpg
-               rig/1/0001.jpg  →  input_images/rig/1/0001.jpg
+    Rig mode (rig_mode=True):
+        Downloads all objects preserving subfolder structure into RIG_IMAGES.
+        R2 keys: rig/0/0001.jpg  →  input_images/rig/0/0001.jpg
+                 rig/1/0001.jpg  →  input_images/rig/1/0001.jpg
 
-  Two-sides mode (two_sides_mode=True):
-      Downloads objects preserving rig1/rig2 subfolder structure.
-      R2 keys: rig1/0/0001.jpg  →  input_images/rig1/0/0001.jpg
-               rig1/1/0001.jpg  →  input_images/rig1/1/0001.jpg
-               rig2/0/0001.jpg  →  input_images/rig2/0/0001.jpg
-               rig2/1/0001.jpg  →  input_images/rig2/1/0001.jpg
-  :param local_dir: Local directory to download images into (used in single mode).
-  :type local_dir: str
-  :param bucket: R2 bucket name.
-  :type bucket: str
-  :param rig_mode: If True, download rig-structured images.
-  :type rig_mode: bool
-  :param two_sides_mode: If True, download two-sides structured images into rig1/rig2.
-  :type two_sides_mode: bool
-  :return: None
-  :rtype: None
-  """
-  if two_sides_mode:
-      os.makedirs(TWO_SIDES_RIG1, exist_ok=True)
-      os.makedirs(TWO_SIDES_RIG2, exist_ok=True)
+    Two-sides mode (two_sides_mode=True):
+        Downloads objects preserving rig1/rig2 subfolder structure.
+        R2 keys: rig1/0/0001.jpg  →  input_images/rig1/0/0001.jpg
+                 rig1/1/0001.jpg  →  input_images/rig1/1/0001.jpg
+                 rig2/0/0001.jpg  →  input_images/rig2/0/0001.jpg
+                 rig2/1/0001.jpg  →  input_images/rig2/1/0001.jpg
+    :param local_dir: Local directory to download images into (used in single mode).
+    :type local_dir: str
+    :param bucket: R2 bucket name.
+    :type bucket: str
+    :param rig_mode: If True, download rig-structured images.
+    :type rig_mode: bool
+    :param two_sides_mode: If True, download two-sides structured images into rig1/rig2.
+    :type two_sides_mode: bool
+    :return: None
+    :rtype: None
+    """
+    if two_sides_mode:
+        os.makedirs(TWO_SIDES_RIG1, exist_ok=True)
+        os.makedirs(TWO_SIDES_RIG2, exist_ok=True)
 
-      print("Downloading images from R2 (two-sides mode)...")
-      response = s3.list_objects_v2(Bucket=bucket)
-      if 'Contents' in response:
-          for obj in response['Contents']:
-              file_key = obj['Key']
-              # Keys are: rig1/0/0001.jpg, rig2/1/0001.jpg, etc.
-              if file_key.startswith("rig1/"):
-                  sub_path = file_key[len("rig1/"):]  # e.g. "0/0001.jpg"
-                  local_path = os.path.join(TWO_SIDES_RIG1, *sub_path.split("/"))
-              elif file_key.startswith("rig2/"):
-                  sub_path = file_key[len("rig2/"):]
-                  local_path = os.path.join(TWO_SIDES_RIG2, *sub_path.split("/"))
-              else:
-                  continue
+        print("Downloading images from R2 (two-sides mode)...")
+        response = s3.list_objects_v2(Bucket=bucket)
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                file_key = obj['Key']
+                # Keys are: rig1/0/0001.jpg, rig2/1/0001.jpg, etc.
+                if file_key.startswith("rig1/"):
+                    sub_path = file_key[len("rig1/"):]  # e.g. "0/0001.jpg"
+                    local_path = os.path.join(TWO_SIDES_RIG1, *sub_path.split("/"))
+                elif file_key.startswith("rig2/"):
+                    sub_path = file_key[len("rig2/"):]
+                    local_path = os.path.join(TWO_SIDES_RIG2, *sub_path.split("/"))
+                else:
+                    continue
 
-              os.makedirs(os.path.dirname(local_path), exist_ok=True)
-              print(f"Downloading {file_key} -> {local_path}...")
-              download_file(file_key, local_path, bucket)
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                print(f"Downloading {file_key} -> {local_path}...")
+                download_file(file_key, local_path, bucket)
 
-      print("Downloaded every image (two-sides)")
-      return
+        print("Downloaded every image (two-sides)")
+        return
 
-  if rig_mode:
-      target_dir = RIG_IMAGES
-      os.makedirs(target_dir, exist_ok=True)
+    if rig_mode:
+        target_dir = RIG_IMAGES
+        os.makedirs(target_dir, exist_ok=True)
 
-      print("Downloading images from R2 (rig mode)...")
-      response = s3.list_objects_v2(Bucket=bucket)
-      if 'Contents' in response:
-          for obj in response['Contents']:
-              file_key = obj['Key']
-              if not file_key.startswith("rig/"):
-                  continue
-              # file_key = "rig/0/0001.jpg". Strip "rig/" to get "0/0001.jpg"
-              sub_path = file_key[len("rig/"):]
-              local_path = os.path.join(target_dir, *sub_path.split("/"))
-              os.makedirs(os.path.dirname(local_path), exist_ok=True)
-              print(f"Downloading {file_key} -> {local_path}...")
-              download_file(file_key, local_path, bucket)
+        print("Downloading images from R2 (rig mode)...")
+        response = s3.list_objects_v2(Bucket=bucket)
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                file_key = obj['Key']
+                if not file_key.startswith("rig/"):
+                    continue
+                # file_key = "rig/0/0001.jpg". Strip "rig/" to get "0/0001.jpg"
+                sub_path = file_key[len("rig/"):]
+                local_path = os.path.join(target_dir, *sub_path.split("/"))
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                print(f"Downloading {file_key} -> {local_path}...")
+                download_file(file_key, local_path, bucket)
 
-      print("Downloaded every image (rig)")
-      return
+        print("Downloaded every image (rig)")
+        return
 
-  # Single mode
-  os.makedirs(local_dir, exist_ok=True)
-  print("Downloading images from R2...")
-  response = s3.list_objects_v2(Bucket=bucket)
-  if 'Contents' in response:
-      for obj in response['Contents']:
-          file_key = obj['Key']
-          local_path = os.path.join(local_dir, os.path.basename(file_key))
-          os.makedirs(os.path.dirname(local_path), exist_ok=True)
-          print(f"Downloading {file_key} -> {local_path}...")
-          download_file(file_key, local_path, bucket)
+    # Single mode
+    os.makedirs(local_dir, exist_ok=True)
+    print("Downloading images from R2...")
+    response = s3.list_objects_v2(Bucket=bucket)
+    if 'Contents' in response:
+        for obj in response['Contents']:
+            file_key = obj['Key']
+            local_path = os.path.join(local_dir, os.path.basename(file_key))
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            print(f"Downloading {file_key} -> {local_path}...")
+            download_file(file_key, local_path, bucket)
 
-  print("Downloaded every image")
+    print("Downloaded every image")
+
 
 def download_generated_obj(object_name: str = "output.zip", dest_dir: str | None = None,
-                          bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-  """
-  Downloads the output ZIP from R2 and extracts it into dest_dir.
+                           bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
+    """
+    Downloads the output ZIP from R2 and extracts it into dest_dir.
 
-  Resulting layout after extraction:
-      dest_dir/obj/high/       <- OBJ + PNG textures
-      dest_dir/obj/low/        <- OBJ + JPG textures
-      dest_dir/glb/high_model.glb
-      dest_dir/glb/low_model.glb
-      dest_dir/stl/high_model.stl
-      dest_dir/stl/low_model.stl
-      dest_dir/3mf/high_model.3mf
-      dest_dir/3mf/low_model.3mf
-  :param object_name: R2 key of the zip file (e.g. "output.zip").
-  :type object_name: str
-  :param dest_dir: Local directory where the zip is extracted. Created automatically if it does not exist.
-  :type dest_dir: str | None
-  :param bucket: Bucket to download from
-  :type bucket: str
-  :return: True if download + extraction succeeded, False otherwise.
-  :rtype: bool
-  """
-  if not dest_dir:
-      dest_dir = os.getcwd()
+    Resulting layout after extraction:
+        dest_dir/obj/high/       <- OBJ + PNG textures
+        dest_dir/obj/low/        <- OBJ + JPG textures
+        dest_dir/glb/high_model.glb
+        dest_dir/glb/low_model.glb
+        dest_dir/stl/high_model.stl
+        dest_dir/stl/low_model.stl
+        dest_dir/3mf/high_model.3mf
+        dest_dir/3mf/low_model.3mf
+    :param object_name: R2 key of the zip file (e.g. "output.zip").
+    :type object_name: str
+    :param dest_dir: Local directory where the zip is extracted. Created automatically if it does not exist.
+    :type dest_dir: str | None
+    :param bucket: Bucket to download from
+    :type bucket: str
+    :return: True if download + extraction succeeded, False otherwise.
+    :rtype: bool
+    """
+    if not dest_dir:
+        dest_dir = OUTPUT_DIR
 
-  os.makedirs(dest_dir, exist_ok=True)
+    # Safely clean out old artifacts before extracting new ones
+    if os.path.exists(dest_dir):
+        # Safety guard: ensure we don't accidentally wipe root/current working dir
+        if os.path.abspath(dest_dir) != os.path.abspath(os.getcwd()):
+            shutil.rmtree(dest_dir, ignore_errors=True)
 
-  zip_path = os.path.join(dest_dir, "output.zip")
+    os.makedirs(dest_dir, exist_ok=True)
 
-  print(f"  [R2] Downloading '{object_name}' -> {zip_path}")
-  if not download_file(object_name, zip_path, bucket):
-      print(f"  [R2] Download FAILED for: {object_name}")
-      return False
+    zip_path = os.path.join(dest_dir, "output.zip")
 
-  size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-  print(f"  [R2] Downloaded ({size_mb:.1f} MB). Extracting to {dest_dir}...")
+    print(f"  [R2] Downloading '{object_name}' -> {zip_path}")
+    if not download_file(object_name, zip_path, bucket):
+        print(f"  [R2] Download FAILED for: {object_name}")
+        return False
 
-  try:
-      with zipfile.ZipFile(zip_path, "r") as zipf:
-          zipf.extractall(dest_dir)
-  except zipfile.BadZipFile as e:
-      logging.error("[R2] Extraction failed — bad zip: %s", e)
-      return False
-  finally:
-      os.remove(zip_path)
+    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    print(f"  [R2] Downloaded ({size_mb:.1f} MB). Extracting to {dest_dir}...")
 
-  print(f"  [R2] Extraction complete: {dest_dir}")
-  return True
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zipf:
+            zipf.extractall(dest_dir)
+    except zipfile.BadZipFile as e:
+        logging.error("[R2] Extraction failed — bad zip: %s", e)
+        return False
+    finally:
+        os.remove(zip_path)
+
+    print(f"  [R2] Extraction complete: {dest_dir}")
+    return True
+
 
 def send_images(input_images_path: str = INPUT_IMAGES):
     """Upload flat single-camera images to R2.
@@ -522,6 +541,7 @@ def download_result():
     print("Download resulted model")
     download_generated_obj("output.zip", "./output")
     print("Model downloaded!")
+
 
 def delete_all_files():
     print("Cleaning up R2 bucket...")

@@ -4,6 +4,7 @@ import router.system
 import router.ai
 import router.library
 import router.scanner
+import router.test
 
 from system.exception import SystemConnectionError
 
@@ -17,7 +18,7 @@ async def system_connection_error_handler(request: Request, exc: SystemConnectio
     )
 
 
-routers = [router.system, router.ai, router.library, router.scanner]
+routers = [router.system, router.ai, router.library, router.scanner, router.test]
 
 for router in routers:
     app.include_router(router.router)

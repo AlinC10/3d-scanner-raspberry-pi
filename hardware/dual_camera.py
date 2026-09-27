@@ -99,26 +99,31 @@ class DualCamera:
     def prepare_scan(self, **kwargs) -> List[dict]:
         """
         Prepare and lock both cameras concurrently for scanning.
-        You can pass `focus=(300, 500)` to set different focus values on each camera.
+        You can pass `focus=(300, 500)` or `rotation=(90, 270)` to set independent values per camera.
         """
         focus_val = kwargs.pop("focus", None)
+        rotation_val = kwargs.pop("rotation", None)
         
+        kwargs1 = kwargs.copy()
+        kwargs2 = kwargs.copy()
+
         if isinstance(focus_val, (tuple, list)) and len(focus_val) == 2 and isinstance(focus_val[0], (int, str, type(None))):
-            # If a valid tuple is passed, give each camera its own focus parameter
-            kwargs1 = kwargs.copy()
             kwargs1["focus"] = focus_val[0]
-            
-            kwargs2 = kwargs.copy()
             kwargs2["focus"] = focus_val[1]
-            
-            f1 = self._executor.submit(self.cam1.prepare_scan, **kwargs1)
-            f2 = self._executor.submit(self.cam2.prepare_scan, **kwargs2)
-            return [f1.result(), f2.result()]
         else:
-            # Pass the exact same focus value (int, "auto", or None) to both
-            kwargs["focus"] = focus_val
-            futures = [self._executor.submit(cam.prepare_scan, **kwargs) for cam in self.cameras]
-            return [f.result() for f in futures]
+            kwargs1["focus"] = focus_val
+            kwargs2["focus"] = focus_val
+
+        if isinstance(rotation_val, (tuple, list)) and len(rotation_val) == 2 and isinstance(rotation_val[0], (int, str, type(None))):
+            kwargs1["rotation"] = rotation_val[0]
+            kwargs2["rotation"] = rotation_val[1]
+        else:
+            kwargs1["rotation"] = rotation_val
+            kwargs2["rotation"] = rotation_val
+            
+        f1 = self._executor.submit(self.cam1.prepare_scan, **kwargs1)
+        f2 = self._executor.submit(self.cam2.prepare_scan, **kwargs2)
+        return [f1.result(), f2.result()]
 
     def lock_auto_features(self, settle_time: float = 2.0) -> List[dict]:
         """Lock the current AE/AWB settings on both cameras concurrently."""

@@ -75,3 +75,24 @@ The `_PREPARE_ALLOWED` and `_TERMINAL` tuple definitions are now class-level att
   - **Asynchronous Execution (`/start`):** Built `POST /scanning/start`. It validates the rig is `PREPARED`, instantly returns `202 Accepted`, and shifts the massive workload (mechanical scan -> RunPod launch -> R2 download) into a `fastapi.BackgroundTasks` runner to prevent orphaned HTTP threading.
   - **State Machine UI Polling (`/status`):** Built `GET /scanning/status` to expose `scanner.state` (e.g. `PROCESSING`, `DOWNLOADING`, `ERROR`) and `total_photos` natively to the frontend polling loop.
   - **Emergency Stop API (`/cancel`):** Built `POST /scanning/cancel`. Instantly fires `scanner.emergency_stop()`, which cuts motor power, sets `_cancel_event` to kill any active RunPod GraphQL polling loops, terminates active cloud pods, and forces the state to `CANCELLED`.
+
+---
+
+## Phase D: Asynchronous Preparation & Camera Streaming (Completed)
+**Goal:** Implement a 4-Phase architecture for the `prepare` sequence to instantly provide live stream URLs while safely homing the rig and auto-tuning cameras asynchronously.
+
+### Accomplishments
+1. **Camera Re-entrancy (`hardware/camera/camera.py`)**: 
+   - Wrapped stream configuration inside `if not getattr(self.picam2, "started", False):`.
+   - Allows `prepare_scan()` to be called multiple times without crushing the H.264 encoder, enabling safe in-place recalibration of AE/AWB parameters.
+2. **Scanner Pipeline Restructuring (`hardware/scanner.py`)**:
+   - Split the monolithic prepare into `setup_and_stream()` and `finish_preparation()`.
+   - `setup_and_stream`: Instantiates dual cameras, starts the sensor, starts the RTSP stream, and returns the stream URLs.
+   - `finish_preparation`: Travels down to home endstop, raises by 30mm, cleans the R2 bucket, and **re-calls** `dual_cameras.prepare_scan(**kwargs, keep_running=True)` to perfectly auto-tune and lock exposure directly in front of the illuminated object.
+   - Guarded `finish_preparation` thoroughly against `_cancel_event` race conditions.
+3. **API Orchestration (`router/scanner.py`)**:
+   - Converted `POST /prepare` to execute `setup_and_stream()` synchronously for an immediate `< 2s` response carrying the RTSP stream links.
+   - Delegated `finish_preparation` to `fastapi.BackgroundTasks`.
+4. **Schema Updates (`schemas/scanner.py`)**:
+   - Attached `stream_urls: list[str] | None` to both `PrepareResponse` and `StatusResponse`.
+   - Built full typed schemas for `/start` (`StartResponse`), `/cancel` (`CancelResponse`), and `/status` (`StatusResponse`).

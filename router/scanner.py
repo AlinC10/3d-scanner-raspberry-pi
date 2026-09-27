@@ -13,21 +13,32 @@ router = APIRouter(
     tags=["Scanner"],
 )
 
-# Step 13: Singleton Hardware State
 # The scanner is initialized once and kept in memory as a singleton across the FastAPI application lifecycle.
 scanner = Scanner()
 
-@router.post("/prepare")
-def prepare_scan(req: PrepareRequest):
+def _finish_preparation_worker(kwargs: dict):
+    scanner.finish_preparation(**kwargs)
+
+@router.post("/prepare", response_model=PrepareResponse, status_code=202)
+def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
     """
     Safely triggers the homing, lighting, and camera initializations for the frontend framing.
     """
     try:
-        url = scanner.prepare_scan(
+        urls = scanner.setup_and_stream(
             enable_stream=req.enable_stream,
-            bitrate=req.bitrate
+            bitrate=req.bitrate,
+            **req.camera_config.model_dump()
         )
-        return {"status": "success", "stream_url": url, "state": scanner.state}
+        
+        background_tasks.add_task(_finish_preparation_worker, req.camera_config.model_dump())
+        
+        return PrepareResponse(
+            status="accepted", 
+            message="Live stream started. Rig homing and camera tuning in progress.", 
+            state=scanner.state, 
+            stream_urls=urls
+        )
     except RuntimeError as e:
         # State validation failures
         raise HTTPException(status_code=400, detail=str(e))
@@ -44,10 +55,8 @@ def _orchestrate_pipeline(req: StartRequest):
         # 1. Mechanical Scan
         scanner.scan(
             angle=req.mechanical.angle,
-            step_type=req.mechanical.turntable.step_type,
             delay_turntable=req.mechanical.turntable.delay,
             z_move_mm=req.mechanical.z_move_mm,
-            z_step_type=req.mechanical.z_axis.step_type,
             delay_z_motor=req.mechanical.z_axis.delay
         )
         
@@ -100,7 +109,7 @@ def _orchestrate_pipeline(req: StartRequest):
         if scanner.state != ScannerState.CANCELLED:
             scanner.state = ScannerState.ERROR
 
-@router.post("/start", status_code=202)
+@router.post("/start", response_model=StartResponse, status_code=202)
 def start_scan(req: StartRequest, background_tasks: BackgroundTasks):
     """
     Delegates the mechanical scan and cloud execution to a background pipeline.
@@ -109,25 +118,26 @@ def start_scan(req: StartRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=f"Cannot start scan from state {scanner.state}. Must be PREPARED.")
         
     background_tasks.add_task(_orchestrate_pipeline, req)
-    return {"status": "accepted", "message": "Pipeline started."}
+    return StartResponse(status="accepted", message="Pipeline started.")
 
-@router.post("/cancel")
+@router.post("/cancel", response_model=CancelResponse)
 def cancel_scan():
     """
     Instantly stops all mechanical movement and terminates any running cloud pods.
     """
     try:
         scanner.emergency_stop()
-        return {"status": "success", "state": scanner.state}
+        return CancelResponse(status="success", state=scanner.state)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/status")
+@router.get("/status", response_model=StatusResponse)
 def get_status():
     """
     Poll this endpoint to observe the active pipeline state.
     """
-    return {
-        "state": scanner.state,
-        "total_photos": getattr(scanner, "total_photos", 0)
-    }
+    return StatusResponse(
+        state=scanner.state,
+        total_photos=getattr(scanner, "total_photos", 0),
+        stream_urls=getattr(scanner, "stream_urls", None)
+    )

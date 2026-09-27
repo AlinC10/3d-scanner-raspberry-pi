@@ -424,12 +424,13 @@ class ArducamIMX477:
         if rotation is not None:
             self.rotation = rotation
 
-        preview_resolution = preview_resolution or self._preview_size
-        # self._configure_preview(preview_resolution)
-        self._configure_still(preview_resolution or self._preview_size)
-        if show_preview:
-            self.picam2.start_preview(Preview.QT)
-        self.picam2.start()
+        if not getattr(self.picam2, "started", False):
+            preview_resolution = preview_resolution or self._preview_size
+            # self._configure_preview(preview_resolution)
+            self._configure_still(preview_resolution or self._preview_size)
+            if show_preview:
+                self.picam2.start_preview(Preview.QT)
+            self.picam2.start()
         try:
             if focus is not None:
                 if isinstance(focus, str):
