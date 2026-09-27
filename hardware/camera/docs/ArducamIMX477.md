@@ -40,6 +40,13 @@ Captures a JPEG still (and optionally a DNG raw file if `raw=True`). Handles any
 ### `record_video(self, output=None, duration=10.0, resolution=None, quality=25) -> str`
 Records an H.264 video stream wrapped in an MP4 container.
 
+### `start_stream(self, rtsp_url="rtsp://localhost:8554/", bitrate=2_000_000) -> str`
+Pushes a live H.264 video feed from the `lores` stream to MediaMTX via RTSP over TCP. Leaves the uncompressed `main` stream free for simultaneous photo captures.
+* **Returns**: Full RTSP stream URL (e.g. `rtsp://localhost:8554/cam0`).
+
+### `stop_stream(self)`
+Stops the active RTSP live video stream.
+
 ## Focus Control Methods
 
 * **`focus_set(self, position: int)`**: Set absolute focus position (0 to 1023).
