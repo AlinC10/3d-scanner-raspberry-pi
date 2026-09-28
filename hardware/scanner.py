@@ -196,39 +196,39 @@ class Scanner:
 
             self._upload_thread = None
 
-    def move_z_up(self, steps: int = 20, delay: float = 0.001, step_type: Optional[str] = None):
+    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None):
         """Move Z-axis UP. Blocked if the top endstop is already active."""
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
 
         self.z_axis_motor.rotate(clockwise=True, steps=steps, delay=delay, step_type=step_type)
 
-    def move_z_down(self, steps: int = 20, delay: float = 0.001, step_type: Optional[str] = None):
+    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None):
         """Move Z-axis DOWN. Blocked if the bottom endstop is already active."""
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
 
         self.z_axis_motor.rotate(clockwise=False, steps=steps, delay=delay, step_type=step_type)
         
-    def move_z_up_angle(self, angle: float= 18.0, delay: float = 0.001, step_type: Optional[str] = None):
+    def move_z_up_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None):
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
             
         self.z_axis_motor.rotate_angle(clockwise=True, angle=angle, delay=delay, step_type=step_type)
 
-    def move_z_down_angle(self, angle: float= 18.0, delay: float = 0.001, step_type: Optional[str] = None):
+    def move_z_down_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None):
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
             
         self.z_axis_motor.rotate_angle(clockwise=False, angle=angle, delay=delay, step_type=step_type)
 
-    def move_z_up_distance(self, distance: float= 100.0, delay: float = 0.001, step_type: Optional[str] = None):
+    def move_z_up_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None):
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
 
         self.z_axis_motor.rotate_distance(clockwise=True, distance=distance, delay=delay, step_type=step_type)
 
-    def move_z_down_distance(self, distance: float= 100.0, delay: float = 0.001, step_type: Optional[str] = None):
+    def move_z_down_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None):
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
 
@@ -240,7 +240,7 @@ class Scanner:
 
         try:
             while True:
-                self.move_z_down(steps=20, delay=0.0005)
+                self.move_z_down(steps=20, delay=0.0010)
         except BottomEndstopTriggered:
             pass
         except Exception as e:
@@ -249,7 +249,7 @@ class Scanner:
             self.z_axis_motor.stop()
             self.z_axis_motor.disable()
 
-    def move_z_to_top(self, delay: float = 0.0005):
+    def move_z_to_top(self, delay: float = 0.0010):
         """The z-axis motor will rotate UP until it reaches the top endstop."""
         self.z_axis_motor.enable()
 
@@ -396,9 +396,9 @@ class Scanner:
     def scan(
         self, 
         angle: float = 18.0, 
-        delay_turntable: float = 0.0005,
+        delay_turntable: float = 0.0010,
         z_move_mm: float = 100.0,
-        delay_z_motor: float = 0.0005
+        delay_z_motor: float = 0.0010
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.

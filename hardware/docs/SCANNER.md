@@ -171,7 +171,7 @@ Background worker for homing down, +30mm offset, R2 bucket cleanup, and in-place
 #### `home_z_axis() -> None`
 Drives carriage downward continuously in 20-step increments until `down_endstop` triggers.
 
-#### `move_z_to_top(delay: float = 0.0005) -> None`
+#### `move_z_to_top(delay: float = 0.0010) -> None`
 Drives carriage upward continuously until `up_endstop` triggers.
 
 #### `move_z_up_distance(distance: float = 100.0, delay: float = 0.001) -> None`
@@ -180,7 +180,7 @@ Moves carriage UP by distance in millimeters. Blocked if top limit switch is act
 #### `move_z_down_distance(distance: float = 100.0, delay: float = 0.001) -> None`
 Moves carriage DOWN by distance in millimeters. Blocked if bottom limit switch is active.
 
-#### `scan(angle: float = 18.0, delay_turntable: float = 0.0005, z_move_mm: float = 100.0, delay_z_motor: float = 0.0005) -> None`
+#### `scan(angle: float = 18.0, delay_turntable: float = 0.0010, z_move_mm: float = 100.0, delay_z_motor: float = 0.0010) -> None`
 Executes full physical scanning and parallel image upload sequence.
 
 #### `generate_livestream(bitrate: int = 2_000_000) -> list[str] | None`

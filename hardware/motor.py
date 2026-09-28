@@ -1,9 +1,11 @@
+import threading
+import time
 from typing import Optional
 
-from RpiMotorLib import RpiMotorLib
 from gpiozero import DigitalOutputDevice
 
-T8_THREADED_ROD_STEP = 8 # mm
+T8_THREADED_ROD_STEP = 8  # mm
+
 
 class MotorError(Exception):
     pass
@@ -11,7 +13,7 @@ class MotorError(Exception):
 
 class Motor:
     """
-    Stepper motor controller for NEMA 17 stepper motor with DRV8825 driver.
+    Stepper motor controller for NEMA 17 stepper motor with TB6600 driver.
     """
     nema17_step_angle = 1.8  # degrees
 
@@ -23,7 +25,7 @@ class Motor:
             step_type: str = "Full"
     ) -> None:
         """
-        Initializes the NEMA 17 stepper motor with the DRV8825 driver.
+        Initializes the NEMA 17 stepper motor with the TB6600 driver.
 
         :param dir_pin: GPIO pin connected to DIR on the driver (defaults to 20).
         :type dir_pin: int
@@ -32,10 +34,11 @@ class Motor:
         :param en_pin: GPIO pin connected to EN on the driver to enable/disable it.
                        Defaults to 16. Pass None if EN pin is hardwired or unused.
         :type en_pin: Optional[int]
-        :param step_type:
+        :param step_type: Default microstepping mode string.
         :type step_type: str
         """
-        self.motor = RpiMotorLib.A4988Nema(direction_pin=dir_pin, step_pin=step_pin, motor_type="DRV8825", mode_pins=(-1, -1, -1))
+        self.dir_device = DigitalOutputDevice(dir_pin)
+        self.step_device = DigitalOutputDevice(step_pin)
 
         self.en_device = None
         if en_pin is not None:
@@ -43,6 +46,7 @@ class Motor:
             self.disable()  # Default to disabled until explicitly enabled
 
         self.step_type = step_type
+        self._stop_event = threading.Event()
 
     def handle_driver_fault(self) -> None:
         self.stop()
@@ -61,8 +65,6 @@ class Motor:
         """
         if self.en_device:
             self.en_device.on()
-
-
 
     def angle_to_steps_conversion(self, angle: int | float = 18, step_type: Optional[str] = None):
         if step_type is None:
@@ -104,7 +106,11 @@ class Motor:
             delay: float | int = 0.002,
             step_type: Optional[str] = None,
             verbose: bool = False,
-            initial_delay: float | int = 0.05) -> None:
+            initial_delay: float | int = 0.05,
+            acceleration: bool = True,
+            start_delay: Optional[float] = None,
+            ramp_percent: float = 0.2,
+            cancel_event: Optional[threading.Event] = None) -> None:
         """
         Rotates the motor by a specific angle. Verifies if the requested angle
         is perfectly divisible by the given step_type. If not, raises an error.
@@ -121,16 +127,25 @@ class Motor:
                 delay=delay, 
                 step_type=step_type, 
                 verbose=verbose,
-                initial_delay=initial_delay
+                initial_delay=initial_delay,
+                acceleration=acceleration,
+                start_delay=start_delay,
+                ramp_percent=ramp_percent,
+                cancel_event=cancel_event
             )
 
-    def rotate_distance(self,
-                        clockwise: bool = True,
-                        distance: int | float = 100.0,
-                        delay: float | int = 0.002,
-                        step_type: Optional[str] = None,
-                        verbose: bool = False,
-                        initial_delay: float | int = 0.05) -> None:
+    def rotate_distance(
+            self,
+            clockwise: bool = True,
+            distance: int | float = 100.0,
+            delay: float | int = 0.002,
+            step_type: Optional[str] = None,
+            verbose: bool = False,
+            initial_delay: float | int = 0.05,
+            acceleration: bool = True,
+            start_delay: Optional[float] = None,
+            ramp_percent: float = 0.2,
+            cancel_event: Optional[threading.Event] = None) -> None:
         if step_type is None:
             step_type = self.step_type
 
@@ -142,9 +157,12 @@ class Motor:
                 delay=delay,
                 step_type=step_type,
                 verbose=verbose,
-                initial_delay=initial_delay
+                initial_delay=initial_delay,
+                acceleration=acceleration,
+                start_delay=start_delay,
+                ramp_percent=ramp_percent,
+                cancel_event=cancel_event
             )
-
 
     def rotate(
             self,
@@ -153,33 +171,89 @@ class Motor:
             delay: float | int = 0.002,
             step_type: Optional[str] = None,
             verbose: bool = False,
-            initial_delay: float | int = 0.05) -> None:
+            initial_delay: float | int = 0.05,
+            acceleration: bool = True,
+            start_delay: Optional[float] = None,
+            ramp_percent: float = 0.2,
+            cancel_event: Optional[threading.Event] = None) -> None:
         """
-        Rotates the motor.
+        Rotates the motor using native GPIO stepping with optional trapezoidal
+        acceleration and deceleration profiling to prevent inertial overshoot.
 
         :param clockwise: Direction of rotation, True for clockwise, False for counter-clockwise.
         :type clockwise: bool
         :param steps: Number of steps to rotate.
         :type steps: int
-        :param delay: Step delay in seconds between pulses.
+        :param delay: Cruise step delay in seconds between pulses.
         :type delay: float | int
-        :param step_type: Microstepping mode (e.g., "Full", "Half", "1/32").
-                          This string is ignored by the hardware if mode_pins are set to (-1, -1, -1).
-        :type step_type: str
-        :param verbose: Write pin actions
+        :param step_type: Microstepping mode (retained for signature compatibility).
+        :type step_type: Optional[str]
+        :param verbose: Write step diagnostics if True.
         :type verbose: bool
-        :param initial_delay: Initial delay after GPIO pins initialized but before motor is moved.
+        :param initial_delay: Initial delay after setting direction pin before stepping.
         :type initial_delay: float | int
+        :param acceleration: Whether to apply acceleration/deceleration ramping. Defaults to True.
+        :type acceleration: bool
+        :param start_delay: Starting/stopping delay for ramp. Defaults to max(delay * 3.0, 0.0025).
+        :type start_delay: Optional[float]
+        :param ramp_percent: Fraction of total steps spent accelerating and decelerating (0.0 to 0.5).
+        :type ramp_percent: float
+        :param cancel_event: Optional external threading.Event for cooperative cancellation.
+        :type cancel_event: Optional[threading.Event]
         """
-        if step_type is None:
-            step_type = self.step_type
+        if steps <= 0:
+            return
 
-        self.motor.motor_go(clockwise, step_type, steps, delay, verbose, initial_delay)
+        self._stop_event.clear()
+        self.dir_device.value = 1 if clockwise else 0
+        if initial_delay > 0:
+            time.sleep(initial_delay)
+
+        target_delay = float(delay)
+        
+        if acceleration:
+            cushion_delay = float(start_delay) if start_delay is not None else max(target_delay * 3.0, 0.0025)
+            bounded_ramp_percent = max(0.0, min(float(ramp_percent), 0.5))
+            ramp_steps = min(int(steps * bounded_ramp_percent), steps // 2)
+        else:
+            cushion_delay = target_delay
+            ramp_steps = 0
+
+        for i in range(steps):
+            if self._stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                if verbose:
+                    print(f"[Motor] Interrupted at step {i}/{steps}")
+                break
+
+            # Calculate delay for this step (trapezoidal profile)
+            if ramp_steps > 0:
+                if i < ramp_steps:
+                    progress = i / ramp_steps
+                    current_delay = cushion_delay - progress * (cushion_delay - target_delay)
+                elif i >= (steps - ramp_steps):
+                    steps_from_end = steps - 1 - i
+                    progress = steps_from_end / ramp_steps
+                    current_delay = cushion_delay - progress * (cushion_delay - target_delay)
+                else:
+                    current_delay = target_delay
+            else:
+                current_delay = target_delay
+
+            # Symmetric 50% duty cycle for maximum jitter tolerance in Python
+            half_delay = current_delay / 2.0
+
+            # Send step pulse
+            self.step_device.on()
+            time.sleep(half_delay)
+            self.step_device.off()
+            time.sleep(half_delay)
+            if verbose:
+                print(f"Steps count {i+1}", end="\r", flush=True)
 
     def stop(self, release_torque: Optional[bool] = False) -> None:
         """
-        Interrupts a currently running motor_go loop.
+        Interrupts a currently running rotate loop.
         """
-        self.motor.motor_stop()
+        self._stop_event.set()
         if release_torque:
             self.disable()

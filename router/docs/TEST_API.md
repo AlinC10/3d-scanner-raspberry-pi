@@ -83,7 +83,7 @@ Flips the current lighting state.
 ## 3. Motor Homing & Limit Seeking
 
 ### `POST /test/motor/home-bottom`
-Moves the carriage downward in small increments (20 steps at 0.0005s delay) until the bottom limit switch activates. When triggered, the motor automatically disables torque.
+Moves the carriage downward in small increments (20 steps at 0.0010s delay) until the bottom limit switch activates. When triggered, the motor automatically disables torque.
 
 * **Response (`200 OK`)**:
   ```json
@@ -105,7 +105,7 @@ Moves the carriage downward in small increments (20 steps at 0.0005s delay) unti
 Moves the carriage upward until the top limit switch activates.
 
 * **Query Parameters**:
-  * `delay` (optional float, default `0.0005`, min `0.0001`, max `0.01`): Step pulse delay.
+  * `delay` (optional float, default `0.0010`, min `0.0001`, max `0.01`): Step pulse delay.
 
 * **Response (`200 OK`)**:
   ```json
@@ -118,7 +118,7 @@ Moves the carriage upward until the top limit switch activates.
 
 * **Example `curl`**:
   ```bash
-  curl -X POST "http://localhost:8000/test/motor/move-to-top?delay=0.0005"
+  curl -X POST "http://localhost:8000/test/motor/move-to-top?delay=0.0010"
   ```
 
 ---
@@ -133,12 +133,12 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
   {
     "distance_mm": 15.0,
     "direction": "up",
-    "delay": 0.0005
+    "delay": 0.0010
   }
   ```
   * `distance_mm` (float, default `10.0`, range `0.1`–`200.0`): Travel distance.
   * `direction` (`"up"` | `"down"`, default `"up"`).
-  * `delay` (float, default `0.0005`): Step pulse delay.
+  * `delay` (float, default `0.0010`): Step pulse delay.
 
 * **Response (`200 OK`)**:
   ```json
@@ -174,12 +174,12 @@ Rotates the turntable platter by a specific angle.
   {
     "angle": 18.0,
     "clockwise": true,
-    "delay": 0.0005
+    "delay": 0.0010
   }
   ```
   * `angle` (float, default `18.0`, range `0.1`–`360.0`).
   * `clockwise` (bool, default `true`).
-  * `delay` (float, default `0.0005`).
+  * `delay` (float, default `0.0010`).
 
 * **Response (`200 OK`)**:
   ```json

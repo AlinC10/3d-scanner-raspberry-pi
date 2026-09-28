@@ -21,7 +21,7 @@ The physical system is orchestrated entirely by the edge device, functioning as 
 *   **Vision System:** 2x Arducam B0272 12MP IMX477 (Motorized Focus).
     *   Mounted horizontally on the Z-axis with a 30° or 45° converging angle.
     *   Operates in a Master-Slave configuration synchronized via XVS to capture extended geometry in a single trigger.
-*   **Kinematics (Motors & Drivers):** 2x NEMA17 stepper motors (1.5A, 1.8°) driven by DRV8825 drivers.
+*   **Kinematics (Motors & Drivers):** 2x NEMA17 stepper motors (1.5A, 1.8°) driven by TB6600 drivers.
     *   **Z-Axis Motor:** Moves the horizontal camera mount vertically.
     *   **Rotary Motor:** Spins the central platform.
 *   **Mechanical Structure:** 

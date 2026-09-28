@@ -1,6 +1,6 @@
 # Motor Controller & Kinematics (`../motor.py`)
 
-The `Motor` class in `../motor.py` is the hardware abstraction layer for driving **NEMA 17 stepper motors** using **Texas Instruments DRV8825 stepper motor drivers** on Raspberry Pi OS.
+The `Motor` class in `../motor.py` is the hardware abstraction layer for driving **NEMA 17 stepper motors** using **Texas Instruments TB6600 stepper motor drivers** on Raspberry Pi OS.
 
 It encapsulates microstepping pulse calculations, angular rotation math, linear T8 lead screw kinematics, and thermal/power management via active-low enable control.
 
@@ -11,7 +11,7 @@ It encapsulates microstepping pulse calculations, angular rotation math, linear 
 | Component | Specification | Description / Value |
 |---|---|---|
 | **Stepper Motor** | NEMA 17 Bipolar | `1.8°` step angle (200 full steps per 360° revolution) |
-| **Driver Carrier** | TI DRV8825 | Up to 1/32 microstepping, 2.5A peak current |
+| **Driver Carrier** | TB6600 | Up to 1/16 microstepping, 5A peak current |
 | **Z-Axis Lead Screw** | T8 Lead Screw | `8mm` pitch / lead (1 full 360° revolution = 8mm linear travel) |
 | **Logic Voltage** | 3.3V GPIO | Compatible with Raspberry Pi 4 / 5 GPIO logic levels |
 
@@ -28,8 +28,8 @@ In the 3D scanner architecture, two separate `Motor` instances are initialized i
 
 > [!NOTE]
 > **Hardwired Microstepping Pins (`mode_pins=(-1, -1, -1)`)**:
-> The DRV8825 driver mode pins (`M0`, `M1`, `M2`) are hardwired physically on the driver board (via jumpers or pull-up/pull-down resistors). 
-> Therefore, `RpiMotorLib` is initialized with `mode_pins=(-1, -1, -1)` to prevent software GPIO toggling. The `step_type` parameter is used exclusively by our Python conversion math to calculate the required pulse count.
+> The TB6600 driver mode pins are hardwired physically on the driver board (via pull-up/pull-down resistors). 
+The `step_type` parameter is used exclusively by our Python conversion math to calculate the required pulse count.
 
 ---
 
@@ -81,7 +81,7 @@ $$\text{Steps} = \text{angle\_to\_steps\_conversion}(\theta_{\text{degrees}}, \t
 
 Stepper motors consume full holding current even when stationary, which causes coils and drivers to overheat if left energized while idle.
 
-The DRV8825 `EN` (Enable) pin is **active-low**:
+The TB6600 `EN` (Enable) pin is **active-low**:
 * **`enable()`**: Drives `EN` pin **LOW** (`en_device.off()`). Energizes the motor coils for motion.
 * **`disable()`**: Drives `EN` pin **HIGH** (`en_device.on()`). Cuts current to the motor coils, releasing holding torque.
 
@@ -130,14 +130,18 @@ Rotates the motor by exact degrees. Verifies angle divisibility before starting.
 #### `rotate_distance(clockwise: bool = True, distance: float = 100.0, delay: float = 0.002, step_type: Optional[str] = None, initial_delay: float = 0.05) -> None`
 Moves linear lead screw carriage by distance in millimeters.
 
-#### `rotate(clockwise: bool = True, steps: int = 200, delay: float = 0.002, step_type: Optional[str] = None, initial_delay: float = 0.05) -> None`
-Direct low-level step pulse dispatch to `RpiMotorLib.motor_go()`.
+#### `rotate(clockwise: bool = True, steps: int = 200, delay: float = 0.002, step_type: Optional[str] = None, verbose: bool = False, initial_delay: float = 0.05, acceleration: bool = True, start_delay: Optional[float] = None, ramp_percent: float = 0.2, cancel_event: Optional[threading.Event] = None) -> None`
+Native GPIO step pulse dispatcher with smooth trapezoidal / triangular acceleration and deceleration profiling.
+* `acceleration`: When `True` (default), smoothly ramps speed up and down to eliminate inertial overshoot with heavy objects. Set to `False` for constant-velocity stepping.
+* `start_delay`: Initial and final crawl delay. Defaults to `max(delay * 3.0, 0.0025)`.
+* `ramp_percent`: Percentage of total steps spent accelerating and decelerating (defaults to `0.20`, max `0.50`).
+* `cancel_event`: Optional external `threading.Event` checked alongside the internal `_stop_event` on every step pulse for cooperative cancellation.
 
 #### `stop(release_torque: bool = False) -> None`
-Interrupts an active `motor_go` loop. If `release_torque=True`, immediately calls `disable()`.
+Signals the internal `threading.Event` to immediately break an active `rotate()` loop in sub-milliseconds. If `release_torque=True`, immediately calls `disable()`.
 
 #### `handle_driver_fault() -> None`
-Emergency handler for DRV8825 `FAULT` conditions. Stops motor and raises `MotorError`.
+Emergency handler for TB6600 `FAULT` conditions. Stops motor and raises `MotorError`.
 
 ---
 
@@ -153,7 +157,7 @@ turntable = Motor(dir_pin=24, step_pin=23, en_pin=18, step_type="1/4")
 turntable.enable()
 try:
     # Rotate 18 degrees clockwise with 0.5ms step pulse delay
-    turntable.rotate_angle(clockwise=True, angle=18.0, delay=0.0005)
+    turntable.rotate_angle(clockwise=True, angle=18.0, delay=0.0010)
 finally:
     turntable.disable()  # Cut power so motor doesn't get hot while camera captures
 ```
@@ -168,7 +172,7 @@ z_axis = Motor(dir_pin=19, step_pin=26, en_pin=21, step_type="1/16")
 z_axis.enable()
 try:
     # Climb 30.0 mm up
-    z_axis.rotate_distance(clockwise=True, distance=30.0, delay=0.0005)
+    z_axis.rotate_distance(clockwise=True, distance=30.0, delay=0.0010)
 finally:
     z_axis.disable()
 ```
@@ -187,7 +191,7 @@ bottom_switch.when_pressed = z_motor.stop
 z_motor.enable()
 try:
     while not bottom_switch.is_active:
-        z_motor.rotate(clockwise=False, steps=20, delay=0.0005)
+        z_motor.rotate(clockwise=False, steps=20, delay=0.0010)
 finally:
     z_motor.stop(release_torque=True)
 ```

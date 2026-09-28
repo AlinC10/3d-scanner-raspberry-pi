@@ -24,7 +24,7 @@ Currently, the development is focused strictly on the **CLI/Hardware layer**. AP
         *   I2C Focus Control - The focusing process is controlled via software instead of your bare hands. Use keyboard arrows keys to adjust the focus to the best or OpenCV autofocus examples to automate it.
         *   Focus Distance: 80mm to infinity
 
-*   **Kinematics (Motors & Mechanics):** 2x NEMA17 Stepper Motors (1.5A, 1.8°/step) driven by **DRV8825** drivers.
+*   **Kinematics (Motors & Mechanics):** 2x NEMA17 Stepper Motors (1.5A, 1.8°/step) driven by **TB6600** drivers.
     *   **Z-Axis Motor:** Moves the dual-camera bracket vertically. Uses a T8x8 (P2) trapezoidal lead screw with an MGN9 linear guide rail system.
     *   **Turntable Motor:** Rotates the central scanning platform. Supported by a heavy-duty unidirectional axial bearing (120/155mm).
 *   **Peripherals:** 
@@ -44,7 +44,7 @@ The software follows a strict Object-Oriented design. Each hardware component ha
     *   Responsible for hardware-synced dual triggering (Master-Slave logic).
 *   **`Motor` Class:** 
     *   Wrapper for stepper motor control (Z-axis and Turntable).
-    *   **Core Library:** `RpiMotorLib` (specifically `RpiMotorLib` for DRV8825).
+    *   **Core Library:** `RpiMotorLib` (specifically `RpiMotorLib` for TB6600).
     *   **Types used:** `typing.Tuple`.
 
 ### Classes to be developed/refined by AI:

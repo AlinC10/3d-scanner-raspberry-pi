@@ -21,7 +21,7 @@ This project is an automated, hybrid 3D scanning system designed to digitize bot
 
 **SBC:** Raspberry Pi 5 8GB (Master controller)
 **Optics:** 2x Arducam B0272 12MP IMX477 Motorized Focus HQ Cameras. Hardware synchronized via XVS (Master-Slave config, angled 30°-45°).
-**Kinematics:** 2x NEMA17 Stepper Motors (1.5A, 1.8°/step) driven by DRV8825.
+**Kinematics:** 2x NEMA17 Stepper Motors (1.5A, 1.8°/step) driven by TB6600.
 * Z-Axis Motor (T8x8 lead screw, MGN9 rails)
 * Turntable Motor (Axial bearing)
 

@@ -185,10 +185,10 @@ Starts the automated scanning and cloud 3D generation workflow.
     "angle": 18.0,
     "z_move_mm": 100.0,
     "turntable": {
-      "delay": 0.0005
+      "delay": 0.0010
     },
     "z_axis": {
-      "delay": 0.0005
+      "delay": 0.0010
     }
   },
   "cloud": {
@@ -223,8 +223,8 @@ curl -X POST http://localhost:8000/scanner/start \
        "mechanical": {
          "angle": 18.0,
          "z_move_mm": 50.0,
-         "turntable": {"delay": 0.0005},
-         "z_axis": {"delay": 0.0005}
+         "turntable": {"delay": 0.0010},
+         "z_axis": {"delay": 0.0010}
        },
        "cloud": {
          "mode": "rig",
@@ -329,7 +329,7 @@ async function startScan(jobId: string) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       job_id: jobId,
-      mechanical: { angle: 18.0, z_move_mm: 80.0, turntable: { delay: 0.0005 }, z_axis: { delay: 0.0005 } },
+      mechanical: { angle: 18.0, z_move_mm: 80.0, turntable: { delay: 0.0010 }, z_axis: { delay: 0.0010 } },
       cloud: { mode: "rig", depthmap_downscale: 2 }
     })
   });

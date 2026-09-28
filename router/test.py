@@ -26,10 +26,10 @@ class ZMoveRequest(BaseModel):
         description="Direction of carriage travel."
     )] = "up"
     delay: Annotated[float, Field(
-        ge=0.0001,
+        ge=0.0002,
         le=0.01,
         description="Delay in seconds between motor step pulses."
-    )] = 0.0005
+    )] = 0.0010
 
 
 class TurntableRotateRequest(BaseModel):
@@ -42,10 +42,10 @@ class TurntableRotateRequest(BaseModel):
         description="Rotation direction (True = clockwise, False = counter-clockwise)."
     )] = True
     delay: Annotated[float, Field(
-        ge=0.0001,
+        ge=0.0002,
         le=0.01,
         description="Delay in seconds between motor step pulses."
-    )] = 0.0005
+    )] = 0.0010
 
 
 class StreamTestRequest(BaseModel):
@@ -122,7 +122,7 @@ def test_home_bottom():
 
 
 @router.post("/motor/move-to-top")
-def test_move_to_top(delay: float = Query(0.0005, ge=0.0001, le=0.01)):
+def test_move_to_top(delay: float = Query(0.0010, ge=0.0002, le=0.01)):
     """
     Moves the Z-axis carriage UP until the top limit switch is triggered.
     Stops and releases torque upon reaching the switch.
