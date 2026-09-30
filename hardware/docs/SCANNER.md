@@ -108,13 +108,16 @@ Triggered by `POST /scanner/start`, this method handles the physical 3D capture:
 2. **Multi-Level Elevation Loop**:
    - Calculates step count for `z_move_mm` via `distance_to_step_conversion()`.
    - Loops while `not self.up_endstop.is_active` and `not self._cancel_event.is_set()`:
+     - Resets `object_detected_this_level = False` for the new ring.
      - **360° Rotational Ring**:
        - Calculates steps per jump (`angle_to_steps_conversion(angle)`).
        - Captures stereoscopic photo pair (`capture_photo()`).
        - Enqueues photo paths into `self.upload_queue`.
        - Increments `self.total_photos += len(photo_paths)`.
+       - **ToF Verification**: Calls `tof.is_object_detected()`. If the ToF sensor sees the object during this photo stop, `object_detected_this_level` is permanently flagged `True` for this ring.
        - Rotates turntable by `angle`.
-       - Pauses for motor vibration settling (`0.1s`).
+       - Pauses for motor vibration settling (`0.2s`).
+     - **Roof Termination Check**: If `object_detected_this_level` is `False` at the end of the 360° ring, it means the carriage has successfully cleared the top of the object. The scan breaks the elevation loop early to save time!
      - **Elevation Step**:
        - Climbs UP by `z_move_mm`.
 3. **Finalization (`finally`)**:

@@ -13,10 +13,13 @@ from .dual_camera_xvs import DualCameraXVS
 from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
 from .motor import Motor
 from .relay import Relay
+from .tof import ToFSensor
 import cloud.cloudflare_r2 as r2
 from system import file_control as fc
 
 log = logging.getLogger(__name__)
+
+TOF_BACKGROUND_DISTANCE_MM = 400.0
 
 class ScannerError(Exception):
     pass
@@ -43,6 +46,7 @@ T8_THREADED_ROD_STEP = 8 # mm
 
 class Scanner:
     def __init__(self, xvs: bool = True):
+        self.tof = ToFSensor()
         self.turntable_motor = Motor(dir_pin=24, step_pin=23, en_pin=18, step_type="1/4")
         self.z_axis_motor = Motor(dir_pin=19, step_pin=26, en_pin=21, step_type="1/16")
 
@@ -265,7 +269,7 @@ class Scanner:
             self.z_axis_motor.disable()
 
 
-    def setup_and_stream(self, enable_stream: bool = True, bitrate: int = 2_000_000, **kwargs) -> list[str] | None:
+    def setup_and_stream(self, enable_stream: bool = True, bitrate: int = 4_000_000, **kwargs) -> list[str] | None:
         """
         Phase 1: Initializes cameras, gets initial stream image, and starts livestream.
         Returns the stream_urls immediately so the frontend can connect.
@@ -325,16 +329,16 @@ class Scanner:
             self.cleanup()
             raise ScannerError(f"Error in setup_and_stream: {str(e)}")
 
-    def finish_preparation(self, **kwargs):
+    def finish_preparation(self, **camera_kwargs):
         """
         Phase 2 & 3: Homes carriage, cleans R2, recalibrates cameras in front of the object.
         Designed to run as a background task.
         """
         try:
             # Pop off initialization arguments that would crash ArducamIMX477
-            kwargs.pop("master_id", None)
-            kwargs.pop("slave_id", None)
-            kwargs.pop("video_resolution", None)
+            camera_kwargs.pop("master_id", None)
+            camera_kwargs.pop("slave_id", None)
+            camera_kwargs.pop("video_resolution", None)
 
             # home the motor
             self.home_z_axis()
@@ -352,8 +356,8 @@ class Scanner:
             if self._cancel_event.is_set(): return
 
             # Recalibrate AE/AWB and focus in front of the illuminated object
-            kwargs["keep_running"] = True
-            self.dual_cameras.prepare_scan(**kwargs)
+            camera_kwargs["keep_running"] = True
+            self.dual_cameras.prepare_scan(**camera_kwargs)
             
             with self._lock:
                 if self.state != ScannerState.CANCELLED:
@@ -368,7 +372,7 @@ class Scanner:
                 if self.state != ScannerState.CANCELLED:
                     self.state = ScannerState.ERROR
 
-    def generate_livestream(self, bitrate: int = 2_000_000):
+    def generate_livestream(self, bitrate: int = 4_000_000):
         """"""
         if self.state not in (ScannerState.PREPARING, ScannerState.PREPARED) or self.dual_cameras is None:
             return
@@ -447,6 +451,7 @@ class Scanner:
                     break
 
                 total_shots = max(1, round(360.0 / angle))
+                object_detected_this_level = False
                 
                 for shot in range(total_shots):
                     # Check for cancellation before each photo
@@ -478,10 +483,26 @@ class Scanner:
                         delay=delay_turntable,
                         verbose=False
                     )
-                    time.sleep(0.2)  # Let object settle so the next photo isn't blurry
+
+                    # --- Settle Time & ToF Object Detection ---
+                    # The ToF sensor has a 200ms timing budget.
+                    # Taking a measurement inherently blocks the thread for ~200ms, 
+                    # perfectly doubling as our physical motor settling time!
+                    if not object_detected_this_level:
+                        if self.tof.is_object_detected(threshold=TOF_BACKGROUND_DISTANCE_MM):
+                            object_detected_this_level = True
+                            log.debug("Object detected by ToF sensor.")
+                    else:
+                        # If we already found the object, skip ToF and just sleep 0.2s to settle
+                        time.sleep(0.2)
 
                 # Exit outer loop if cancelled during the inner loop
                 if self._cancel_event.is_set():
+                    break
+
+                # --- End of Level Evaluation ---
+                if not object_detected_this_level:
+                    log.info(f"ToF Sensor cleared the object at level {self._level}. Terminating scan early.")
                     break
 
                 # If endstop was triggered during the slice, exit loop

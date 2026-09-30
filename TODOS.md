@@ -109,7 +109,7 @@ cam.set_controls({
 ## 4. 🧠 Software: Capture Logic & Working Modes
 *Status: Python CLI Scripting* | *Depends on: Cameras and Motors calibrated*
 <a id="sw-metadata"></a>
-* [ ] **File & Metadata Processing (Pre-Meshroom)**
+* [x] **File & Metadata Processing (Pre-Meshroom)**
 *   **Details:**
        *   [ ] **EXIF Modification (Python Script):** Write a Python script to modify the `Camera Model` metadata field (e.g., from "IMX477" to "IMX477_Cam2") exclusively for Camera 2's photos. This forces Meshroom to calculate distinct lens profiles for the slight focus differences.
        *   [ ] **File name synchronization:** Ensure that photos taken at the exact same moment (same turntable angle) have identical names for both cameras (e.g., both should be named `0001.jpg`).
@@ -172,13 +172,18 @@ dual_camera.stop_stream()
 * [ ] **Implement "Blur Rejector" Safety Check (OpenCV)**
 * **Details:** Prevent ruined Meshroom pipelines caused by physical mechanical vibrations. Before uploading/saving, run `cv2.Laplacian(image, cv2.CV_64F).var()` on the preview frame. If the focal score drops below a set threshold, the camera took a blurry photo. The script will automatically pause, wait 1 second for vibrations to settle, and retake the photo.
 
+<a id="hw-face-scan"></a>
+* [ ] **Facial Landmark Detection**
+* How it works: Use the Google MediaPipe library (mp.solutions.face_mesh). Track specific facial points (eyes and chin). Wait until the eyes appear in the camera, then move the Z-axis down. Stop when the chin point reaches the top of the camera frame.
+* Why it's the best: It knows exactly what a face is. It doesn't get confused by shoulders, hair, or backgrounds. It's incredibly fast on the Pi 5.
+
 ---
 
 ## 5. ☁️ Cloud Architecture & Meshroom Pipeline
 *Status: RunPod Processing* | *Depends on: Python CLI outputting valid datasets*
 
 <a id="sw-upload"></a>
-* [ ] **Build an Asynchronous Upload Queue**
+* [x] **Build an Asynchronous Upload Queue**
 * **Details:** Implement a background thread using Python's `queue.Queue` so the Pi can upload JPEGs to Cloudflare R2 silently. This prevents the turntable from stalling while waiting for the Wi-Fi upload to finish.
 ```python
 import threading

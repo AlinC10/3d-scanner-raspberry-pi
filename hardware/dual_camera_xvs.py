@@ -113,7 +113,7 @@ class DualCameraXVS:
         
         return [f_master.result(), f_slave.result()]
 
-    def start_stream(self, bitrate: int = 2_000_000):
+    def start_stream(self, bitrate: int = 4_000_000):
         if not isinstance(bitrate, int):
             raise TypeError("Bitrate needs to be an integer (int)")
 

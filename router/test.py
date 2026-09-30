@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Literal, Annotated
 import logging
 from fastapi import APIRouter, HTTPException, Query
@@ -15,6 +16,12 @@ router = APIRouter(
 )
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
+
+class MotorTarget(str, Enum):
+    TURNTABLE = "turntable"
+    Z_AXIS = "z_axis"
+    ALL = "all"
+
 
 class ZMoveRequest(BaseModel):
     distance_mm: Annotated[float, Field(
@@ -53,10 +60,10 @@ class StreamTestRequest(BaseModel):
         ge=500_000,
         le=10_000_000,
         description="RTSP stream bitrate in bps (e.g. 2000000 = 2 Mbps)."
-    )] = 2_000_000
+    )] = 4_000_000
 
 
-# ── 1. Endstops Diagnostics ──────────────────────────────────────────────────
+# ── 1. Sensor Diagnostics (Endstops & ToF) ───────────────────────────────────
 
 @router.get("/endstops")
 def get_endstops_status():
@@ -70,6 +77,19 @@ def get_endstops_status():
         "top_endstop": top_active,
         "bottom_endstop": bottom_active,
         "status": "triggered" if (top_active or bottom_active) else "clear"
+    }
+
+@router.get("/tof/distance")
+def test_tof_distance():
+    """
+    Returns the current distance measured by the ToF sensor in mm.
+    Use this to calibrate the background distance threshold!
+    """
+    dist = scanner.tof.get_distance_mm()
+    return {
+        "status": "success",
+        "distance_mm": dist,
+        "is_infinity": dist == float('inf')
     }
 
 
@@ -102,7 +122,50 @@ def toggle_lights():
     return {"status": "success", "is_on": bool(scanner.lights.is_active)}
 
 
-# ── 3. Motor Homing & Limit Seek ─────────────────────────────────────────────
+# ── 3. Motor Power & State Diagnostics ───────────────────────────────────────
+
+@router.get("/motor/state")
+def get_motor_state():
+    """
+    Returns the current enable/disable state of the stepper motors.
+    """
+    def is_enabled(motor):
+        if motor.en_device is None:
+            return True
+        return motor.en_device.value == 0
+
+    return {
+        "turntable": "enabled" if is_enabled(scanner.turntable_motor) else "disabled",
+        "z_axis": "enabled" if is_enabled(scanner.z_axis_motor) else "disabled"
+    }
+
+@router.post("/motor/enable")
+def test_motor_enable(target: MotorTarget = MotorTarget.ALL):
+    """
+    Manually energizes the motor coils (holding torque ON).
+    Useful to verify wiring and check if the motor locks up.
+    """
+    if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
+        scanner.turntable_motor.enable()
+    if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
+        scanner.z_axis_motor.enable()
+        
+    return {"status": "success", "target": target, "state": "enabled"}
+
+@router.post("/motor/disable")
+def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
+    """
+    Manually releases motor torque (holding torque OFF / free wheel).
+    """
+    if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
+        scanner.turntable_motor.disable()
+    if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
+        scanner.z_axis_motor.disable()
+        
+    return {"status": "success", "target": target, "state": "disabled"}
+
+
+# ── 4. Motor Homing & Limit Seek ─────────────────────────────────────────────
 
 @router.post("/motor/home-bottom")
 def test_home_bottom():
@@ -111,6 +174,7 @@ def test_home_bottom():
     Stops and releases torque upon reaching the switch.
     """
     try:
+        test_motor_enable(MotorTarget.Z_AXIS)
         scanner.home_z_axis()
         return {
             "status": "success",
@@ -128,6 +192,7 @@ def test_move_to_top(delay: float = Query(0.0010, ge=0.0002, le=0.01)):
     Stops and releases torque upon reaching the switch.
     """
     try:
+        test_motor_enable(MotorTarget.Z_AXIS)
         scanner.move_z_to_top(delay=delay)
         return {
             "status": "success",
@@ -138,7 +203,7 @@ def test_move_to_top(delay: float = Query(0.0010, ge=0.0002, le=0.01)):
         raise HTTPException(status_code=500, detail=f"Move to top failed: {str(e)}")
 
 
-# ── 4. Manual Incremental Movement ───────────────────────────────────────────
+# ── 5. Manual Incremental Movement ───────────────────────────────────────────
 
 @router.post("/motor/z-move")
 def test_z_move(req: ZMoveRequest):
@@ -193,7 +258,7 @@ def test_turntable_rotate(req: TurntableRotateRequest):
         scanner.turntable_motor.disable()
 
 
-# ── 5. Livestream & Camera Testing ───────────────────────────────────────────
+# ── 6. Livestream & Camera Testing ───────────────────────────────────────────
 
 @router.post("/stream/start")
 def test_stream_start(req: StreamTestRequest = StreamTestRequest()):
@@ -266,7 +331,7 @@ def test_camera_snap():
         raise HTTPException(status_code=500, detail=f"Camera snap failed: {str(e)}")
 
 
-# ── 6. Full Hardware Reset & Cleanup ─────────────────────────────────────────
+# ── 7. Full Hardware Reset & Cleanup ─────────────────────────────────────────
 
 @router.post("/cleanup")
 def test_cleanup():

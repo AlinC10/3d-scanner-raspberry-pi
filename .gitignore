@@ -12,3 +12,8 @@ __pycache__
 **/.idea
 
 ai/Annex-A-Detailed-Software-Requirements-Specification-SRS.pdf
+conv
+
+**plan.md
+plans
+plans/**
