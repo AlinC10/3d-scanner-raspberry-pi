@@ -22,7 +22,7 @@ It powers individual camera instances across the dual-camera rig, managing the d
 
 ### 1. Dual-Stream Concurrent Pipeline (`lores` vs `main`)
 To allow the live RTSP stream to run continuously without bottlenecking or freezing during photo captures, the driver configures two separate hardware streams inside `picamera2`:
-* **`lores` Stream** (e.g. $1280 \times 720$ or $1920 \times 1080$): Dedicated to the H.264 video encoder (`start_stream()`), streaming over TCP via FFmpeg to MediaMTX.
+* **`lores` Stream** ($960 \times 720$ native 4:3 @ 24 FPS): Dedicated to the H.264 video encoder (`start_stream()`), streaming over TCP via FFmpeg to MediaMTX with a 4 Mbps bitrate. It matches the full sensor aspect ratio without cropping while keeping CPU usage around ~15–20% on Raspberry Pi 5.
 * **`main` Stream** ($4056 \times 3040$): Kept free and uncompressed. When `capture_photo()` fires, it captures a full 12.3MP still directly from the `main` stream without interrupting or dropping frames on the `lores` RTSP feed.
 
 ```
@@ -35,7 +35,7 @@ To allow the live RTSP stream to run continuously without bottlenecking or freez
                   └───────┬───────────────┬───────┘
                           │               │
             lores Stream  │               │  main Stream
-         (1280x720 H.264) │               │  (4056x3040 Raw/JPEG)
+         (960x720 H.264)  │               │  (4056x3040 Raw/JPEG)
                           ▼               ▼
                   ┌───────────────┐ ┌───────────────┐
                   │ H264Encoder   │ │ High-Res JPEG │
@@ -63,6 +63,11 @@ if not getattr(self.picam2, "started", False):
 In photogrammetry, digital zooming or Region of Interest (ROI) cropping shifts the camera's optical principal point $(c_x, c_y)$ and distorts the focal length $f$. 
 * The driver **strictly forbids digital zoom**.
 * Framing adjustments must be made physically by repositioning the camera carriage on the Z-axis or adjusting distance to the turntable.
+
+### 4. Photogrammetry Sensor Defaults
+During `prepare_scan()`, the driver automatically injects two optimized `libcamera` controls:
+* **`AeMeteringMode: CentreWeighted`**: Concentrates auto-exposure metering on the physical object resting in the center of the turntable, preventing surrounding dark backgrounds from overexposing and clipping object highlights.
+* **`NoiseReductionMode: Off`**: Disables spatial smoothing and edge-blurring algorithms to deliver raw, un-softened sensor pixels to Meshroom for dense SIFT feature extraction.
 
 ---
 
@@ -104,7 +109,7 @@ ArducamIMX477(
     quality: int = 95,
     size: Optional[Tuple[int, int]] = (4056, 3040),
     video_size: Optional[Tuple[int, int]] = (1920, 1080),
-    preview_size: Optional[Tuple[int, int]] = (1280, 720),
+    preview_size: Optional[Tuple[int, int]] = (960, 720),
     rotation: int = 0
 )
 ```
@@ -112,10 +117,10 @@ ArducamIMX477(
 ### Core Methods
 
 #### `prepare_scan(photo_resolution=None, quality=None, focus=None, settle_time=2.0, exposure_time=None, awb_mode="auto", keep_running=False, ...) -> dict`
-Prepares, calibrates, and locks the camera for scanning. Supports `focus="auto"` for sweep autofocus or an integer position.
+Prepares, calibrates, and locks the camera for scanning. Automatically injects Photogrammetry Defaults (`CentreWeighted` AE + `NoiseReductionMode.Off`). Supports `focus="auto"` for sweep autofocus or an integer position.
 
-#### `start_stream(rtsp_url="rtsp://localhost:8554/", bitrate=2_000_000) -> str`
-Starts pushing an H.264 video stream from the `lores` stream to MediaMTX via RTSP over TCP.
+#### `start_stream(rtsp_url="rtsp://localhost:8554/", bitrate=4_000_000) -> str`
+Starts pushing an H.264 video stream ($960 \times 720$ native 4:3 @ 24 FPS) from the `lores` stream to MediaMTX via RTSP over TCP.
 * **Returns**: Full RTSP stream URL (e.g. `rtsp://localhost:8554/cam0`).
 
 #### `stop_stream() -> None`

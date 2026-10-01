@@ -32,7 +32,9 @@ Initializes the dual camera setup, assigning `master` and `slave` properties. By
 
 Just like the software-synced `DualCamera`, all commands are executed concurrently, with tuples accepted for specific independent overrides:
 
-* **`prepare_scan(self, **kwargs)`**: Prepares and locks both cameras for scanning. The Slave starts before the Master. You can pass independent focuses, e.g., `focus=(300, 500)`.
+* **`prepare_scan(self, **kwargs) -> List[dict]`**: Prepares and locks both cameras for scanning. The Slave starts before the Master to establish XVS sync. Features **Master-to-Slave Stereoscopic Sync**: when using auto-exposure/AWB, the Slave camera automatically inherits the Master camera's locked `ExposureTime`, `AnalogueGain`, and `ColourGains` to guarantee 1:1 color parity (manual values in `kwargs` bypass the override). You can pass independent focuses, e.g., `focus=(300, 500)`.
+* **`start_stream(self, bitrate: int = 4_000_000) -> List[str]`**: Pushes dual H.264 RTSP live video feeds ($960 \times 720$ native 4:3 @ 24 FPS) to MediaMTX via RTSP over TCP.
+* **`stop_stream(self)`**: Stops the active RTSP live video streams on both cameras.
 * **`focus_set(self, position)`**: Actuates VCMs to absolute positions. Accepts an `int` or a `Tuple[int, int]` (Master, Slave).
 * **`focus_step(self, delta)`**: Adjusts VCM focuses relatively. Accepts an `int` or a `Tuple[int, int]`.
 * **`capture_photo(self, output_prefix="photo", output_dir=".", meshroom_rig=True, ...)`**: Captures hardware-synchronized photos. Like the standard dual class, setting `meshroom_rig=True` outputs photos to `output_dir/0/` and `output_dir/1/` with identical filenames for Meshroom rig constraint detection.

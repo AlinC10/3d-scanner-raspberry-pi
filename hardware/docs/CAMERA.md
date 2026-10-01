@@ -30,7 +30,7 @@ hardware/camera/
 
 ### 1. Dual-Stream Concurrent Pipeline (`lores` + `main`)
 The camera driver leverages `picamera2` multi-stream output capabilities:
-* **`lores` Stream** ($1280 \times 720$ / $1920 \times 1080$): Feeds an `H264Encoder` streaming over TCP via FFmpeg directly to MediaMTX (`rtsp://localhost:8554/cam{id}`).
+* **`lores` Stream** ($960 \times 720$ @ 24 FPS, 4 Mbps): Feeds an `H264Encoder` streaming over TCP via FFmpeg directly to MediaMTX (`rtsp://localhost:8554/cam{id}`). Uses a native 4:3 aspect ratio matching the physical IMX477 sensor without vertical cropping, maintaining low CPU usage (~15-20%) on Raspberry Pi 5.
 * **`main` Stream** ($4056 \times 3040$): Kept uncompressed and available. When a scan captures a photo, it grabs the full 12.3MP still directly from the `main` stream without interrupting, reconfiguring, or dropping frames on the live RTSP stream.
 
 ### 2. Re-entrant Preparation & Runtime Auto-Tuning
@@ -45,6 +45,11 @@ Digital zoom or Region of Interest (ROI) cropping alters the effective focal len
 
 ### 4. EXIF Serial Number Injection
 To prevent Meshroom's Bundle Adjustment node from averaging out subtle manufacturing differences between the two physical lenses (e.g. slight focal length or optical center variations), `camera.py` injects unique EXIF serial numbers (`cam0` and `cam1`). This causes Meshroom to automatically calibrate them as separate optical intrinsic groups.
+
+### 5. Photogrammetry Sensor Defaults
+To optimize raw capture fidelity for AliceVision Meshroom, `prepare_scan()` automatically enforces two optical defaults:
+* **`AeMeteringMode: CentreWeighted`**: Unlike standard matrix metering which averages dark empty backgrounds and severely overexposes centrally placed objects, center-weighted metering calculates exposure strictly from the central region where the object sits.
+* **`NoiseReductionMode: Off`**: Disables `libcamera`'s automatic spatial denoising filter. Denoising filters smear micro-textures (wood grain, fabric weave, 3D print layer lines). Preserving raw sensor high-frequency detail allows Meshroom to extract significantly denser SIFT keypoints.
 
 ---
 
@@ -73,10 +78,10 @@ Hardware constants and operational presets are centralized in [`hardware/camera/
 * `VCM_MAX_POS = 1023`: Extreme macro / close-up position (maximum coil extension).
 * `VCM_MOVE_DELAY_S = 0.06`: 60 ms mechanical settling time after movement.
 
-### Capture & Autofocus Defaults (`camera_default.py`)
+### Capture & Autofocus Defaults (`camera_defaults.py`)
 * `DEFAULT_PHOTO_RESOLUTION = (4056, 3040)`: Full 12.3MP sensor capture resolution.
 * `DEFAULT_VIDEO_RESOLUTION = (1920, 1080)`: 1080p full HD stream resolution.
-* `DEFAULT_PREVIEW_RESOLUTION = (1280, 720)`: 720p HD live preview resolution.
+* `DEFAULT_PREVIEW_RESOLUTION = (960, 720)`: Native 4:3 720p live preview stream resolution (uncropped).
 * `DEFAULT_QUALITY = 95`: High-quality JPEG compression level.
 * `AF_STEP = 30`: DAC step size during contrast-detection autofocus sweep.
 * `AF_ROI = (0.3, 0.3, 0.4, 0.4)`: Center 40% region of interest for Laplacian variance sharpness scoring.
@@ -91,10 +96,11 @@ from hardware.camera.camera import ArducamIMX477
 # Initialize camera 0 (CSI port 0, VCM on i2c-10)
 with ArducamIMX477(camera_id=0) as cam:
     # 1. Prepare and start sensor with keep_running=True for live streaming
+    #    Applies Photogrammetry Defaults (CentreWeighted AE + NoiseReductionMode=Off)
     cam.prepare_scan(keep_running=True)
     
-    # 2. Start RTSP live stream to MediaMTX
-    stream_url = cam.start_stream(bitrate=2_000_000)
+    # 2. Start RTSP live stream to MediaMTX (960x720 @ 24 FPS, 4 Mbps)
+    stream_url = cam.start_stream(bitrate=4_000_000)
     print(f"RTSP stream active at: {stream_url}")
     
     # 3. Perform contrast autofocus on object

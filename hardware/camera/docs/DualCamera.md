@@ -20,7 +20,9 @@ All primary methods in `ArducamIMX477` have been mapped in the `DualCamera` clas
 ### Core Controls
 * **`rotate(self, direction: str) -> List[int]`**: Rotates both cameras. Returns a list of the new rotation angles.
 * **`apply_settings(self, **kwargs)`**: Sends simultaneous property updates (exposure, gain, AWB, etc.) to both cameras.
-* **`prepare_scan(self, **kwargs) -> List[dict]`**: Prepares both cameras for 3D scanning by moving focus and locking exposure metrics simultaneously. You can pass `focus=(300, 500)` to set independent focus positions for each camera during preparation!
+* **`prepare_scan(self, **kwargs) -> List[dict]`**: Prepares both cameras for 3D scanning by adjusting focus and locking exposure metrics simultaneously. Features **Master-to-Slave Stereoscopic Sync**: when using auto-exposure/AWB, Camera 2 automatically inherits Camera 1's locked `ExposureTime`, `AnalogueGain`, and `ColourGains` to guarantee 1:1 color parity (manual values in `kwargs` bypass the override). You can pass `focus=(300, 500)` to set independent focus positions for each camera during preparation!
+* **`start_stream(self, bitrate: int = 4_000_000) -> List[str]`**: Pushes dual H.264 RTSP live video feeds ($960 \times 720$ native 4:3 @ 24 FPS) to MediaMTX via RTSP over TCP.
+* **`stop_stream(self)`**: Stops the active RTSP live video streams on both cameras.
 
 ### Focus Controls
 * **`focus_set(self, position: int | Tuple[int, int])`**: Actuates the VCMs to a specified absolute target position. Pass an `int` to set both cameras identically, or a tuple like `(300, 500)` to set independent positions concurrently.

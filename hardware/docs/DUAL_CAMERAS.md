@@ -109,9 +109,10 @@ DualCameraXVS(
 Configures both cameras, applies exposure/gain parameters, runs autofocus (if requested), and locks AE/AWB. Supports independent dual parameters:
 * `focus=(300, 450)` sets Camera 0 to 300 and Camera 1 to 450.
 * `rotation=(0, 180)` sets independent sensor rotations.
+* **Master-to-Slave Stereoscopic Sync**: When auto-features are used (i.e. `exposure_time` or `colour_gains` are `None`), the Slave camera automatically inherits and is locked to the Master camera's exact `ExposureTime`, `AnalogueGain`, and `ColourGains`. This guarantees 1:1 color temperature and luminance parity between the stereoscopic camera pair, preventing texture seam discoloration in Meshroom. If manual values are explicitly passed in `kwargs`, this override is safely bypassed.
 
-#### `start_stream(bitrate: int = 2_000_000) -> List[str]`
-Pushes dual H.264 RTSP live video streams to the local MediaMTX streaming server.
+#### `start_stream(bitrate: int = 4_000_000) -> List[str]`
+Pushes dual H.264 RTSP live video streams ($960 \times 720$ native 4:3 @ 24 FPS) to the local MediaMTX streaming server.
 * **Returns**: `["rtsp://localhost:8554/cam0", "rtsp://localhost:8554/cam1"]`
 
 #### `stop_stream() -> None`
@@ -125,7 +126,7 @@ Stops the RTSP encoder pipeline on both cameras.
 Applies runtime image controls (`brightness`, `contrast`, `saturation`, `sharpness`, `exposure_time`, `awb_mode`) to both cameras simultaneously without stopping the stream.
 
 #### `lock_auto_features(settle_time: float = 2.0) -> List[dict]`
-Waits `settle_time` seconds for the sensors to meter the illuminated object on the turntable, reads `ExposureTime`, `AnalogueGain`, and `ColourGains` from metadata, and locks both algorithms (`AeEnable=False`, `AwbEnable=False`).
+Waits `settle_time` seconds for the sensors to meter the illuminated object on the turntable, reads `ExposureTime`, `AnalogueGain`, and `ColourGains` from the Master camera metadata, forcefully applies them to the Slave camera, and locks both algorithms (`AeEnable=False`, `AwbEnable=False`).
 
 ---
 

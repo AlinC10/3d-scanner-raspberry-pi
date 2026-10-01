@@ -31,7 +31,7 @@ Applies image controls (brightness, contrast, saturation, sharpness, analogue ga
 Allows Auto Exposure (AE) and Auto White Balance (AWB) to settle, calculates the best current settings from the metadata, and locks those exact values onto the camera for subsequent shots. Returns the locked configuration dictionary.
 
 ### `prepare_scan(self, ...)`
-Prepares and locks the camera for a repeatable 3D scanning sequence. This handles moving the focus, locking AE/AWB (or applying manual overrides), and saving the camera state. Highly recommended to use before a loop of photo captures for photogrammetry.
+Prepares and locks the camera for a repeatable 3D scanning sequence. Automatically applies photogrammetry optical defaults (`AeMeteringMode=CentreWeighted` to prevent background overexposure, and `NoiseReductionMode=Off` to preserve raw micro-textures for Meshroom). Handles adjusting motorized focus, settling and locking AE/AWB, and persisting camera controls.
 
 ### `capture_photo(self, output=None, resolution=None, quality=None, raw=False, show_preview=False, preview_duration=2.0) -> str`
 Captures a JPEG still (and optionally a DNG raw file if `raw=True`). Handles any required post-capture processing (like software rotation and resizing via OpenCV) to ensure images perfectly match the requested configuration.
@@ -40,8 +40,8 @@ Captures a JPEG still (and optionally a DNG raw file if `raw=True`). Handles any
 ### `record_video(self, output=None, duration=10.0, resolution=None, quality=25) -> str`
 Records an H.264 video stream wrapped in an MP4 container.
 
-### `start_stream(self, rtsp_url="rtsp://localhost:8554/", bitrate=2_000_000) -> str`
-Pushes a live H.264 video feed from the `lores` stream to MediaMTX via RTSP over TCP. Leaves the uncompressed `main` stream free for simultaneous photo captures.
+### `start_stream(self, rtsp_url="rtsp://localhost:8554/", bitrate=4_000_000) -> str`
+Pushes a live H.264 video feed ($960 \times 720$ native 4:3 @ 24 FPS) from the `lores` stream to MediaMTX via RTSP over TCP. Leaves the uncompressed `main` stream free for simultaneous photo captures.
 * **Returns**: Full RTSP stream URL (e.g. `rtsp://localhost:8554/cam0`).
 
 ### `stop_stream(self)`
