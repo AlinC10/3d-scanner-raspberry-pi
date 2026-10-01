@@ -442,7 +442,11 @@ class ArducamIMX477:
             elif self.focuser.position:
                 log.info("Keeping saved focus position %d", self.focuser.position)
 
-            manual_controls = {}
+            # --- PHOTOGRAMMETRY DEFAULTS ---
+            manual_controls = {
+                "AeMeteringMode": libcontrols.AeMeteringModeEnum.CentreWeighted,
+                "NoiseReductionMode": libcontrols.NoiseReductionModeEnum.Off,
+            }
             if exposure_time is not None:
                 manual_controls.update({
                     "ExposureTime": int(exposure_time),

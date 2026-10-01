@@ -111,7 +111,31 @@ class DualCameraXVS:
         # 3. Start the Master camera. This generates the XVS pulses, unblocking the Slave.
         f_master = self._executor.submit(self.master.prepare_scan, **kwargs_master)
         
-        return [f_master.result(), f_slave.result()]
+        master_res = f_master.result()
+        slave_res = f_slave.result()
+
+        # OVERRIDE: If the user relied on Auto features, force Slave to match Master
+        needs_sync = False
+        sync_controls = {"AeEnable": False, "AwbEnable": False}
+        
+        if kwargs.get("exposure_time") is None:
+            sync_controls["ExposureTime"] = master_res["controls"].get("ExposureTime")
+            sync_controls["AnalogueGain"] = master_res["controls"].get("AnalogueGain")
+            needs_sync = True
+            
+        if kwargs.get("colour_gains") is None:
+            sync_controls["ColourGains"] = master_res["controls"].get("ColourGains")
+            needs_sync = True
+            
+        sync_controls = {k: v for k, v in sync_controls.items() if v is not None}
+        
+        if needs_sync and sync_controls:
+            if getattr(self.slave.picam2, "started", False):
+                self.slave.picam2.set_controls(sync_controls)
+            self.slave._pending_controls.update(sync_controls)
+            slave_res["controls"].update(sync_controls)
+            
+        return [master_res, slave_res]
 
     def start_stream(self, bitrate: int = 4_000_000):
         if not isinstance(bitrate, int):
@@ -133,7 +157,25 @@ class DualCameraXVS:
 
     def lock_auto_features(self, settle_time: float = 2.0) -> List[dict]:
         futures = [self._executor.submit(cam.lock_auto_features, settle_time) for cam in self.cameras]
-        return [f.result() for f in futures]
+        res = [f.result() for f in futures]
+
+        # Force Slave (index 1) to match Master (index 0)
+        sync_controls = {
+            "ExposureTime": res[0].get("ExposureTime"),
+            "AnalogueGain": res[0].get("AnalogueGain"),
+            "ColourGains": res[0].get("ColourGains"),
+            "AeEnable": False,
+            "AwbEnable": False,
+        }
+        sync_controls = {k: v for k, v in sync_controls.items() if v is not None}
+        
+        if sync_controls:
+            if getattr(self.cameras[1].picam2, "started", False):
+                self.cameras[1].picam2.set_controls(sync_controls)
+            self.cameras[1]._pending_controls.update(sync_controls)
+            res[1].update(sync_controls)
+            
+        return res
 
     # ── Focus ────────────────────────────────────────────────────────────────
 

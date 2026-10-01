@@ -123,12 +123,54 @@ class DualCamera:
             
         f1 = self._executor.submit(self.cam1.prepare_scan, **kwargs1)
         f2 = self._executor.submit(self.cam2.prepare_scan, **kwargs2)
-        return [f1.result(), f2.result()]
+        res1 = f1.result()
+        res2 = f2.result()
+
+        # OVERRIDE: If the user relied on Auto features, force cam2 to match cam1
+        needs_sync = False
+        sync_controls = {"AeEnable": False, "AwbEnable": False}
+        
+        if kwargs.get("exposure_time") is None:
+            sync_controls["ExposureTime"] = res1["controls"].get("ExposureTime")
+            sync_controls["AnalogueGain"] = res1["controls"].get("AnalogueGain")
+            needs_sync = True
+            
+        if kwargs.get("colour_gains") is None:
+            sync_controls["ColourGains"] = res1["controls"].get("ColourGains")
+            needs_sync = True
+            
+        sync_controls = {k: v for k, v in sync_controls.items() if v is not None}
+        
+        if needs_sync and sync_controls:
+            if getattr(self.cam2.picam2, "started", False):
+                self.cam2.picam2.set_controls(sync_controls)
+            self.cam2._pending_controls.update(sync_controls)
+            res2["controls"].update(sync_controls)
+            
+        return [res1, res2]
 
     def lock_auto_features(self, settle_time: float = 2.0) -> List[dict]:
         """Lock the current AE/AWB settings on both cameras concurrently."""
         futures = [self._executor.submit(cam.lock_auto_features, settle_time) for cam in self.cameras]
-        return [f.result() for f in futures]
+        res = [f.result() for f in futures]
+
+        # Force Slave (index 1) to match Master (index 0)
+        sync_controls = {
+            "ExposureTime": res[0].get("ExposureTime"),
+            "AnalogueGain": res[0].get("AnalogueGain"),
+            "ColourGains": res[0].get("ColourGains"),
+            "AeEnable": False,
+            "AwbEnable": False,
+        }
+        sync_controls = {k: v for k, v in sync_controls.items() if v is not None}
+        
+        if sync_controls:
+            if getattr(self.cameras[1].picam2, "started", False):
+                self.cameras[1].picam2.set_controls(sync_controls)
+            self.cameras[1]._pending_controls.update(sync_controls)
+            res[1].update(sync_controls)
+            
+        return res
 
     # ── Focus ────────────────────────────────────────────────────────────────
 
