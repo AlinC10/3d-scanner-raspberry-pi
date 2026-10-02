@@ -48,3 +48,15 @@ class ToFSensor:
             if self.get_distance_mm() < threshold:
                 return True
         return False
+
+    def close(self) -> None:
+        """
+        Releases the I2C bus back to the OS.
+        """
+        if hasattr(self, "i2c") and self.i2c is not None:
+            try:
+                self.i2c.deinit()
+                log.info("VL53L0X ToF sensor I2C bus deinitialized.")
+            except Exception as e:
+                log.warning(f"Error releasing I2C bus: {e}")
+

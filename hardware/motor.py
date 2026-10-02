@@ -257,3 +257,15 @@ class Motor:
         self._stop_event.set()
         if release_torque:
             self.disable()
+
+    def close(self) -> None:
+        """
+        Hard-releases the GPIO pins used by the motor back to the OS.
+        """
+        if getattr(self, "dir_device", None) is not None:
+            self.dir_device.close()
+        if getattr(self, "step_device", None) is not None:
+            self.step_device.close()
+        if getattr(self, "en_device", None) is not None:
+            self.en_device.close()
+

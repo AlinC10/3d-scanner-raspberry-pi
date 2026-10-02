@@ -50,8 +50,8 @@ class Scanner:
         self.turntable_motor = Motor(dir_pin=24, step_pin=23, en_pin=18, step_type="1/4")
         self.z_axis_motor = Motor(dir_pin=19, step_pin=26, en_pin=21, step_type="1/16")
 
-        self.up_endstop = Endstop(pin=2, pull_up=True, bounce_time=0.02)
-        self.down_endstop = Endstop(pin=3, pull_up=True, bounce_time=0.02)
+        self.up_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
+        self.down_endstop = Endstop(pin=17, pull_up=True, bounce_time=0.02)
 
         # Wire up safety interrupts: Any endstop hit immediately stops the Z-axis motor mid-loop
         self.up_endstop.when_pressed = self.z_axis_motor.stop
@@ -574,3 +574,24 @@ class Scanner:
             self.dual_cameras.stop_stream()
             self.dual_cameras.close()
             self.dual_cameras = None
+
+    def close_hardware(self) -> None:
+        """
+        Explicitly closes all hardware components, releasing GPIO pins and I2C bus.
+        """
+        log.info("[Scanner] Releasing all GPIO and hardware resources...")
+        components = (
+            ("turntable_motor", getattr(self, "turntable_motor", None)),
+            ("z_axis_motor", getattr(self, "z_axis_motor", None)),
+            ("up_endstop", getattr(self, "up_endstop", None)),
+            ("down_endstop", getattr(self, "down_endstop", None)),
+            ("lights", getattr(self, "lights", None)),
+            ("tof", getattr(self, "tof", None)),
+        )
+        for name, component in components:
+            if component and hasattr(component, "close"):
+                try:
+                    component.close()
+                except Exception as e:
+                    log.warning(f"[Scanner] Error closing {name}: {e}")
+
