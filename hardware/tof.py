@@ -18,6 +18,9 @@ class ToFSensor:
             self.sensor.measurement_timing_budget = timing_budget
             self.available = True
             log.info(f"VL53L0X ToF Sensor initialized with {timing_budget/1000}ms budget.")
+            
+            import atexit
+            atexit.register(self.close)
         except Exception as e:
             log.warning(f"Failed to initialize VL53L0X ToF sensor: {e}")
 

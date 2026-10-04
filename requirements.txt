@@ -218,3 +218,6 @@ xxhash
 yarg
 yarl
 zstandard
+pyserial>=3.5
+Adafruit-Blinka
+adafruit-circuitpython-vl53l0x

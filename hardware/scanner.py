@@ -19,7 +19,7 @@ from system import file_control as fc
 
 log = logging.getLogger(__name__)
 
-TOF_BACKGROUND_DISTANCE_MM = 400.0
+TOF_BACKGROUND_DISTANCE_MM = 535
 
 class ScannerError(Exception):
     pass
@@ -47,8 +47,8 @@ T8_THREADED_ROD_STEP = 8 # mm
 class Scanner:
     def __init__(self, xvs: bool = True):
         self.tof = ToFSensor()
-        self.turntable_motor = Motor(dir_pin=24, step_pin=23, en_pin=18, step_type="1/4")
-        self.z_axis_motor = Motor(dir_pin=19, step_pin=26, en_pin=21, step_type="1/16")
+        self.turntable_motor = Motor(motor_id=0, dir_pin=4, step_pin=3, en_pin=2, step_type="1/16")
+        self.z_axis_motor = Motor(motor_id=1, dir_pin=7, step_pin=6, en_pin=5, step_type="1/4")
 
         self.up_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
         self.down_endstop = Endstop(pin=17, pull_up=True, bounce_time=0.02)
@@ -244,7 +244,7 @@ class Scanner:
 
         try:
             while True:
-                self.move_z_down(steps=20, delay=0.0010)
+                self.move_z_down(steps=100, delay=0.0010)
         except BottomEndstopTriggered:
             pass
         except Exception as e:
@@ -259,7 +259,7 @@ class Scanner:
 
         try:
             while True:
-                self.move_z_up(steps=20, delay=delay)
+                self.move_z_up(steps=100, delay=delay)
         except TopEndstopTriggered:
             pass
         except Exception as e:
@@ -430,7 +430,7 @@ class Scanner:
 
         # Lock released — physical execution begins without blocking emergency_stop()
         self.turntable_motor.enable()
-        self.z_axis_motor.enable()
+        self.z_axis_motor.disable() # Z-axis is idle while taking photos on the first layer
         
         images_dir = str(Path(__file__).resolve().parent.parent / "input_images")
 
@@ -510,10 +510,14 @@ class Scanner:
                     break
 
                 try:
+                    self.turntable_motor.disable()  # Cut turntable coil current
+                    self.z_axis_motor.enable()      # Energize Z-axis
                     self.move_z_up(
                         steps=z_steps,
                         delay=delay_z_motor,
                     )
+                    self.z_axis_motor.disable()     # Done climbing, release Z
+                    self.turntable_motor.enable()   # Re-enable turntable for next slice
                 except TopEndstopTriggered:
                     # Reached the ceiling, break out of the scan loop
                     break
@@ -594,4 +598,13 @@ class Scanner:
                     component.close()
                 except Exception as e:
                     log.warning(f"[Scanner] Error closing {name}: {e}")
+
+        # Ensure the ArduinoBridge is explicitly closed (sends 0xFF and releases serial port)
+        if getattr(self, "turntable_motor", None) is not None:
+            bridge = getattr(self.turntable_motor, "bridge", None)
+            if bridge and hasattr(bridge, "close"):
+                try:
+                    bridge.close()
+                except Exception as e:
+                    log.warning(f"[Scanner] Error closing ArduinoBridge: {e}")
 
