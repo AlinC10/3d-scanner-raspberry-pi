@@ -111,6 +111,7 @@ Commands are sent as ASCII strings, separated by spaces, and terminated by a new
 | `0x04` | `4` | `DISABLE` | `4 <id>\n` | `0\n` or error | Drives EN pin HIGH (cuts coil current to cool motor & driver). |
 | `0x05` | `5` | `ROTATE` | `5 <id> <steps> <dir> <us>\n` | `0\n` or `4\n` | Executes blocking stepping loop. `dir`: 1=CW, 0=CCW. |
 | `0x06` | `6` | `STOP` | `6 <id>\n` | `0\n` or error | In-band software stop for specific motor `<id>`. Releases torque. |
+| `0x10` | `16` | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel>\n` | `0\n` or `4\n` | Trapezoidal velocity ramping move. |
 
 ---
 
@@ -151,7 +152,5 @@ Documented here to ensure future developers have clear allocations that will not
 
 | Opcode (Hex) | Opcode (Dec) | Command / Feature | Payload Format | Description |
 | :---: | :---: | :--- | :--- | :--- |
-| `0x10` | `16` | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <min> <max> <ramp>\n` | Trapezoidal velocity ramping move. |
 | `0x11` | `17` | `SET_ACCEL` | `17 <id> <accel_rate> <jerk>\n` | Configure acceleration constants. |
 | `0x20` | `32` | `GET_STATUS` | `32 <id>\n` | Query motor state and step position. |
-| `0x21` | `33` | `GET_ENDSTOPS` | `33\n` | Read hardware limit switch states. |

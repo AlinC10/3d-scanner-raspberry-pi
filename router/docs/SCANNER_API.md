@@ -160,7 +160,7 @@ Starts the automated scanning and cloud 3D generation workflow.
 2. Returns HTTP `202 Accepted` immediately.
 3. Dispatches the multi-stage background orchestrator:
    * **Stage 1 (Physical Scan & Upload - `RUNNING`)**:
-     * Rotates turntable in incremental jumps (`angle`, default `18.0°` = 20 stops per 360° ring).
+     * Rotates turntable in incremental jumps (`angle`, default `18.0°` = 20 stops per 360° ring) using smooth trapezoidal velocity ramping (default 20% ramp) to eliminate inertia slip.
      * Synchronously captures photos from both cameras (2 photos per stop).
      * Pushes captured images into a background upload queue (uploads stream to Cloudflare R2 in parallel).
      * Climbs Z-axis by `z_move_mm` (default `100.0mm`) per elevation ring until the top limit switch triggers.
@@ -185,10 +185,18 @@ Starts the automated scanning and cloud 3D generation workflow.
     "angle": 18.0,
     "z_move_mm": 100.0,
     "turntable": {
-      "delay": 0.0010
+      "delay": 0.0010,
+      "acceleration": true,
+      "ramp_percent": 0.2,
+      "decel_percent": null,
+      "start_delay": null
     },
     "z_axis": {
-      "delay": 0.0010
+      "delay": 0.0010,
+      "acceleration": false,
+      "ramp_percent": 0.2,
+      "decel_percent": null,
+      "start_delay": null
     }
   },
   "cloud": {
@@ -199,6 +207,23 @@ Starts the automated scanning and cloud 3D generation workflow.
   }
 }
 ```
+
+#### Mechanical & Motor Configuration Parameters
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `angle` | `float` | `18.0` | Turntable rotation angle per slice in degrees (must yield integer microsteps). |
+| `z_move_mm` | `float` | `100.0` | Vertical travel distance in millimeters between rotational slices. |
+| `turntable.delay` | `float` | `0.0010` | Cruise pulse delay in seconds (target maximum angular speed). |
+| `turntable.acceleration` | `bool` | `true` | Enables trapezoidal velocity ramping to prevent heavy object slippage. |
+| `turntable.ramp_percent` | `float` | `0.2` | Fraction of total steps for acceleration ramp (`0.0` to `1.0`). |
+| `turntable.decel_percent` | `float \| null` | `null` | Separate deceleration fraction. If `null`, mirrors `ramp_percent`. |
+| `turntable.start_delay` | `float \| null` | `null` | Initial launch delay in seconds. Defaults to `3 * delay` (light objects) or `5x–8x` for heavy items. |
+| `z_axis.delay` | `float` | `0.0010` | Cruise pulse delay in seconds for vertical lead screw elevator. |
+| `z_axis.acceleration` | `bool` | `false` | Disabled by default on Z-axis to prevent lead screw shuddering. |
+| `z_axis.ramp_percent` | `float` | `0.2` | Fraction of steps for acceleration if `z_axis.acceleration` is enabled. |
+| `z_axis.decel_percent` | `float \| null` | `null` | Optional separate deceleration fraction for Z-axis. |
+| `z_axis.start_delay` | `float \| null` | `null` | Starting launch delay for Z-axis if acceleration is enabled. |
 
 ### Response (`202 Accepted` - `StartResponse`)
 ```json
@@ -223,8 +248,17 @@ curl -X POST http://localhost:8000/scanner/start \
        "mechanical": {
          "angle": 18.0,
          "z_move_mm": 50.0,
-         "turntable": {"delay": 0.0010},
-         "z_axis": {"delay": 0.0010}
+         "turntable": {
+           "delay": 0.0010,
+           "acceleration": true,
+           "ramp_percent": 0.4,
+           "decel_percent": 0.6,
+           "start_delay": 0.0060
+         },
+         "z_axis": {
+           "delay": 0.0010,
+           "acceleration": false
+         }
        },
        "cloud": {
          "mode": "rig",
@@ -329,7 +363,19 @@ async function startScan(jobId: string) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       job_id: jobId,
-      mechanical: { angle: 18.0, z_move_mm: 80.0, turntable: { delay: 0.0010 }, z_axis: { delay: 0.0010 } },
+      mechanical: {
+        angle: 18.0,
+        z_move_mm: 80.0,
+        turntable: {
+          delay: 0.0010,
+          acceleration: true,
+          ramp_percent: 0.2
+        },
+        z_axis: {
+          delay: 0.0010,
+          acceleration: false
+        }
+      },
       cloud: { mode: "rig", depthmap_downscale: 2 }
     })
   });

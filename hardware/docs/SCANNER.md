@@ -116,7 +116,7 @@ Triggered by `POST /scanner/start`, this method handles the physical 3D capture:
        - Enqueues photo paths into `self.upload_queue`.
        - Increments `self.total_photos += len(photo_paths)`.
        - **ToF Verification**: Calls `tof.is_object_detected()`. If the ToF sensor sees the object during this photo stop, `object_detected_this_level` is permanently flagged `True` for this ring.
-       - Rotates turntable by `angle`.
+       - Rotates turntable by `angle` (using 20% trapezoidal acceleration by default to prevent heavy object slippage).
        - Pauses for motor vibration settling (`0.2s`).
      - **Roof Termination Check**: If `object_detected_this_level` is `False` at the end of the 360° ring, it means the carriage has successfully cleared the top of the object. The scan breaks the elevation loop early to save time!
      - **Elevation Step**:
@@ -185,8 +185,8 @@ Moves carriage UP by distance in millimeters. Blocked if top limit switch is act
 #### `move_z_down_distance(distance: float = 100.0, delay: float = 0.001) -> None`
 Moves carriage DOWN by distance in millimeters. Blocked if bottom limit switch is active.
 
-#### `scan(angle: float = 18.0, delay_turntable: float = 0.0010, z_move_mm: float = 100.0, delay_z_motor: float = 0.0010) -> None`
-Executes full physical scanning and parallel image upload sequence.
+#### `scan(angle: float = 18.0, delay_turntable: float = 0.0010, z_move_mm: float = 100.0, delay_z_motor: float = 0.0010, turntable_acceleration: bool = True, turntable_start_delay: float = None, turntable_ramp_percent: float = 0.2, turntable_decel_percent: float = None, z_acceleration: bool = False, z_start_delay: float = None, z_ramp_percent: float = 0.2, z_decel_percent: float = None) -> None`
+Executes full physical scanning and parallel image upload sequence with independent acceleration profiles for turntable and Z-axis.
 
 #### `generate_livestream(bitrate: int = 2_000_000) -> list[str] | None`
 Generates RTSP stream endpoints using active camera array.

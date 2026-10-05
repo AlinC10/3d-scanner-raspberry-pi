@@ -11,7 +11,7 @@ enum CommandOpcode : uint8_t {
     CMD_STOP            = 0x06, // In-band stop for specific motor
 
     // Reserved Future Features (Roadmap)
-    // CMD_ACCEL_ROTATE    = 0x10, // Trapezoidal velocity ramping move
+    CMD_ACCEL_ROTATE    = 0x10, // Trapezoidal velocity ramping move
     // CMD_SET_ACCEL       = 0x11, // Set acceleration rate & jerk limits
     CMD_GET_STATUS      = 0x20, // Query motor state & step position
     CMD_GET_ENDSTOPS    = 0x21, // Read hardware limit switch states

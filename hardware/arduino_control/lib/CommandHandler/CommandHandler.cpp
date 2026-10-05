@@ -45,6 +45,47 @@ void CommandHandler::parseAndExecute(const char* cmd) {
     // Instant O(1) dispatch on opcode digit or initial ASCII letter (zero strcmp!)
     switch (cmd[0]) {
         case '1':
+            if (cmd[1] == '6') { // 16
+                if (!p) { Serial.println(STATUS_ERR_INVALID_ARG); return; }
+                const uint8_t id = strtol(p, &p, 10);
+                const uint32_t steps = strtoul(p, &p, 10);
+                const bool cw = strtol(p, &p, 10) == 1;
+                const uint32_t target_delay = strtoul(p, &p, 10);
+                const uint32_t start_delay = strtoul(p, &p, 10);
+                const uint32_t accel = strtoul(p, &p, 10);
+                const uint32_t decel = strtoul(p, &p, 10);
+                
+                if (id < this->motorCount && this->motors[id].isConfigured()) {
+                    const uint8_t status = this->motors[id].rotateRamp(cw, steps, target_delay, start_delay, accel, decel);
+                    Serial.println(status);
+                } else {
+                    Serial.println(id >= this->motorCount ? STATUS_ERR_INVALID_ARG : STATUS_ERR_NOT_CONFIGURED);
+                }
+                break;
+            }
+            // Fallthrough to PING if it's '1 '
+            Serial.println(STATUS_OK); // 0
+            break;
+        case 'A':
+        case 'a': { // ACCEL_ROTATE Alias
+            if (!p) { Serial.println(STATUS_ERR_INVALID_ARG); return; }
+            const uint8_t id = strtol(p, &p, 10);
+            const uint32_t steps = strtoul(p, &p, 10);
+            const bool cw = strtol(p, &p, 10) == 1;
+            const uint32_t target_delay = strtoul(p, &p, 10);
+            const uint32_t start_delay = strtoul(p, &p, 10);
+            const uint32_t accel = strtoul(p, &p, 10);
+            const uint32_t decel = strtoul(p, &p, 10);
+            
+            if (id < this->motorCount && this->motors[id].isConfigured()) {
+                const uint8_t status = this->motors[id].rotateRamp(cw, steps, target_delay, start_delay, accel, decel);
+                Serial.println(status);
+            } else {
+                Serial.println(id >= this->motorCount ? STATUS_ERR_INVALID_ARG : STATUS_ERR_NOT_CONFIGURED);
+            }
+            break;
+        }
+
         case 'P':
         case 'p': // PING
             Serial.println(STATUS_OK); // 0

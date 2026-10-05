@@ -141,6 +141,7 @@ class Motor:
             acceleration: bool = True,
             start_delay: Optional[float] = None,
             ramp_percent: float = 0.2,
+            decel_percent: Optional[float] = None,
             cancel_event: Optional[threading.Event] = None) -> None:
         """
         Rotates the motor by a specific angle. Verifies if the requested angle
@@ -182,6 +183,7 @@ class Motor:
                 acceleration=acceleration,
                 start_delay=start_delay,
                 ramp_percent=ramp_percent,
+                decel_percent=decel_percent,
                 cancel_event=cancel_event
             )
 
@@ -196,6 +198,7 @@ class Motor:
             acceleration: bool = True,
             start_delay: Optional[float] = None,
             ramp_percent: float = 0.2,
+            decel_percent: Optional[float] = None,
             cancel_event: Optional[threading.Event] = None) -> None:
         """
         Rotates the motor to move the carriage by a specific linear distance.
@@ -236,6 +239,7 @@ class Motor:
                 acceleration=acceleration,
                 start_delay=start_delay,
                 ramp_percent=ramp_percent,
+                decel_percent=decel_percent,
                 cancel_event=cancel_event
             )
 
@@ -250,46 +254,69 @@ class Motor:
             acceleration: bool = True,
             start_delay: Optional[float] = None,
             ramp_percent: float = 0.2,
+            decel_percent: Optional[float] = None,
             cancel_event: Optional[threading.Event] = None) -> bool:
         """
-        Rotates the motor by instructing the Arduino to generate microsecond-precise stepping pulses.
+        Rotates the motor using trapezoidal acceleration via the Arduino bridge.
         
         :param clockwise: Direction of rotation, True for clockwise, False for counter-clockwise.
-        :type clockwise: bool
         :param steps: Number of steps to rotate.
-        :type steps: int
         :param delay: Cruise step delay in seconds between pulses.
-        :type delay: float | int
         :param step_type: Microstepping mode (retained for signature compatibility).
-        :type step_type: Optional[str]
         :param verbose: Legacy argument (ignored in Arduino bridge).
-        :type verbose: bool
         :param initial_delay: Legacy argument (ignored in Arduino bridge).
-        :type initial_delay: float | int
-        :param acceleration: Legacy argument (ignored, trapezoidal accel is scheduled for a future update).
-        :type acceleration: bool
-        :param start_delay: Legacy argument (ignored).
-        :type start_delay: Optional[float]
-        :param ramp_percent: Legacy argument (ignored).
-        :type ramp_percent: float
+        :param acceleration: Whether to use acceleration (if False, ramp_percent is treated as 0.0).
+        :param start_delay: Starting delay (in seconds) for the ramp. Defaults to delay * 3 (suitable for light loads). For heavy loads (>5kg), manual override to 5x-8x is recommended.
+        :param ramp_percent: Percentage of total steps to use for acceleration (0.0 to 1.0). If decel_percent is None, this is also used for deceleration.
+        :param decel_percent: Optional explicit percentage of total steps for deceleration.
         :param cancel_event: Legacy cooperative threading event (use `Motor.stop()` instead).
-        :type cancel_event: Optional[threading.Event]
         :return: True if the rotation completed successfully, False if it was aborted by an emergency stop.
-        :rtype: bool
         """
         if steps <= 0:
             return True
+        if delay <= 0:
+            raise ValueError("Delay must be > 0")
 
-        # Ensure delay in seconds is converted precisely to microseconds for the Arduino
-        delay_us = int(float(delay) * 1_000_000)
+        if not acceleration:
+            ramp_percent = 0.0
+            decel_percent = 0.0
+        else:
+            ramp_percent = ramp_percent or 0.0
 
-        # Calculate a dynamic safety timeout 
-        # Duration formula: steps * physical delay in seconds, + 50% buffer, + 3s fixed overhead
-        expected_timeout = (steps * float(delay)) * 1.5 + 3.0
+        # Validate percentages to prevent negative step bounds leading to uint32_t overflow
+        for p in (ramp_percent, decel_percent):
+            if p is not None and not (0.0 <= p <= 1.0):
+                raise ValueError(f"Ramp percentages must be between 0.0 and 1.0. Got {p}")
+
+        # Calculation logic
+        target_us = int(round(float(delay) * 1_000_000))
+        start_us = int(round((float(start_delay) if start_delay else float(delay) * 3) * 1_000_000))
+        
+        # Prevent underflow
+        if start_us < target_us:
+            start_us = target_us
+
+        accel_steps = int(steps * ramp_percent)
+        decel_steps = int(steps * decel_percent) if decel_percent is not None else accel_steps
+        
+        # Cap to ensure accel + decel don't exceed total steps
+        if accel_steps + decel_steps > steps:
+            total_ramp = accel_steps + decel_steps
+            accel_steps = int(steps * (accel_steps / total_ramp))
+            decel_steps = steps - accel_steps
+
+        # Calculate accurate timeout based on average delay during ramps
+        cruise_steps = steps - (accel_steps + decel_steps)
+        avg_ramp_delay_s = ((start_us + target_us) / 2.0) / 1_000_000.0
+        duration_s = (cruise_steps * float(delay)) + ((accel_steps + decel_steps) * avg_ramp_delay_s)
+        expected_timeout = duration_s * 1.5 + 3.0
 
         dir_val = 1 if clockwise else 0
         
-        cmd = f"{ArduinoCommand.ROTATE.value} {self.motor_id} {steps} {dir_val} {delay_us}"
+        if accel_steps == 0 and decel_steps == 0:
+            cmd = f"{ArduinoCommand.ROTATE.value} {self.motor_id} {steps} {dir_val} {target_us}"
+        else:
+            cmd = f"{ArduinoCommand.ACCEL_ROTATE.value} {self.motor_id} {steps} {dir_val} {target_us} {start_us} {accel_steps} {decel_steps}"
         
         # This call will block until the Arduino completes all stepping or is aborted
         resp = self.bridge.send_command(cmd, timeout=expected_timeout)

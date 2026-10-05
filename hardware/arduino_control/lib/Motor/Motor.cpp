@@ -109,3 +109,64 @@ bool Motor::isConfigured() const {
 bool Motor::isEnabled() const {
     return this->enableStatus;
 }
+inline uint8_t Motor::stepMotorWithCheck(uint32_t delayUs) {
+    if (Serial.available() > 0) {
+        const uint8_t b = Serial.peek();
+        if (b == CMD_EMERGENCY_STOP || b == CMD_EMERGENCY_ALIAS) {
+            Serial.read(); // Consume opcode
+            this->disable();
+            return STATUS_ERR_ABORTED;
+        }
+    }
+    digitalWrite(this->pulsePin, HIGH);
+    delayMicroseconds(5); // TB6600 requirement
+    digitalWrite(this->pulsePin, LOW);
+    
+    safeDelayMicroseconds(delayUs > 5 ? delayUs - 5 : 5);
+    return STATUS_OK;
+}
+
+uint8_t Motor::rotateRamp(const bool clockwise, const uint32_t steps, const uint32_t targetDelayUs, uint32_t startDelayUs, uint32_t accelSteps, uint32_t decelSteps) {
+    if (!this->isConfigured()) return STATUS_ERR_NOT_CONFIGURED;
+    if (steps == 0) return STATUS_ERR_INVALID_ARG;
+    
+    this->enable();
+    
+    digitalWrite(this->dirPin, clockwise ? HIGH : LOW);
+    delayMicroseconds(20);
+
+    if (startDelayUs < targetDelayUs) {
+        startDelayUs = targetDelayUs;
+    }
+
+    if (accelSteps + decelSteps > steps) {
+        uint32_t total = accelSteps + decelSteps;
+        accelSteps = (uint32_t)(((uint64_t)accelSteps * steps) / total);
+        decelSteps = steps - accelSteps;
+    }
+
+    uint32_t cruiseSteps = steps - (accelSteps + decelSteps);
+    uint32_t delayDiff = startDelayUs - targetDelayUs;
+
+    // 1. Acceleration Phase
+    for (uint32_t i = 0; i < accelSteps; i++) {
+        uint32_t currentDelay = startDelayUs - (uint32_t)(((uint64_t)delayDiff * i) / accelSteps);
+        uint8_t status = this->stepMotorWithCheck(currentDelay);
+        if (status != STATUS_OK) return status;
+    }
+
+    // 2. Cruise Phase
+    for (uint32_t i = 0; i < cruiseSteps; i++) {
+        uint8_t status = this->stepMotorWithCheck(targetDelayUs);
+        if (status != STATUS_OK) return status;
+    }
+
+    // 3. Deceleration Phase
+    for (uint32_t i = 0; i < decelSteps; i++) {
+        uint32_t currentDelay = targetDelayUs + (uint32_t)(((uint64_t)delayDiff * i) / decelSteps);
+        uint8_t status = this->stepMotorWithCheck(currentDelay);
+        if (status != STATUS_OK) return status;
+    }
+
+    return STATUS_OK;
+}

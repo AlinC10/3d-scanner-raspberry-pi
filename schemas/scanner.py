@@ -54,7 +54,24 @@ class MotorConfig(BaseModel):
     delay: Annotated[float, Field(
         ge=0.00005,
         description="Delay in seconds between step pulses for the motor."
-    )] = 0.0005
+    )] = 0.0010
+    acceleration: Annotated[bool, Field(
+        description="Whether to use trapezoidal acceleration ramping."
+    )] = False
+    ramp_percent: Annotated[float, Field(
+        ge=0.0,
+        le=1.0,
+        description="Percentage of total steps to use for the acceleration phase."
+    )] = 0.2
+    decel_percent: Annotated[float | None, Field(
+        ge=0.0,
+        le=1.0,
+        description="Optional separate percentage for the deceleration phase. Defaults to ramp_percent if null."
+    )] = None
+    start_delay: Annotated[float | None, Field(
+        ge=0.00005,
+        description="Starting delay in seconds for the ramp."
+    )] = None
 
 
 class MechanicalConfig(BaseModel):
@@ -69,8 +86,8 @@ class MechanicalConfig(BaseModel):
         description="The distance in millimeters the Z-axis should move UP between rotational slices."
     )] = 100.0
     
-    turntable: MotorConfig
-    z_axis: MotorConfig
+    turntable: Annotated[MotorConfig, Field(description="Motor configuration for the rotating turntable.")] = MotorConfig(delay=0.0010, acceleration=True, ramp_percent=0.2)
+    z_axis: Annotated[MotorConfig, Field(description="Motor configuration for the vertical Z-axis.")] = MotorConfig(delay=0.0010, acceleration=False)
 
 
 class CloudConfig(BaseModel):

@@ -200,43 +200,43 @@ class Scanner:
 
             self._upload_thread = None
 
-    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None):
+    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
         """Move Z-axis UP. Blocked if the top endstop is already active."""
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
 
-        self.z_axis_motor.rotate(clockwise=True, steps=steps, delay=delay, step_type=step_type)
+        self.z_axis_motor.rotate(clockwise=True, steps=steps, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
 
-    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None):
+    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
         """Move Z-axis DOWN. Blocked if the bottom endstop is already active."""
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
 
-        self.z_axis_motor.rotate(clockwise=False, steps=steps, delay=delay, step_type=step_type)
+        self.z_axis_motor.rotate(clockwise=False, steps=steps, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
         
-    def move_z_up_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None):
+    def move_z_up_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
             
-        self.z_axis_motor.rotate_angle(clockwise=True, angle=angle, delay=delay, step_type=step_type)
+        self.z_axis_motor.rotate_angle(clockwise=True, angle=angle, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
 
-    def move_z_down_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None):
+    def move_z_down_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
             
-        self.z_axis_motor.rotate_angle(clockwise=False, angle=angle, delay=delay, step_type=step_type)
+        self.z_axis_motor.rotate_angle(clockwise=False, angle=angle, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
 
-    def move_z_up_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None):
+    def move_z_up_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
 
-        self.z_axis_motor.rotate_distance(clockwise=True, distance=distance, delay=delay, step_type=step_type)
+        self.z_axis_motor.rotate_distance(clockwise=True, distance=distance, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
 
-    def move_z_down_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None):
+    def move_z_down_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
 
-        self.z_axis_motor.rotate_distance(clockwise=False, distance=distance, delay=delay, step_type=step_type)
+        self.z_axis_motor.rotate_distance(clockwise=False, distance=distance, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
 
     def home_z_axis(self):
         """The z-axis motor will rotate until it will reach the bottom (home) endstop."""
@@ -244,7 +244,7 @@ class Scanner:
 
         try:
             while True:
-                self.move_z_down(steps=100, delay=0.0010)
+                self.move_z_down(steps=100, delay=0.0010, acceleration=False)
         except BottomEndstopTriggered:
             pass
         except Exception as e:
@@ -259,7 +259,7 @@ class Scanner:
 
         try:
             while True:
-                self.move_z_up(steps=100, delay=delay)
+                self.move_z_up(steps=100, delay=delay, acceleration=False)
         except TopEndstopTriggered:
             pass
         except Exception as e:
@@ -402,12 +402,33 @@ class Scanner:
         angle: float = 18.0, 
         delay_turntable: float = 0.0010,
         z_move_mm: float = 100.0,
-        delay_z_motor: float = 0.0010
+        delay_z_motor: float = 0.0010,
+        turntable_acceleration: bool = True,
+        turntable_start_delay: Optional[float] = None,
+        turntable_ramp_percent: float = 0.2,
+        turntable_decel_percent: Optional[float] = None,
+        z_acceleration: bool = False,
+        z_start_delay: Optional[float] = None,
+        z_ramp_percent: float = 0.2,
+        z_decel_percent: Optional[float] = None
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.
         Stops when the top endstop is triggered, cancellation is requested,
         or the requested logic completes.
+
+        :param angle: The turntable rotation angle per step in degrees.
+        :param delay_turntable: Cruise step delay in seconds between pulses for turntable.
+        :param z_move_mm: Vertical distance to elevate the Z-axis carriage between slices.
+        :param delay_z_motor: Cruise step delay in seconds between pulses for Z-axis motor.
+        :param turntable_acceleration: Whether to use velocity ramping on the turntable.
+        :param turntable_start_delay: Starting delay in seconds for turntable ramp.
+        :param turntable_ramp_percent: Fraction (0.0 - 1.0) of steps used for turntable acceleration.
+        :param turntable_decel_percent: Optional separate fraction (0.0 - 1.0) for turntable deceleration.
+        :param z_acceleration: Whether to use velocity ramping on the Z-axis.
+        :param z_start_delay: Starting delay in seconds for Z-axis ramp.
+        :param z_ramp_percent: Fraction (0.0 - 1.0) of steps used for Z-axis acceleration.
+        :param z_decel_percent: Optional separate fraction (0.0 - 1.0) for Z-axis deceleration.
         """
         # Lock only for state validation, transition, and variable setup
         with self._lock:
@@ -481,6 +502,10 @@ class Scanner:
                         clockwise=True,
                         steps=steps,
                         delay=delay_turntable,
+                        acceleration=turntable_acceleration,
+                        start_delay=turntable_start_delay,
+                        ramp_percent=turntable_ramp_percent,
+                        decel_percent=turntable_decel_percent,
                         verbose=False
                     )
 
@@ -515,6 +540,10 @@ class Scanner:
                     self.move_z_up(
                         steps=z_steps,
                         delay=delay_z_motor,
+                        acceleration=z_acceleration,
+                        start_delay=z_start_delay,
+                        ramp_percent=z_ramp_percent,
+                        decel_percent=z_decel_percent
                     )
                     self.z_axis_motor.disable()     # Done climbing, release Z
                     self.turntable_motor.enable()   # Re-enable turntable for next slice

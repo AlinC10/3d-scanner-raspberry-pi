@@ -108,8 +108,13 @@ Motor(
 
 ### Core Methods
 
-#### `rotate(clockwise: bool = True, steps: int = 200, delay: float = 0.002, **kwargs) -> bool`
-Converts the float `delay` (seconds) into integer `delay_us` (microseconds). Dispatches the `ROTATE` (`0x05`) command to the Arduino. Dynamically calculates a PySerial timeout based on the formula: `steps * delay * 1.5 + 3.0s`. Returns `True` if completed, or `False` if aborted early by `0xFF`.
+#### `rotate(clockwise: bool = True, steps: int = 200, delay: float = 0.002, acceleration: bool = True, ramp_percent: float = 0.2, decel_percent: float = None, start_delay: float = None, **kwargs) -> bool`
+Rotates the motor using trapezoidal acceleration profiles.
+* Converts float `delay` (seconds) into integer `target_us` (microseconds).
+* Supports asymmetric ramping (different `ramp_percent` and `decel_percent`).
+* Dispatches `ACCEL_ROTATE` (`0x10`) if ramping is used, otherwise falls back to constant-velocity `ROTATE` (`0x05`).
+* Dynamically calculates a PySerial timeout based on accurate integral step timing.
+* Returns `True` if completed, or `False` if aborted early by `0xFF`.
 
 #### `stop(release_torque: bool = False) -> None`
 Immediately injects the out-of-band `0xFF` emergency stop byte directly over the UART wire, bypassing all transaction locks. The Arduino intercepts this in sub-milliseconds and halts any active `rotate` loop. If `release_torque=True`, it explicitly follows up with a `DISABLE` command.
