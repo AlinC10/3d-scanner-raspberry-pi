@@ -20,7 +20,7 @@ def set_power(state: Literal["on", "off"]) -> dict[str, Literal["on", "off"]]:
     success = bluetooth.power_on() if state == "on" else bluetooth.power_off()
 
     if success:
-        return {"powered": {state}}
+        return {"powered": state}
     else:
         raise BluetoothConnectionError("Failed to change power state")
 

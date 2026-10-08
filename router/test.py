@@ -65,7 +65,7 @@ def get_tof_distance():
     Returns the distance to the subject in mm.
     """
     try:
-        distance = scanner.tof_sensor.get_distance()
+        distance = scanner.tof.get_distance_mm()
         return {
             "status": "success",
             "distance_mm": distance
@@ -82,7 +82,8 @@ def test_lights_enable(req: BrightnessRequest = BrightnessRequest(brightness=1.0
     Turns on the LED illumination panels (via GPIO relay).
     """
     try:
-        scanner.lights.enable(brightness=req.brightness)
+        scanner.lights.set_brightness(req.brightness)
+        scanner.lights.on()
         return {
             "status": "success",
             "state": "enabled",
@@ -101,7 +102,7 @@ def test_lights_disable():
     Turns off the LED illumination panels.
     """
     try:
-        scanner.lights.disable()
+        scanner.lights.off()
         return {
             "status": "success",
             "state": "disabled",
@@ -161,14 +162,18 @@ def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
 # ── 4. Motor Homing & Limit Seek ─────────────────────────────────────────────
 
 @router.post("/motor/home-bottom")
-def test_home_bottom():
+def test_home_bottom(
+    delay: float = Query(0.0015, description="Cruise step delay in seconds"),
+    start_delay: float = Query(0.004, description="Starting ramp delay"),
+    ramp_percent: float = Query(0.1, description="Percentage of movement used for acceleration")
+):
     """
     Moves the Z-axis carriage DOWN until the bottom (home) limit switch is triggered.
     Stops and releases torque upon reaching the switch.
     """
     try:
         test_motor_enable(MotorTarget.Z_AXIS)
-        scanner.home_z_axis()
+        scanner.home_z_axis(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
         return {
             "status": "success",
             "message": "Carriage successfully homed to bottom endstop.",
@@ -179,14 +184,18 @@ def test_home_bottom():
 
 
 @router.post("/motor/move-to-top")
-def test_move_to_top(delay: float = Query(0.0010, ge=0.0002, le=0.01)):
+def test_move_to_top(
+    delay: float = Query(0.0015, description="Cruise step delay in seconds"),
+    start_delay: float = Query(0.004, description="Starting ramp delay"),
+    ramp_percent: float = Query(0.1, description="Percentage of movement used for acceleration")
+):
     """
     Moves the Z-axis carriage UP until the top limit switch is triggered.
     Stops and releases torque upon reaching the switch.
     """
     try:
         test_motor_enable(MotorTarget.Z_AXIS)
-        scanner.move_z_to_top(delay=delay)
+        scanner.move_z_to_top(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
         return {
             "status": "success",
             "message": "Carriage successfully reached top endstop.",

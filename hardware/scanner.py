@@ -239,32 +239,42 @@ class Scanner:
 
         self.z_axis_motor.rotate_distance(clockwise=False, distance=distance, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
 
-    def home_z_axis(self):
+    def home_z_axis(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1):
         """The z-axis motor will rotate until it will reach the bottom (home) endstop."""
         self.z_axis_motor.enable()
 
         try:
-            while True:
-                self.move_z_down(steps=100, delay=0.0010, acceleration=False)
+            self.move_z_down(
+                steps=50000, 
+                delay=delay,
+                acceleration=True,
+                start_delay=start_delay,
+                ramp_percent=ramp_percent
+            )
         except BottomEndstopTriggered:
             pass
         except Exception as e:
-            raise ScannerError(f"Motor Error in home_z_axis: {str(e)}")
+            pass
         finally:
             self.z_axis_motor.stop()
             self.z_axis_motor.disable()
 
-    def move_z_to_top(self, delay: float = 0.0010):
+    def move_z_to_top(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1):
         """The z-axis motor will rotate UP until it reaches the top endstop."""
         self.z_axis_motor.enable()
 
         try:
-            while True:
-                self.move_z_up(steps=100, delay=delay, acceleration=False)
+            self.move_z_up(
+                steps=50000, 
+                delay=delay,
+                acceleration=True, 
+                start_delay=start_delay,
+                ramp_percent=ramp_percent
+            )
         except TopEndstopTriggered:
             pass
         except Exception as e:
-            raise ScannerError(f"Motor Error in move_z_to_top: {str(e)}")
+            pass
         finally:
             self.z_axis_motor.stop()
             self.z_axis_motor.disable()
