@@ -103,19 +103,28 @@ class ArduinoBridge:
             # Auto-discovery: Search for known Arduino or generic serial chip USB descriptors.
             # This is safer than hardcoding '/dev/ttyACM0' which can drift to ACM1 upon replugging.
             ports = list(serial.tools.list_ports.comports())
-            search_names = ["ARDUINO", "CH340", "CH341", "CP210", "FTDI", "USB-SERIAL"]
+            # 1. Try to match specific known names
+            search_names = ["ARDUINO", "CH340", "CH341", "CP210", "FTDI", "USB-SERIAL", "USB", "SERIAL", "UART"]
             
             for p in ports:
                 # p[1] is the OS-provided hardware description field.
                 description = (p.description or p[1] or "").upper()
+                hwid = (p.hwid or "").upper()
                 for name in search_names:
-                    if name in description:
+                    if name in description or name in hwid:
                         target_port = p.device
                         break
                 if target_port:
                     break
             
-            # Fallback if no matching descriptors are found
+            # 2. Fallback: just find any ttyUSB or ttyACM connected
+            if not target_port:
+                for p in ports:
+                    if "ttyUSB" in p.device or "ttyACM" in p.device:
+                        target_port = p.device
+                        break
+                        
+            # 3. Absolute fallback
             target_port = target_port or "/dev/ttyACM0"
 
         log.info(f"[ArduinoBridge] Connecting to {target_port} at {self.baudrate} baud...")
@@ -163,6 +172,9 @@ class ArduinoBridge:
         :return: The status code or response returned by the Arduino.
         :rtype: str
         """
+        if not self.serial:
+            raise RuntimeError("Arduino is not connected. Cannot send command.")
+            
         clean_cmd = cmd.strip() + "\n"
         
         # Acquire transaction lock so no other normal command can interleave
