@@ -9,7 +9,7 @@ from hardware.relay import Relay
 
 log = logging.getLogger(__name__)
 
-RP1_PWM0_MARKER = "1f00098000"
+RP1_PWM_MARKERS = ["1f00098000", "1f0009c000", "1000120000.pcie"]
 
 
 class LightLockedError(RuntimeError):
@@ -88,18 +88,20 @@ class DimmableLight:
 
         discovered_info = []
 
-        # 1. Match by RP1 base address marker
+        # 1. Match by RP1 base address marker (PWM0: 1f00098000, PWM1: 1f0009c000)
         for index, chip in chips:
             try:
                 device = str((chip / "device").resolve()).lower()
                 npwm = (chip / "npwm").read_text().strip() if (chip / "npwm").exists() else "?"
                 discovered_info.append(f"pwmchip{index} (npwm={npwm}, device={device})")
-                if RP1_PWM0_MARKER.lower() in device:
-                    return index
+                for marker in RP1_PWM_MARKERS:
+                    if marker.lower() in device:
+                        log.info("[Lights] Identified RP1 PWM chip%d (%s, npwm=%s)", index, marker, npwm)
+                        return index
             except OSError as e:
                 discovered_info.append(f"pwmchip{index} (read error: {e})")
 
-        # 2. Defensive fallback: match by channel count (pwm-2chan / pwm has >= 2 channels; cooler fan has 1)
+        # 2. Defensive fallback: match by channel count (RP1 PWM has 2 or 4 channels; CPU cooler fan has 1)
         for index, chip in chips:
             try:
                 npwm_str = (chip / "npwm").read_text().strip()
@@ -112,7 +114,7 @@ class DimmableLight:
 
         details = "; ".join(discovered_info)
         raise RuntimeError(
-            f"Could not identify the RP1 PWM0 chip. Detected PWM chips: [{details}]. "
+            f"Could not identify the RP1 PWM chip. Detected PWM chips: [{details}]. "
             "If only the active cooler fan chip (1 channel) is listed, make sure 'dtoverlay=pwm-2chan' is in /boot/firmware/config.txt and you have REBOOTED the Pi."
         )
 
