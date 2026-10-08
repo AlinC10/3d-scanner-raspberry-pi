@@ -56,6 +56,16 @@ class DimmableLight:
 
             from rpi_hardware_pwm import HardwarePWM
 
+            import subprocess
+            try:
+                # Force pin multiplexing for Raspberry Pi 5 RP1 PWM 
+                # (since dtoverlay=pwm-2chan doesn't always mux GPIO 12 automatically on Pi 5)
+                # Hardcoded to GPIO 12 for PWM Channel 0
+                if pwm_channel == 0:
+                    subprocess.run(["pinctrl", "set", "12", "a0"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                log.warning("[Lights] Failed to run pinctrl for pin muxing: %s", e)
+                
             self._pwm = HardwarePWM(pwm_channel=pwm_channel, hz=frequency, chip=pwm_chip)
             self._pwm.start(0)
         except ImportError:

@@ -14,7 +14,7 @@ router = APIRouter(
 )
 
 # The scanner is initialized once and kept in memory as a singleton across the FastAPI application lifecycle.
-scanner = Scanner()
+scanner = Scanner(xvs=False)
 
 def _finish_preparation_worker(kwargs: dict):
     scanner.finish_preparation(**kwargs)

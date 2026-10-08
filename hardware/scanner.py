@@ -51,8 +51,8 @@ class Scanner:
         self.turntable_motor = Motor(motor_id=0, dir_pin=4, step_pin=3, en_pin=2, step_type="1/16")
         self.z_axis_motor = Motor(motor_id=1, dir_pin=7, step_pin=6, en_pin=5, step_type="1/4")
 
-        self.up_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
-        self.down_endstop = Endstop(pin=17, pull_up=True, bounce_time=0.02)
+        self.up_endstop = Endstop(pin=22, pull_up=True, bounce_time=0.02)
+        self.down_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
 
         # Wire up safety interrupts: Any endstop hit immediately stops the Z-axis motor mid-loop
         self.up_endstop.when_pressed = self.z_axis_motor.stop

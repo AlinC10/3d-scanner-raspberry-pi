@@ -41,18 +41,30 @@ class DualCameraXVS:
         Initializes the XVS synchronized dual camera setup.
         """
         log.info("Initializing DualCameraXVS (Master: CSI %d, Slave: CSI %d)", master_id, slave_id)
+        self._executor = ThreadPoolExecutor(max_workers=2)
         
+        # 1. Instantiate Master
         self.master = ArducamIMX477(
             camera_id=master_id, quality=quality, size=size,
             video_size=video_size, preview_size=preview_size, rotation=master_rotation
         )
+        
+        # 2. START Master Stream (generates clock pulses so Slave can safely probe sensor)
+        # We temporarily configure and start it so Slave's __init__ doesn't time out.
+        self.master.picam2.configure(self.master.picam2.create_preview_configuration())
+        self.master.picam2.start()
+        time.sleep(0.5)
+        
+        # 3. Instantiate Slave safely!
         self.slave = ArducamIMX477(
             camera_id=slave_id, quality=quality, size=size,
             video_size=video_size, preview_size=preview_size, rotation=slave_rotation
         )
         
+        # 4. Stop Master (or let prepare_scan handle it)
+        self.master.picam2.stop()
+        
         self.cameras = [self.master, self.slave]
-        self._executor = ThreadPoolExecutor(max_workers=2)
 
     def __enter__(self):
         return self
