@@ -25,6 +25,8 @@ def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
     Safely triggers the homing, lighting, and camera initializations for the frontend framing.
     """
     try:
+        scanner.lights.set_brightness(req.illumination_brightness)
+        
         urls = scanner.setup_and_stream(
             enable_stream=req.enable_stream,
             bitrate=req.bitrate,
@@ -54,9 +56,9 @@ def _orchestrate_pipeline(req: StartRequest):
     try:
         # 1. Mechanical Scan
         scanner.scan(
-            angle=req.mechanical.angle,
+            angle=req.mechanical.turntable.angle,
             delay_turntable=req.mechanical.turntable.delay,
-            z_move_mm=req.mechanical.z_move_mm,
+            z_move_mm=req.mechanical.z_axis.distance_mm,
             delay_z_motor=req.mechanical.z_axis.delay,
             turntable_acceleration=req.mechanical.turntable.acceleration,
             turntable_start_delay=req.mechanical.turntable.start_delay,

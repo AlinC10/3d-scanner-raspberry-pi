@@ -12,10 +12,11 @@ from .dual_camera import DualCamera
 from .dual_camera_xvs import DualCameraXVS
 from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
 from .motor import Motor
-from .relay import Relay
+from .lights import DimmableLight
 from .tof import ToFSensor
 import cloud.cloudflare_r2 as r2
 from system import file_control as fc
+import statistics
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ class Scanner:
         self.up_endstop.when_pressed = self.z_axis_motor.stop
         self.down_endstop.when_pressed = self.z_axis_motor.stop
 
-        self.lights = Relay(pin=11, active_high=True, initial_value=False)
+        self.lights = DimmableLight(relay_pin=11, pwm_channel=0, frequency=10000)
 
         self.dual_cameras: Optional[DualCamera | DualCameraXVS] = None
 
@@ -267,7 +268,91 @@ class Scanner:
         finally:
             self.z_axis_motor.stop()
             self.z_axis_motor.disable()
+    def wait_for_light_stable(
+        self,
+        samples: int = 4,
+        tolerance: float = 0.03,
+        timeout_s: float = 60.0,
+        stable_time_s: float = 10.0,
+    ) -> bool:
+        """
+        Monitors ExposureTime * AnalogueGain metadata to confirm LED thermal stabilization.
+        """
+        if not self.dual_cameras:
+            return False
 
+        cams = []
+        if getattr(self.dual_cameras.master if self.xvs else self.dual_cameras.cam1, "picam2", None):
+            cams.append(self.dual_cameras.master if self.xvs else self.dual_cameras.cam1)
+            
+        slave = self.dual_cameras.slave if self.xvs else self.dual_cameras.cam2
+        if getattr(slave, "picam2", None):
+            cams.append(slave)
+
+        if not cams or not getattr(cams[0].picam2, "started", False):
+            return False
+
+        log.info("[Light] Verifying optical light stabilization...")
+        try:
+            for cam in cams:
+                for key in ("AeEnable", "AwbEnable", "ExposureTime", "AnalogueGain", "ColourGains"):
+                    cam._pending_controls.pop(key, None)
+                cam.picam2.set_controls({"AeEnable": True, "AwbEnable": True})
+        except Exception as e:
+            log.warning("[Light] Could not enable AE for light stabilization: %s", e)
+            return False
+
+        if self._cancel_event.wait(timeout=0.4):
+            return False
+
+        def measure() -> float:
+            vals = []
+            for _ in range(samples):
+                if self._cancel_event.is_set():
+                    return 0.0
+                try:
+                    md = cams[0].picam2.capture_metadata()
+                    exp = md.get("ExposureTime")
+                    gain = md.get("AnalogueGain")
+                    if exp and gain and exp > 0 and gain > 0:
+                        vals.append(float(exp) * float(gain))
+                except Exception:
+                    pass
+                if self._cancel_event.wait(timeout=0.06):
+                    return 0.0
+            return statistics.median(vals) if vals else 0.0
+
+        start = time.monotonic()
+        anchor_val = measure()
+        anchor_time = time.monotonic()
+
+        while time.monotonic() - start < timeout_s:
+            if self._cancel_event.wait(timeout=1.0):
+                return False
+
+            if not self.lights.is_on:
+                log.warning("[Light] Illumination was turned off or lost during stabilization.")
+                return False
+
+            cur_val = measure()
+            if anchor_val <= 0 or cur_val <= 0:
+                anchor_val = cur_val
+                anchor_time = time.monotonic()
+                continue
+
+            drift = abs(cur_val - anchor_val) / anchor_val
+            log.info("[Light] Thermal Drift: %.2f%% relative to anchor", drift * 100)
+
+            if drift >= tolerance:
+                anchor_val = cur_val
+                anchor_time = time.monotonic()
+            else:
+                if time.monotonic() - anchor_time >= stable_time_s:
+                    log.info("[Light] Illumination stabilized.")
+                    return True
+
+        log.warning("[Light] Thermal stabilization window timed out.")
+        return False
 
     def setup_and_stream(self, enable_stream: bool = True, bitrate: int = 4_000_000, **kwargs) -> list[str] | None:
         """
@@ -355,9 +440,39 @@ class Scanner:
 
             if self._cancel_event.is_set(): return
 
-            # Recalibrate AE/AWB and focus in front of the illuminated object
-            camera_kwargs["keep_running"] = True
-            self.dual_cameras.prepare_scan(**camera_kwargs)
+            # Reject scan if brightness is 0
+            if self.lights.brightness <= 0:
+                raise ScannerError("Brightness is 0%; cannot start a photogrammetry scan.")
+            
+            self.lights.lock_brightness()
+
+            try:
+                if not self.lights.is_on:
+                    self.lights.on()
+
+                if not self.lights.is_on:
+                    raise ScannerError("Failed to energize LED illumination.")
+
+                stable = self.wait_for_light_stable(timeout_s=90.0, stable_time_s=10.0, tolerance=0.03)
+                
+                if self._cancel_event.is_set():
+                    self.lights.unlock_brightness()
+                    return
+                    
+                if not stable:
+                    raise ScannerError("Light thermal stabilization timed out.")
+
+                if not self.lights.is_on:
+                    raise ScannerError("Lights were turned off before camera lock.")
+
+                # Recalibrate AE/AWB and focus in front of the illuminated object
+                camera_kwargs["keep_running"] = True
+                self.dual_cameras.prepare_scan(**camera_kwargs)
+                
+            except Exception:
+                self.lights.unlock_brightness()
+                self.lights.off()
+                raise
             
             with self._lock:
                 if self.state != ScannerState.CANCELLED:
@@ -572,6 +687,7 @@ class Scanner:
         self.z_axis_motor.stop(release_torque=True)
         
         # Cut lights
+        self.lights.unlock_brightness()
         self.lights.off()
         
         # Shut down cameras if running
@@ -598,6 +714,7 @@ class Scanner:
 
         self.turntable_motor.stop(release_torque=True)
         self.z_axis_motor.stop(release_torque=True)
+        self.lights.unlock_brightness()
         self.lights.off()
 
         self._level = 0

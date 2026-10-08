@@ -92,11 +92,13 @@ The lens focus is driven by a Voice Coil Motor (VCM) controlled over I2C. The ca
 
 For 3D photogrammetry with Meshroom, lighting must not flicker or shift color between photos:
 
-### `lock_auto_features(settle_time: float = 2.0) -> dict`
+### `lock_auto_features(settle_time: float = 2.0, lock_ae: bool = True, lock_awb: bool = True) -> dict`
 1. Waits `settle_time` seconds with scanner LEDs illuminated for the automatic metering algorithms to converge on the object.
 2. Captures live frame metadata: `ExposureTime`, `AnalogueGain`, and `ColourGains` (red/blue balance).
-3. Writes those exact values back to the sensor while setting `AeEnable=False` and `AwbEnable=False`.
+3. Selectively locks Auto Exposure (`AeEnable=False`) and/or Auto White Balance (`AwbEnable=False`), writing the live metadata back to the sensor.
 4. Freezes exposure and white balance for all subsequent 360° captures.
+
+*Note: The `prepare_scan` method intelligently orchestrates this. If you supply a manual `exposure_time`, it correctly skips locking AE while still locking AWB, ensuring a manual shutter speed does not cause color drift.*
 
 ---
 
@@ -138,8 +140,8 @@ Records an MP4 video clip locally.
 #### `apply_settings(exposure_time=None, analogue_gain=None, awb_mode=None, brightness=None, contrast=None, saturation=None, sharpness=None) -> None`
 Applies runtime image adjustments without restarting the stream.
 
-#### `lock_auto_features(settle_time=2.0) -> dict`
-Extracts converged exposure and color balance metadata and locks both auto features.
+#### `lock_auto_features(settle_time=2.0, lock_ae=True, lock_awb=True) -> dict`
+Extracts converged exposure and color balance metadata and locks the specified auto features.
 
 #### `focus_set(position: int) -> None`
 Sets lens focus position (`0`–`1023`).

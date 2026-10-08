@@ -46,11 +46,57 @@ class PrepareRequest(BaseModel):
         le=10_000_000,
         description="The bitrate for the camera livestream in bps (e.g., 2000000 for 2 Mbps)."
     )] = 2_000_000
+    
+    illumination_brightness: Annotated[float, Field(
+        ge=0.0,
+        le=1.0,
+        description="Desired LED brightness during the scan (0.0 to 1.0). Defaults to 100%."
+    )] = 1.0
 
     camera_config: Annotated[DualCameraConfig, Field(description="Configuration block for the dual camera array.")]
 
 
-class MotorConfig(BaseModel):
+class TurntableRotateRequest(BaseModel):
+    angle: Annotated[float, Field(
+        gt=0.0,
+        le=360.0,
+        description="Angle in degrees to rotate turntable."
+    )] = 18.0
+    clockwise: Annotated[bool, Field(
+        description="Rotation direction (True = clockwise, False = counter-clockwise)."
+    )] = True
+    delay: Annotated[float, Field(
+        ge=0.00005,
+        description="Delay in seconds between step pulses for the motor."
+    )] = 0.0010
+    acceleration: Annotated[bool, Field(
+        description="Whether to use trapezoidal acceleration ramping."
+    )] = True
+    ramp_percent: Annotated[float, Field(
+        ge=0.0,
+        le=1.0,
+        description="Percentage of total steps to use for the acceleration phase."
+    )] = 0.2
+    decel_percent: Annotated[float | None, Field(
+        ge=0.0,
+        le=1.0,
+        description="Optional separate percentage for the deceleration phase. Defaults to ramp_percent if null."
+    )] = None
+    start_delay: Annotated[float | None, Field(
+        ge=0.00005,
+        description="Starting delay in seconds for the ramp."
+    )] = None
+
+
+class ZMoveRequest(BaseModel):
+    distance_mm: Annotated[float, Field(
+        gt=0.0,
+        le=200.0,
+        description="Distance in millimeters to travel."
+    )] = 100.0
+    direction: Annotated[Literal["up", "down"], Field(
+        description="Direction of carriage travel."
+    )] = "up"
     delay: Annotated[float, Field(
         ge=0.00005,
         description="Delay in seconds between step pulses for the motor."
@@ -75,19 +121,8 @@ class MotorConfig(BaseModel):
 
 
 class MechanicalConfig(BaseModel):
-    angle: Annotated[float | int, Field(
-        gt=2.0,
-        le=40.0,
-        description="The rotation angle per capture step in degrees."
-    )] = 18.0
-    z_move_mm: Annotated[float, Field(
-        gt=0.0,
-        lt=150.0,
-        description="The distance in millimeters the Z-axis should move UP between rotational slices."
-    )] = 100.0
-    
-    turntable: Annotated[MotorConfig, Field(description="Motor configuration for the rotating turntable.")] = MotorConfig(delay=0.0010, acceleration=True, ramp_percent=0.2)
-    z_axis: Annotated[MotorConfig, Field(description="Motor configuration for the vertical Z-axis.")] = MotorConfig(delay=0.0010, acceleration=False)
+    turntable: Annotated[TurntableRotateRequest, Field(description="Configuration for the rotating turntable.")] = Field(default_factory=TurntableRotateRequest)
+    z_axis: Annotated[ZMoveRequest, Field(description="Configuration for the vertical Z-axis.")] = Field(default_factory=ZMoveRequest)
 
 
 class CloudConfig(BaseModel):

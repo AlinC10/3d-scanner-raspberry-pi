@@ -90,6 +90,7 @@ Prepares the scanner for framing and calibration.
 {
   "enable_stream": true,
   "bitrate": 2000000,
+  "illumination_brightness": 1.0,
   "camera_config": {
     "master_id": 0,
     "slave_id": 1,
@@ -139,6 +140,7 @@ curl -X POST http://localhost:8000/scanner/prepare \
      -d '{
        "enable_stream": true,
        "bitrate": 2000000,
+       "illumination_brightness": 1.0,
        "camera_config": {
          "master_id": 0,
          "slave_id": 1
@@ -182,9 +184,9 @@ Starts the automated scanning and cloud 3D generation workflow.
 {
   "job_id": "scan-vase-001",
   "mechanical": {
-    "angle": 18.0,
-    "z_move_mm": 100.0,
     "turntable": {
+      "angle": 18.0,
+      "clockwise": true,
       "delay": 0.0010,
       "acceleration": true,
       "ramp_percent": 0.2,
@@ -192,6 +194,8 @@ Starts the automated scanning and cloud 3D generation workflow.
       "start_delay": null
     },
     "z_axis": {
+      "distance_mm": 100.0,
+      "direction": "up",
       "delay": 0.0010,
       "acceleration": false,
       "ramp_percent": 0.2,
@@ -212,8 +216,10 @@ Starts the automated scanning and cloud 3D generation workflow.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `angle` | `float` | `18.0` | Turntable rotation angle per slice in degrees (must yield integer microsteps). |
-| `z_move_mm` | `float` | `100.0` | Vertical travel distance in millimeters between rotational slices. |
+| `turntable.angle` | `float` | `18.0` | Turntable rotation angle per slice in degrees (must yield integer microsteps). |
+| `turntable.clockwise` | `bool` | `true` | Turntable rotation direction. |
+| `z_axis.distance_mm` | `float` | `100.0` | Vertical travel distance in millimeters between rotational slices. |
+| `z_axis.direction` | `string` | `"up"` | Direction of Z-axis carriage travel. |
 | `turntable.delay` | `float` | `0.0010` | Cruise pulse delay in seconds (target maximum angular speed). |
 | `turntable.acceleration` | `bool` | `true` | Enables trapezoidal velocity ramping to prevent heavy object slippage. |
 | `turntable.ramp_percent` | `float` | `0.2` | Fraction of total steps for acceleration ramp (`0.0` to `1.0`). |

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from router.scanner import scanner
 from hardware.endstop import TopEndstopTriggered, BottomEndstopTriggered
 from hardware.scanner import ScannerError
+from hardware.lights import LightLockedError
 
 log = logging.getLogger(__name__)
 
@@ -23,37 +24,7 @@ class MotorTarget(str, Enum):
     ALL = "all"
 
 
-class ZMoveRequest(BaseModel):
-    distance_mm: Annotated[float, Field(
-        gt=0.0,
-        le=200.0,
-        description="Distance in millimeters to travel."
-    )] = 10.0
-    direction: Annotated[Literal["up", "down"], Field(
-        description="Direction of carriage travel."
-    )] = "up"
-    delay: Annotated[float, Field(
-        ge=0.0002,
-        le=0.01,
-        description="Delay in seconds between motor step pulses."
-    )] = 0.0010
-
-
-class TurntableRotateRequest(BaseModel):
-    angle: Annotated[float, Field(
-        gt=0.0,
-        le=360.0,
-        description="Angle in degrees to rotate turntable."
-    )] = 18.0
-    clockwise: Annotated[bool, Field(
-        description="Rotation direction (True = clockwise, False = counter-clockwise)."
-    )] = True
-    delay: Annotated[float, Field(
-        ge=0.0002,
-        le=0.01,
-        description="Delay in seconds between motor step pulses."
-    )] = 0.0010
-
+from schemas.scanner import ZMoveRequest, TurntableRotateRequest
 
 class StreamTestRequest(BaseModel):
     bitrate: Annotated[int, Field(
@@ -63,71 +34,93 @@ class StreamTestRequest(BaseModel):
     )] = 4_000_000
 
 
+class BrightnessRequest(BaseModel):
+    brightness: Annotated[float, Field(
+        ge=0.0,
+        le=1.0,
+        description="Light brightness level (0.0 to 1.0)."
+    )]
+
+
 # ── 1. Sensor Diagnostics (Endstops & ToF) ───────────────────────────────────
 
 @router.get("/endstops")
 def get_endstops_status():
     """
     Reads the real-time status of both Z-axis physical limit switches.
-    Returns True if switch is pressed/triggered, False if open/released.
+    Returns:
+      bottom_endstop: True if the carriage is at the absolute bottom (home).
+      top_endstop: True if the carriage hit the upper ceiling limit.
     """
-    top_active = bool(scanner.up_endstop.is_active)
-    bottom_active = bool(scanner.down_endstop.is_active)
     return {
-        "top_endstop": top_active,
-        "bottom_endstop": bottom_active,
-        "status": "triggered" if (top_active or bottom_active) else "clear"
-    }
-
-@router.get("/tof/distance")
-def test_tof_distance():
-    """
-    Returns the current distance measured by the ToF sensor in mm.
-    Use this to calibrate the background distance threshold!
-    """
-    dist = scanner.tof.get_distance_mm()
-    return {
-        "status": "success",
-        "distance_mm": dist,
-        "is_infinity": dist == float('inf')
+        "bottom_endstop": bool(scanner.down_endstop.is_active),
+        "top_endstop": bool(scanner.up_endstop.is_active)
     }
 
 
-# ── 2. Lighting Relay ────────────────────────────────────────────────────────
-
-@router.get("/lights")
-def get_lights_status():
-    """Returns the current state of the LED lights relay (True = ON, False = OFF)."""
-    return {"is_on": bool(scanner.lights.is_active)}
-
-
-@router.post("/lights/on")
-def turn_lights_on():
-    """Turns the lighting relay ON."""
-    scanner.lights.on()
-    return {"status": "success", "is_on": True}
-
-
-@router.post("/lights/off")
-def turn_lights_off():
-    """Turns the lighting relay OFF."""
-    scanner.lights.off()
-    return {"status": "success", "is_on": False}
-
-
-@router.post("/lights/toggle")
-def toggle_lights():
-    """Toggles the lighting relay state."""
-    scanner.lights.toggle()
-    return {"status": "success", "is_on": bool(scanner.lights.is_active)}
-
-
-# ── 3. Motor Power & State Diagnostics ───────────────────────────────────────
-
-@router.get("/motor/state")
-def get_motor_state():
+@router.get("/tof")
+def get_tof_distance():
     """
-    Returns the current enable/disable state of the stepper motors.
+    Reads the Time-of-Flight (VL53L0X) laser distance sensor.
+    Returns the distance to the subject in mm.
+    """
+    try:
+        distance = scanner.tof_sensor.get_distance()
+        return {
+            "status": "success",
+            "distance_mm": distance
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ToF Sensor Error: {str(e)}")
+
+
+# ── 2. Lighting & Relays ─────────────────────────────────────────────────────
+
+@router.post("/lights/enable")
+def test_lights_enable(req: BrightnessRequest = BrightnessRequest(brightness=1.0)):
+    """
+    Turns on the LED illumination panels (via GPIO relay).
+    """
+    try:
+        scanner.lights.enable(brightness=req.brightness)
+        return {
+            "status": "success",
+            "state": "enabled",
+            "brightness": req.brightness,
+            "message": "Lights enabled."
+        }
+    except LightLockedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to turn on lights: {str(e)}")
+
+
+@router.post("/lights/disable")
+def test_lights_disable():
+    """
+    Turns off the LED illumination panels.
+    """
+    try:
+        scanner.lights.disable()
+        return {
+            "status": "success",
+            "state": "disabled",
+            "message": "Lights disabled."
+        }
+    except LightLockedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to turn off lights: {str(e)}")
+
+
+# ── 3. Motor State (Torque) ──────────────────────────────────────────────────
+
+@router.get("/motor/status")
+def get_motor_status():
+    """
+    Returns the current electrical holding state of both steppers.
+    "enabled" = Coil is energized, motor holding torque is ON.
+    "disabled" = Coil is off, motor free wheels.
     """
     def is_enabled(motor):
         if motor.en_device is None:
@@ -214,9 +207,23 @@ def test_z_move(req: ZMoveRequest):
     scanner.z_axis_motor.enable()
     try:
         if req.direction == "up":
-            scanner.move_z_up_distance(distance=req.distance_mm, delay=req.delay)
+            scanner.move_z_up_distance(
+                distance=req.distance_mm, 
+                delay=req.delay,
+                acceleration=req.acceleration,
+                start_delay=req.start_delay,
+                ramp_percent=req.ramp_percent,
+                decel_percent=req.decel_percent
+            )
         else:
-            scanner.move_z_down_distance(distance=req.distance_mm, delay=req.delay)
+            scanner.move_z_down_distance(
+                distance=req.distance_mm, 
+                delay=req.delay,
+                acceleration=req.acceleration,
+                start_delay=req.start_delay,
+                ramp_percent=req.ramp_percent,
+                decel_percent=req.decel_percent
+            )
 
         return {
             "status": "success",
@@ -244,7 +251,11 @@ def test_turntable_rotate(req: TurntableRotateRequest):
         scanner.turntable_motor.rotate_angle(
             clockwise=req.clockwise,
             angle=req.angle,
-            delay=req.delay
+            delay=req.delay,
+            acceleration=req.acceleration,
+            start_delay=req.start_delay,
+            ramp_percent=req.ramp_percent,
+            decel_percent=req.decel_percent
         )
         return {
             "status": "success",

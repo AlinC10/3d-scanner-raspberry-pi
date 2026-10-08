@@ -61,7 +61,7 @@ The scanner enforces strict lifecycle state transitions:
 | **Z-Axis Motor** | `Motor` | Arduino `D7`/`D6`/`D5` | Vertical lead screw elevator (1/4 microstepping = 800 steps/rev, 1.8A driver current). |
 | **Top Endstop** | `Endstop` | `GPIO 2` (Pull-Up) | Prevents carriage from over-traveling into top chassis. |
 | **Bottom Endstop** | `Endstop` | `GPIO 3` (Pull-Up) | Home reference position for Z-axis homing. |
-| **Illumination** | `Relay` | `GPIO 11` (Active High) | Controls LED lighting strips inside the scan chamber. |
+| **Illumination** | `DimmableLight` | `GPIO 11` (Relay) / `GPIO 12` (PWM) | Controls 12V LED lighting strips inside the scan chamber. (See [LIGHTS.md](LIGHTS.md) for PWM and relay isolation mechanics). |
 | **Dual Cameras** | `DualCameraXVS` / `DualCamera` | CSI-2 Interfaces (`cam0`, `cam1`) | Dual Arducam IMX477 sensors with hardware frame sync. (See [CAMERA.md](CAMERA.md) for subsystem overview and [DUAL_CAMERAS.md](DUAL_CAMERAS.md) for stereo architecture). |
 
 ---
@@ -88,8 +88,12 @@ To deliver an immediate live video feed to the frontend while accommodating 15â€
   3. Checks for cancellation: `if self._cancel_event.is_set(): return`.
   4. Raises carriage by **+30.0 mm** to rest directly in front of the illuminated object.
   5. Cleans previous scan assets from Cloudflare R2 bucket (`r2.delete_all_files_from_bucket()`).
-  6. **Re-calls `dual_cameras.prepare_scan(**kwargs, keep_running=True)`**: Because `picam2.started` is already `True`, stream reconfiguration is bypassed. The cameras dynamically settle auto-exposure and auto-white-balance on the illuminated object and freeze them in-place.
-  7. Transitions state:
+  6. Rejects the scan with `ScannerError` if the light brightness is set to 0.0.
+  7. **Locks the brightness API** (`self.lights.lock_brightness()`) so operators cannot accidentally dim the lights mid-scan via `/lights/brightness` or `/lights/toggle`.
+  8. Powers on the illumination if not already on.
+  9. Executes a **thermal stabilization loop** (`wait_for_light_stable()`) that monitors the optical drift of libcamera's auto-exposure metrics (`ExposureTime * AnalogueGain`). It waits for the LED strips to thermally plateau so exposure levels don't drift mid-scan.
+  10. **Re-calls `dual_cameras.prepare_scan(**kwargs, keep_running=True)`**: Because `picam2.started` is already `True`, stream reconfiguration is bypassed. The cameras dynamically settle auto-exposure and auto-white-balance on the fully warmed-up object and permanently lock them in-place.
+  11. Transitions state:
      ```python
      with self._lock:
          if self.state != ScannerState.CANCELLED:

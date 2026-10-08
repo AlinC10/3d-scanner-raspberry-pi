@@ -51,31 +51,51 @@ Reads the live electrical status of both physical limit switches.
 
 ---
 
-## 2. Illumination Relay
+## 2. Illumination System
 
 ### `GET /test/lights`
+Returns the current state of the LED lights, including brightness (0.0 to 1.0) and whether they are actively locked by an ongoing 360-degree scan.
 * **Response (`200 OK`)**:
   ```json
   {
-    "is_on": true
+    "is_on": true,
+    "brightness": 0.8,
+    "locked": false
   }
   ```
 
 ### `POST /test/lights/on`
-Powers the relay ON to illuminate the scan chamber.
-* **Response (`200 OK`)**: `{"status": "success", "is_on": true}`
+Powers the lights ON, automatically applying the previous brightness level (or defaulting to 100% if it was 0).
+* **Response (`200 OK`)**: `{"status": "success", "is_on": true, "brightness": 1.0}`
+* **Error (`409 Conflict`)**: Lights are locked (scan in progress).
 
 ### `POST /test/lights/off`
-Powers the relay OFF.
+Instantly drops PWM brightness to 0 and cuts relay power (Zero-Current Switching).
 * **Response (`200 OK`)**: `{"status": "success", "is_on": false}`
+* **Error (`409 Conflict`)**: Lights are locked (scan in progress).
 
 ### `POST /test/lights/toggle`
 Flips the current lighting state.
-* **Response (`200 OK`)**: `{"status": "success", "is_on": true}`
+* **Response (`200 OK`)**: `{"status": "success", "is_on": true, "brightness": 1.0}`
+* **Error (`409 Conflict`)**: Lights are locked (scan in progress).
+
+### `POST /test/lights/brightness`
+Dims the LED strips using RP1 hardware PWM.
+* **Request Body**:
+  ```json
+  {
+    "brightness": 0.5
+  }
+  ```
+  * `brightness` (float, range `0.0` to `1.0`): 0 is off, 1.0 is full brightness.
+* **Response (`200 OK`)**: `{"status": "success", "brightness": 0.5, "is_on": true}`
+* **Error (`409 Conflict`)**: Lights are locked (scan in progress).
 
 * **Example `curl`**:
   ```bash
-  curl -X POST http://localhost:8000/test/lights/toggle
+  curl -X POST http://localhost:8000/test/lights/brightness \
+       -H "Content-Type: application/json" \
+       -d '{"brightness": 0.25}'
   ```
 
 ---

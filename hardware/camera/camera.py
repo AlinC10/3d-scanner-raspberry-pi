@@ -333,7 +333,9 @@ class ArducamIMX477:
                 self.picam2.set_controls(ctls)
             log.info("Controls applied: %s", list(ctls))
 
-    def lock_auto_features(self, settle_time: float = 2.0) -> dict:
+    def lock_auto_features(
+        self, settle_time: float = 2.0, lock_ae: bool = True, lock_awb: bool = True
+    ) -> dict:
         """Lock the current automatic exposure and white-balance results.
 
         The camera must already be streaming. AE and AWB are allowed to settle
@@ -353,21 +355,29 @@ class ArducamIMX477:
         if not getattr(self.picam2, "started", False):
             raise RuntimeError("camera must be started before locking auto features")
 
-        time.sleep(settle_time)
+        if settle_time:
+            time.sleep(settle_time)
+            
         metadata = self.picam2.capture_metadata()
-        controls = {
-            "AeEnable": False,
-            "AwbEnable": False,
-        }
+        controls = {}
 
-        for name in ("ExposureTime", "AnalogueGain", "ColourGains"):
-            if name in metadata:
-                controls[name] = metadata[name]
+        if lock_ae:
+            controls["AeEnable"] = False
+            for name in ("ExposureTime", "AnalogueGain"):
+                if name in metadata:
+                    controls[name] = metadata[name]
 
-        self.picam2.set_controls(controls)
-        self._pending_controls.update(controls)
+        if lock_awb:
+            controls["AwbEnable"] = False
+            if "ColourGains" in metadata:
+                controls["ColourGains"] = metadata["ColourGains"]
+
+        if controls:
+            self.picam2.set_controls(controls)
+            self._pending_controls.update(controls)
+            
         log.info(
-            "AE/AWB locked: exposure=%s gain=%s colour_gains=%s",
+            "Auto features locked: exposure=%s gain=%s colour_gains=%s",
             controls.get("ExposureTime"),
             controls.get("AnalogueGain"),
             controls.get("ColourGains"),
@@ -447,13 +457,13 @@ class ArducamIMX477:
                 "AeMeteringMode": libcontrols.AeMeteringModeEnum.CentreWeighted,
                 "NoiseReductionMode": libcontrols.NoiseReductionModeEnum.Off,
             }
-            if exposure_time is not None:
-                manual_controls.update({
-                    "ExposureTime": int(exposure_time),
-                    "AeEnable": False,
-                })
-            if analogue_gain is not None:
-                manual_controls["AnalogueGain"] = float(analogue_gain)
+            if exposure_time is not None or analogue_gain is not None:
+                manual_controls["AeEnable"] = False
+                if exposure_time is not None:
+                    manual_controls["ExposureTime"] = int(exposure_time)
+                if analogue_gain is not None:
+                    manual_controls["AnalogueGain"] = float(analogue_gain)
+
             if colour_gains is not None:
                 manual_controls.update({
                     "ColourGains": tuple(float(value) for value in colour_gains),
@@ -481,14 +491,26 @@ class ArducamIMX477:
                 self._pending_controls.update(manual_controls)
                 self.picam2.set_controls(manual_controls)
 
-            if exposure_time is None and colour_gains is None:
-                locked = self.lock_auto_features(settle_time=settle_time)
-            else:
-                if settle_time:
-                    time.sleep(settle_time)
-                locked = dict(manual_controls)
-                self.picam2.set_controls(locked)
-                self._pending_controls.update(locked)
+            locked = dict(manual_controls)
+
+            # Only trigger a live AE/AWB lock if values are entirely missing
+            needs_ae_lock = (exposure_time is None) and (analogue_gain is None)
+            needs_awb_lock = (colour_gains is None)
+
+            if needs_ae_lock or needs_awb_lock:
+                auto_locked = self.lock_auto_features(
+                    settle_time=settle_time, 
+                    lock_ae=needs_ae_lock, 
+                    lock_awb=needs_awb_lock
+                )
+
+                # Prevent auto_locked metadata from overwriting explicitly passed manual controls
+                for k, v in auto_locked.items():
+                    if k not in locked:
+                        locked[k] = v
+
+            elif settle_time:
+                time.sleep(settle_time)
         finally:
             if not keep_running:
                 self.picam2.stop()

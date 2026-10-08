@@ -126,7 +126,7 @@ Stops the RTSP encoder pipeline on both cameras.
 Applies runtime image controls (`brightness`, `contrast`, `saturation`, `sharpness`, `exposure_time`, `awb_mode`) to both cameras simultaneously without stopping the stream.
 
 #### `lock_auto_features(settle_time: float = 2.0) -> List[dict]`
-Waits `settle_time` seconds for the sensors to meter the illuminated object on the turntable, reads `ExposureTime`, `AnalogueGain`, and `ColourGains` from the Master camera metadata, forcefully applies them to the Slave camera, and locks both algorithms (`AeEnable=False`, `AwbEnable=False`).
+Waits `settle_time` seconds for the sensors to meter the illuminated object on the turntable, reads `ExposureTime`, `AnalogueGain`, and `ColourGains` from the Master camera metadata, forcefully applies them to the Slave camera, and locks the algorithms (`AeEnable=False`, `AwbEnable=False`). Note: when called via `prepare_scan`, partial manual overrides intelligently toggle these locks.
 
 ---
 
