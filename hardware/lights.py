@@ -42,7 +42,11 @@ class DimmableLight:
 
         try:
             if pwm_chip is None:
-                pwm_chip = self._find_pwm_chip()
+                import os
+                if "PWM_CHIP" in os.environ:
+                    pwm_chip = int(os.environ["PWM_CHIP"])
+                else:
+                    pwm_chip = self._find_pwm_chip()
             log.info(
                 "[Lights] Initializing hardware PWM: chip=%d, channel=%d, frequency=%d Hz",
                 pwm_chip,
@@ -78,30 +82,38 @@ class DimmableLight:
 
         chips.sort(key=lambda x: x[0])
         if not chips:
-            raise RuntimeError("No /sys/class/pwm/pwmchip* found. Enable dtoverlay=pwm-2chan and reboot.")
+            raise RuntimeError(
+                "No /sys/class/pwm/pwmchip* found. Is 'dtoverlay=pwm-2chan' enabled in /boot/firmware/config.txt? A reboot is required after adding it."
+            )
+
+        discovered_info = []
 
         # 1. Match by RP1 base address marker
         for index, chip in chips:
             try:
-                device = str((chip / "device").resolve())
-                if RP1_PWM0_MARKER in device:
+                device = str((chip / "device").resolve()).lower()
+                npwm = (chip / "npwm").read_text().strip() if (chip / "npwm").exists() else "?"
+                discovered_info.append(f"pwmchip{index} (npwm={npwm}, device={device})")
+                if RP1_PWM0_MARKER.lower() in device:
                     return index
-            except OSError:
-                pass
+            except OSError as e:
+                discovered_info.append(f"pwmchip{index} (read error: {e})")
 
-        # 2. Defensive fallback: match by channel count (pwm-2chan has 2 channels; fan has 1)
+        # 2. Defensive fallback: match by channel count (pwm-2chan / pwm has >= 2 channels; cooler fan has 1)
         for index, chip in chips:
             try:
-                npwm = (chip / "npwm").read_text().strip()
-                if npwm == "2":
-                    log.warning("[Lights] RP1 marker not found, but pwmchip%d has 2 channels. Using it.", index)
+                npwm_str = (chip / "npwm").read_text().strip()
+                npwm_val = int(npwm_str)
+                if npwm_val >= 2:
+                    log.warning("[Lights] RP1 address marker not matched, but pwmchip%d has %d channels. Using it.", index, npwm_val)
                     return index
-            except OSError:
+            except (OSError, ValueError):
                 pass
 
+        details = "; ".join(discovered_info)
         raise RuntimeError(
-            "Could not identify the RP1 PWM0 chip. Refusing to default to pwmchip0 "
-            "to prevent accidentally taking control of the Raspberry Pi Active Cooler fan."
+            f"Could not identify the RP1 PWM0 chip. Detected PWM chips: [{details}]. "
+            "If only the active cooler fan chip (1 channel) is listed, make sure 'dtoverlay=pwm-2chan' is in /boot/firmware/config.txt and you have REBOOTED the Pi."
         )
 
     def _target_duty(self) -> float:
