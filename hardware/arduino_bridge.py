@@ -57,17 +57,18 @@ class ArduinoBridge:
         self.port = port
         self.baudrate = baudrate
         self.serial: Optional[serial.Serial] = None
+        self._configs = []
         
         # We use a two-lock architecture to allow emergency stops to preempt active commands.
         
         # 1. Write Lock: Prevents two threads from interleaving bytes during a write.
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         
         # 2. Response (Transaction) Lock: Ensures a strict Request->Response transaction.
         # If Thread A sends a ROTATE command, no other thread can send a normal command 
         # until Thread A receives its '0' or '4' response. This prevents Thread B from 
         # stealing Thread A's response buffer.
-        self._response_lock = threading.Lock()
+        self._response_lock = threading.RLock()
         
         self._connect()
         
@@ -154,12 +155,19 @@ class ArduinoBridge:
             time.sleep(0.05)
 
         if not ready_received:
-            # Fallback: if we connected to an already-open port without DTR reset, 
-            # ping the board to ensure it is alive.
             try:
                 self.send_command(f"{ArduinoCommand.PING.value}")
             except Exception:
                 pass
+
+        # Auto-heal: Restore any motor configuration states
+        if hasattr(self, '_configs') and self._configs:
+            log.info("[ArduinoBridge] Auto-restoring motor configurations after connection...")
+            for cfg in self._configs:
+                try:
+                    self.send_command(cfg, timeout=2.0)
+                except Exception:
+                    pass
 
     def send_command(self, cmd: str, timeout: Optional[float] = 30.0) -> str:
         """
@@ -177,19 +185,25 @@ class ArduinoBridge:
             
         clean_cmd = cmd.strip() + "\n"
         
+        # Intercept and store CONFIG commands for auto-healing
+        if clean_cmd.startswith(str(ArduinoCommand.CONFIG.value) + " "):
+            cmd_no_nl = cmd.strip()
+            if cmd_no_nl not in self._configs:
+                self._configs.append(cmd_no_nl)
+        
         # Acquire transaction lock so no other normal command can interleave
         with self._response_lock:
-            # Acquire write lock just for the physical bytes transfer
-            with self._write_lock:
-                self.serial.write(clean_cmd.encode("utf-8"))
-                self.serial.flush()
-
             # Temporarily mutate the underlying pyserial timeout for this specific transaction
             old_timeout = self.serial.timeout
             if timeout is not None:
                 self.serial.timeout = timeout
                 
             try:
+                # Acquire write lock just for the physical bytes transfer
+                with self._write_lock:
+                    self.serial.write(clean_cmd.encode("utf-8"))
+                    self.serial.flush()
+
                 # Block until the Arduino executes the command and returns its Status Code (e.g., '0' or '4')
                 line = self.serial.readline().decode("utf-8", errors="ignore").strip()
                 return line
