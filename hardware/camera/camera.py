@@ -16,10 +16,8 @@ try:
     from picamera2.outputs import FfmpegOutput
     from libcamera import controls as libcontrols
 except ImportError:
-    sys.exit(
-        "[ERROR] picamera2 not found. Install with:\n"
-        "  sudo apt install python3-picamera2"
-    )
+    logging.warning("[ERROR] picamera2 not found. Install with:\n"
+        "  sudo apt install python3-picamera2")
 
 
 try:

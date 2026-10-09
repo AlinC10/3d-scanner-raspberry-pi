@@ -2,7 +2,14 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 import logging
 from schemas.scanner import *
 
-from hardware.scanner import Scanner, ScannerState
+import os
+MOCK_HARDWARE = os.environ.get("MOCK_HARDWARE") == "1"
+
+if MOCK_HARDWARE:
+    from hardware.scanner_mock import ScannerMock as Scanner
+    from hardware.scanner_mock import ScannerState
+else:
+    from hardware.scanner import Scanner, ScannerState
 import cloud.runpod as runpod
 import cloud.cloudflare_r2 as r2
 
@@ -14,7 +21,14 @@ router = APIRouter(
 )
 
 # The scanner is initialized once and kept in memory as a singleton across the FastAPI application lifecycle.
-scanner = Scanner(xvs=False)
+import os
+MOCK_HARDWARE = os.environ.get("MOCK_HARDWARE") == "1"
+
+if MOCK_HARDWARE:
+    from hardware.scanner_mock import ScannerMock
+    scanner = ScannerMock(xvs=False)
+else:
+    scanner = Scanner(xvs=False) if not MOCK_HARDWARE else Scanner(xvs=False)
 
 def _finish_preparation_worker(kwargs: dict):
     scanner.finish_preparation(**kwargs)
