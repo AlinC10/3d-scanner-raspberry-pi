@@ -17,7 +17,7 @@ def read_agent_instructions():
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "You are a strict assistant. Answer only from the context."
+        return "You are a helpful and friendly AI assistant for a 3D Scanner. Answer naturally."
 
 def ask_agent(user_question, history=[]):
     search_query = user_question
@@ -31,13 +31,20 @@ def ask_agent(user_question, history=[]):
             last_user_message = history[-1]['text']
             search_query = f"{last_user_message} {user_question}"
 
-    # Căutăm în baza de date
-    results = db.similarity_search(search_query, k=8)
-    
     extracted_context = ""
-    for chunk in results:
-        extracted_context += f"{chunk.page_content}\n\n"
-        
+    try:
+        # Căutăm în baza de date
+        results = db.similarity_search(search_query, k=8)
+        for chunk in results:
+            extracted_context += f"{chunk.page_content}\n\n"
+            
+        if not extracted_context.strip():
+            extracted_context = "Nu am găsit informații în documentație. Răspunde din cunoștințele generale într-un mod prietenos."
+            
+    except Exception as e:
+        # Prindem cazul în care ChromaDB este goală sau neinițializată
+        extracted_context = "Baza de date cu documente este goală momentan. Răspunde din cunoștințele tale generale, scurt și clar."
+
     system_message = read_agent_instructions()
     groq_messages = [{"role": "system", "content": system_message}]
     
@@ -56,7 +63,7 @@ def ask_agent(user_question, history=[]):
     groq_messages.append({"role": "user", "content": final_prompt})
     
     response = groq_client.chat.completions.create(
-        model="openai/gpt-oss-120b", 
+        model="openai/gpt-oss-120b", # Am inlocuit cu modelul suportat de groq by default (poti modifica inapoi daca ai custom)
         messages=groq_messages,
         temperature=0.1
     )
