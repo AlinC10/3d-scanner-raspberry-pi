@@ -75,8 +75,8 @@ uint8_t Motor::rotate(const bool clockwise, const uint32_t steps, const uint32_t
     digitalWrite(this->dirPin, clockwise ? HIGH : LOW);
     delayMicroseconds(20); // TB6600 direction setup time
 
-    constexpr uint8_t TB6600_REQ_MICROS_DELAY = 10;
-    const uint32_t lowDelay = (delayMicros > TB6600_REQ_MICROS_DELAY) ? (delayMicros - TB6600_REQ_MICROS_DELAY) : 1;
+    constexpr uint8_t TB6600_REQ_MICROS_DELAY = 50;
+    const uint32_t lowDelay = (delayMicros > TB6600_REQ_MICROS_DELAY) ? (delayMicros - TB6600_REQ_MICROS_DELAY) : TB6600_REQ_MICROS_DELAY;
 
     for (uint32_t i = 0; i < steps; i++) {
         if (Serial.available() > 0) {
@@ -119,10 +119,10 @@ inline uint8_t Motor::stepMotorWithCheck(uint32_t delayUs) {
         }
     }
     digitalWrite(this->pulsePin, HIGH);
-    delayMicroseconds(5); // TB6600 requirement
+    delayMicroseconds(50); // TB6600 requirement
     digitalWrite(this->pulsePin, LOW);
     
-    safeDelayMicroseconds(delayUs > 5 ? delayUs - 5 : 5);
+    safeDelayMicroseconds(delayUs > 50 ? delayUs - 50 : 50);
     return STATUS_OK;
 }
 
