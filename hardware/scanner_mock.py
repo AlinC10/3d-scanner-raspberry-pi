@@ -6,7 +6,7 @@ class ScannerState:
     ERROR = "ERROR"
 
 class ScannerMock:
-    def __init__(self, xvs=False):
+    def __init__(self, xvs=False, camera_mode=None, **kwargs):
         self.state = ScannerState.IDLE
         self.turntable_motor = None
         self.z_axis_motor = None

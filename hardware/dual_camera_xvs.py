@@ -1,226 +1,145 @@
 import logging
 import time
 from typing import Optional, List, Tuple
-from concurrent.futures import ThreadPoolExecutor
 
+from .base_dual_camera import BaseDualCamera
 from .camera import ArducamIMX477
-from hardware.camera.config import DEFAULT_QUALITY
+from hardware.camera.config import (
+    DEFAULT_QUALITY,
+    DEFAULT_PHOTO_RESOLUTION,
+    DEFAULT_VIDEO_RESOLUTION,
+    DEFAULT_PREVIEW_RESOLUTION,
+)
 
 log = logging.getLogger(__name__)
 
-class DualCameraXVS:
+
+class DualCameraXVS(BaseDualCamera):
     """
     Controls two Arducam IMX477 cameras using Hardware XVS Synchronization.
     
-    IMPORTANT: This class assumes your hardware and OS are configured for XVS:
+    IMPORTANT: This class assumes hardware and OS are configured for XVS:
     1. A physical jumper cable connects the XVS pins between the two cameras.
-    2. /boot/firmware/config.txt assigns one camera as 'source' (Master) 
-       and the other as 'sink' (Slave), e.g.:
-         dtoverlay=imx477,camera0,xvs_source
-         dtoverlay=imx477,camera1,xvs_sink
+    2. /boot/firmware/config.txt assigns one camera as 'source' (Master/cam1)
+       and the other as 'sink' (Slave/cam2).
          
     CRITICAL BEHAVIOR:
-    In XVS mode, the Slave camera will completely freeze and wait for the Master 
-    camera to start generating timing pulses. Therefore, the Slave camera MUST 
-    be started before the Master camera, and they must be started in separate 
-    threads to prevent Python from deadlocking.
+    In XVS mode, the Slave camera (cam2) will freeze and wait for the Master
+    camera (cam1) to start generating timing pulses. Therefore, the Slave camera
+    MUST be started before the Master camera, and they must be started in separate
+    threads to prevent deadlocking.
     """
 
     def __init__(
         self,
-        master_id: int = 0,
-        slave_id: int = 1,
+        camera_id1: int = 0,
+        camera_id2: int = 1,
         quality: int = DEFAULT_QUALITY,
         size: Optional[Tuple[int, int]] = None,
         video_size: Optional[Tuple[int, int]] = None,
         preview_size: Optional[Tuple[int, int]] = None,
-        master_rotation: int = 0,
-        slave_rotation: int = 0,
+        rotation1: int = 0,
+        rotation2: int = 0,
+        **kwargs,
     ):
         """
         Initializes the XVS synchronized dual camera setup.
+        Accepts legacy master_id/slave_id/camera_id_1 keyword arguments for backward compatibility.
         """
-        log.info("Initializing DualCameraXVS (Master: CSI %d, Slave: CSI %d)", master_id, slave_id)
-        self._executor = ThreadPoolExecutor(max_workers=2)
-        
-        # 1. Instantiate Master
-        self.master = ArducamIMX477(
-            camera_id=master_id, quality=quality, size=size,
-            video_size=video_size, preview_size=preview_size, rotation=master_rotation
+        camera_id1 = kwargs.pop("master_id", kwargs.pop("camera_id_1", camera_id1))
+        camera_id2 = kwargs.pop("slave_id", kwargs.pop("camera_id_2", camera_id2))
+        rotation1 = kwargs.pop("master_rotation", kwargs.pop("rotation_1", rotation1))
+        rotation2 = kwargs.pop("slave_rotation", kwargs.pop("rotation_2", rotation2))
+
+        super().__init__(
+            camera_id1=camera_id1,
+            camera_id2=camera_id2,
+            quality=quality,
+            size=size,
+            video_size=video_size,
+            preview_size=preview_size,
+            rotation1=rotation1,
+            rotation2=rotation2,
         )
-        
-        # 2. START Master Stream (generates clock pulses so Slave can safely probe sensor)
-        # We temporarily configure and start it so Slave's __init__ doesn't time out.
-        self.master.picam2.configure(self.master.picam2.create_preview_configuration())
-        self.master.picam2.start()
+
+        log.info("Initializing DualCameraXVS (Master: CSI %d, Slave: CSI %d)", camera_id1, camera_id2)
+
+        # 1. Instantiate Master (cam1)
+        self.cam1 = ArducamIMX477(
+            camera_id=camera_id1,
+            quality=quality,
+            size=size,
+            video_size=video_size,
+            preview_size=preview_size,
+            rotation=rotation1,
+        )
+
+        # 2. START Master Stream temporarily (generates clock pulses so Slave can safely probe sensor)
+        self.cam1.picam2.configure(self.cam1.picam2.create_preview_configuration())
+        self.cam1.picam2.start()
         time.sleep(0.5)
-        
-        # 3. Instantiate Slave safely!
-        self.slave = ArducamIMX477(
-            camera_id=slave_id, quality=quality, size=size,
-            video_size=video_size, preview_size=preview_size, rotation=slave_rotation
+
+        # 3. Instantiate Slave (cam2) safely
+        self.cam2 = ArducamIMX477(
+            camera_id=camera_id2,
+            quality=quality,
+            size=size,
+            video_size=video_size,
+            preview_size=preview_size,
+            rotation=rotation2,
         )
-        
-        # 4. Stop Master (or let prepare_scan handle it)
-        self.master.picam2.stop()
-        
-        self.cameras = [self.master, self.slave]
 
-    def __enter__(self):
-        return self
+        # 4. Stop Master preview stream
+        self.cam1.picam2.stop()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        self.cameras = [self.cam1, self.cam2]
 
-    def close(self):
-        """Shutdown the thread pool and safely close both cameras."""
-        self._executor.shutdown(wait=True)
-        for cam in self.cameras:
-            cam.close()
-        log.info("DualCameraXVS closed.")
-
-    # ── Configuration & State ────────────────────────────────────────────────
-
-    def rotate(self, direction: str) -> List[int]:
-        futures = [self._executor.submit(cam.rotate, direction) for cam in self.cameras]
-        return [f.result() for f in futures]
-
-    def apply_settings(self, **kwargs):
-        futures = [self._executor.submit(cam.apply_settings, **kwargs) for cam in self.cameras]
-        for f in futures:
-            f.result()
+    # ── Abstract Contract Implementation ───────────────────────
 
     def prepare_scan(self, **kwargs) -> List[dict]:
         """
         Prepare and lock both cameras concurrently for scanning.
+        Enforces XVS sequencing: Slave thread starts FIRST, pauses, Master starts SECOND.
         """
-        focus_val = kwargs.pop("focus", None)
-        rotation_val = kwargs.pop("rotation", None)
-        kwargs_master = kwargs.copy()
-        kwargs_slave = kwargs.copy()
-        
-        if isinstance(focus_val, (tuple, list)) and len(focus_val) == 2 and isinstance(focus_val[0], (int, str, type(None))):
-            kwargs_master["focus"] = focus_val[0]
-            kwargs_slave["focus"] = focus_val[1]
-        else:
-            kwargs_master["focus"] = focus_val
-            kwargs_slave["focus"] = focus_val
+        kw1, kw2 = self._split_camera_kwargs(kwargs)
 
-        if isinstance(rotation_val, (tuple, list)) and len(rotation_val) == 2 and isinstance(rotation_val[0], (int, str, type(None))):
-            kwargs_master["rotation"] = rotation_val[0]
-            kwargs_slave["rotation"] = rotation_val[1]
-        else:
-            kwargs_master["rotation"] = rotation_val
-            kwargs_slave["rotation"] = rotation_val
+        # 1. Start Slave thread FIRST (blocks waiting for XVS pulses)
+        f_slave = self._executor.submit(self.cam2.prepare_scan, **kw2)
 
-        # START SEQUENCE IS CRITICAL FOR XVS:
-        # 1. Start the Slave camera thread FIRST. It will block waiting for XVS.
-        f_slave = self._executor.submit(self.slave.prepare_scan, **kwargs_slave)
-        
-        # 2. Give the OS a tiny moment to initiate the slave thread.
+        # 2. Give the OS a tiny moment to initiate the slave thread
         time.sleep(0.1)
-        
-        # 3. Start the Master camera. This generates the XVS pulses, unblocking the Slave.
-        f_master = self._executor.submit(self.master.prepare_scan, **kwargs_master)
-        
+
+        # 3. Start Master camera (generates XVS pulses, unblocking Slave)
+        f_master = self._executor.submit(self.cam1.prepare_scan, **kw1)
+
         master_res = f_master.result()
         slave_res = f_slave.result()
 
-        # OVERRIDE: If the user relied on Auto features, force Slave to match Master
-        needs_sync = False
-        sync_controls = {"AeEnable": False, "AwbEnable": False}
-        
-        if kwargs.get("exposure_time") is None:
-            sync_controls["ExposureTime"] = master_res["controls"].get("ExposureTime")
-            sync_controls["AnalogueGain"] = master_res["controls"].get("AnalogueGain")
-            needs_sync = True
-            
-        if kwargs.get("colour_gains") is None:
-            sync_controls["ColourGains"] = master_res["controls"].get("ColourGains")
-            needs_sync = True
-            
-        sync_controls = {k: v for k, v in sync_controls.items() if v is not None}
-        
-        if needs_sync and sync_controls:
-            if getattr(self.slave.picam2, "started", False):
-                self.slave.picam2.set_controls(sync_controls)
-            self.slave._pending_controls.update(sync_controls)
-            slave_res["controls"].update(sync_controls)
-            
+        # Synchronize AE/AWB controls from Master (cam1) to Slave (cam2)
+        self._sync_slave_controls(master_res, slave_res, kwargs)
+
         return [master_res, slave_res]
 
-    def start_stream(self, bitrate: int = 4_000_000):
+    def start_stream(self, bitrate: int = 4_000_000) -> List[str]:
+        """
+        Starts RTSP live streams with Slave started before Master.
+        """
         if not isinstance(bitrate, int):
             raise TypeError("Bitrate needs to be an integer (int)")
 
-        f_slave = self._executor.submit(self.slave.start_stream, bitrate=bitrate)
-
+        f_slave = self._executor.submit(self.cam2.start_stream, bitrate=bitrate)
         time.sleep(0.1)
+        f_master = self._executor.submit(self.cam1.start_stream, bitrate=bitrate)
 
-        f_master = self._executor.submit(self.master.start_stream, bitrate=bitrate)
-
-        # return URL to the streams
         return [f_master.result(), f_slave.result()]
 
-    def stop_stream(self):
-        self._executor.submit(self.slave.stop_stream)
-
-        self._executor.submit(self.master.stop_stream)
-
-    def lock_auto_features(self, settle_time: float = 2.0) -> List[dict]:
-        futures = [self._executor.submit(cam.lock_auto_features, settle_time) for cam in self.cameras]
-        res = [f.result() for f in futures]
-
-        # Force Slave (index 1) to match Master (index 0)
-        sync_controls = {
-            "ExposureTime": res[0].get("ExposureTime"),
-            "AnalogueGain": res[0].get("AnalogueGain"),
-            "ColourGains": res[0].get("ColourGains"),
-            "AeEnable": False,
-            "AwbEnable": False,
-        }
-        sync_controls = {k: v for k, v in sync_controls.items() if v is not None}
-        
-        if sync_controls:
-            if getattr(self.cameras[1].picam2, "started", False):
-                self.cameras[1].picam2.set_controls(sync_controls)
-            self.cameras[1]._pending_controls.update(sync_controls)
-            res[1].update(sync_controls)
-            
-        return res
-
-    # ── Focus ────────────────────────────────────────────────────────────────
-
-    def focus_set(self, position: int | Tuple[int, int]):
-        if isinstance(position, (tuple, list)) and len(position) == 2:
-            f_master = self._executor.submit(self.master.focus_set, position[0])
-            f_slave = self._executor.submit(self.slave.focus_set, position[1])
-            f_master.result(); f_slave.result()
-        else:
-            futures = [self._executor.submit(cam.focus_set, position) for cam in self.cameras]
-            for f in futures:
-                f.result()
-            
-    def focus_step(self, delta: int | Tuple[int, int]):
-        if isinstance(delta, (tuple, list)) and len(delta) == 2:
-            f_master = self._executor.submit(self.master.focus_step, delta[0])
-            f_slave = self._executor.submit(self.slave.focus_step, delta[1])
-            f_master.result(); f_slave.result()
-        else:
-            futures = [self._executor.submit(cam.focus_step, delta) for cam in self.cameras]
-            for f in futures:
-                f.result()
-
-    def focus_reset(self):
-        futures = [self._executor.submit(cam.focus_reset) for cam in self.cameras]
-        for f in futures:
-            f.result()
-
-    def focus_sweep_autofocus(self, step: int = 30, roi: tuple = (0.3, 0.3, 0.4, 0.4)) -> List[int]:
-        futures = [self._executor.submit(cam.focus_sweep_autofocus, step=step, roi=roi) for cam in self.cameras]
-        return [f.result() for f in futures]
-
-    # ── Capture ──────────────────────────────────────────────────────────────
+    def stop_stream(self) -> None:
+        """
+        Stops RTSP live streams sequentially.
+        """
+        self._executor.submit(self.cam2.stop_stream)
+        time.sleep(0.1)
+        self._executor.submit(self.cam1.stop_stream)
 
     def capture_photo(
         self,
@@ -232,66 +151,67 @@ class DualCameraXVS:
         raw: bool = False,
         show_preview: bool = False,
         preview_duration: float = 2.0,
+        **kwargs,
     ) -> List[str]:
         """
-        Capture hardware-synchronized photos.
-        If meshroom_rig=True, outputs will be saved to output_dir/0/ and output_dir/1/
-        with identical filenames for proper Meshroom rig detection.
+        Capture hardware-synchronized photos with Slave queued before Master.
         """
-        import os
-        
-        if meshroom_rig:
-            # Create the rig folders (0 and 1)
-            dir0 = os.path.join(output_dir, str(self.master.camera_id))
-            dir1 = os.path.join(output_dir, str(self.slave.camera_id))
-            os.makedirs(dir0, exist_ok=True)
-            os.makedirs(dir1, exist_ok=True)
-            
-            # Meshroom requires identical filenames in different folders
-            out_master = os.path.join(dir0, f"{output_prefix}.jpg")
-            out_slave = os.path.join(dir1, f"{output_prefix}.jpg")
-        else:
-            out_master = os.path.join(output_dir, f"{output_prefix}_master_cam{self.master.camera_id}.jpg")
-            out_slave  = os.path.join(output_dir, f"{output_prefix}_slave_cam{self.slave.camera_id}.jpg")
-        
+        out_master, out_slave = self._resolve_capture_paths(output_prefix, output_dir, meshroom_rig)
+
         # SLAVE FIRST
         f_slave = self._executor.submit(
-            self.slave.capture_photo,
-            output=out_slave, resolution=resolution or self.slave.size, quality=quality or self.slave.quality,
-            raw=raw, show_preview=show_preview, preview_duration=preview_duration
+            self.cam2.capture_photo,
+            output=out_slave,
+            resolution=resolution or self.cam2.size,
+            quality=quality or self.cam2.quality,
+            raw=raw,
+            show_preview=show_preview,
+            preview_duration=preview_duration,
         )
-        
+
         # MASTER SECOND
         f_master = self._executor.submit(
-            self.master.capture_photo,
-            output=out_master, resolution=resolution or self.master.size, quality=quality or self.master.quality,
-            raw=raw, show_preview=show_preview, preview_duration=preview_duration
+            self.cam1.capture_photo,
+            output=out_master,
+            resolution=resolution or self.cam1.size,
+            quality=quality or self.cam1.quality,
+            raw=raw,
+            show_preview=show_preview,
+            preview_duration=preview_duration,
         )
-            
+
         return [f_master.result(), f_slave.result()]
 
     def record_video(
         self,
         output_prefix: str = "xvs_video",
+        output_dir: str = ".",
         duration: float = 10.0,
         resolution=None,
         quality: int = 25,
+        **kwargs,
     ) -> List[str]:
-        out_master = f"{output_prefix}_master_cam{self.master.camera_id}.mp4"
-        out_slave  = f"{output_prefix}_slave_cam{self.slave.camera_id}.mp4"
-        
+        """
+        Record videos with Slave queued before Master.
+        """
+        out_master, out_slave = self._resolve_video_paths(output_prefix, output_dir)
+
         # SLAVE FIRST
         f_slave = self._executor.submit(
-            self.slave.record_video,
-            output=out_slave, duration=duration, resolution=resolution or self.slave.video_size, quality=quality or self.slave.quality
+            self.cam2.record_video,
+            output=out_slave,
+            duration=duration,
+            resolution=resolution or self.cam2.video_size,
+            quality=quality or self.cam2.quality,
         )
-        
-        # time.sleep(0.1)
-        
+
         # MASTER SECOND
         f_master = self._executor.submit(
-            self.master.record_video,
-            output=out_master, duration=duration, resolution=resolution or self.master.video_size, quality=quality or self.master.quality
+            self.cam1.record_video,
+            output=out_master,
+            duration=duration,
+            resolution=resolution or self.cam1.video_size,
+            quality=quality or self.cam1.quality,
         )
-            
+
         return [f_master.result(), f_slave.result()]

@@ -8,8 +8,11 @@ import queue
 
 from hardware.camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY, \
     DEFAULT_VIDEO_RESOLUTION
+import os
+from .base_dual_camera import BaseDualCamera
 from .dual_camera import DualCamera
 from .dual_camera_xvs import DualCameraXVS
+from .dual_camera_rpi_sync import DualCameraRPISync
 from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
 from .motor import Motor
 from .lights import DimmableLight
@@ -46,7 +49,7 @@ T8_THREADED_ROD_STEP = 8 # mm
 
 
 class Scanner:
-    def __init__(self, xvs: bool = True):
+    def __init__(self, xvs: Optional[bool] = None, camera_mode: Optional[str] = None):
         self.tof = ToFSensor()
         self.turntable_motor = Motor(motor_id=0, dir_pin=7, step_pin=6, en_pin=8, step_type="1/16")
         self.z_axis_motor = Motor(motor_id=1, dir_pin=4, step_pin=5, en_pin=3, step_type="1/4")
@@ -60,9 +63,18 @@ class Scanner:
 
         self.lights = DimmableLight(relay_pin=11, pwm_channel=0, frequency=10000)
 
-        self.dual_cameras: Optional[DualCamera | DualCameraXVS] = None
+        self.dual_cameras: Optional[BaseDualCamera] = None
 
-        self.xvs = xvs
+        if camera_mode is not None:
+            self.camera_mode = camera_mode.lower()
+        elif xvs is True:
+            self.camera_mode = "xvs"
+        elif xvs is False:
+            self.camera_mode = os.environ.get("CAMERA_MODE", "rpi_sync").lower()
+        else:
+            self.camera_mode = os.environ.get("CAMERA_MODE", "rpi_sync").lower()
+
+        self.xvs = (self.camera_mode == "xvs")
 
         self.state = ScannerState.IDLE
         self._lock = threading.Lock()
@@ -81,12 +93,9 @@ class Scanner:
 
     @property
     def is_streaming(self):
-        if isinstance(self.dual_cameras, DualCamera):
-            return getattr(self.dual_cameras.cam1.picam2, "recording", False)
-        elif isinstance(self.dual_cameras, DualCameraXVS):
-            return getattr(self.dual_cameras.master.picam2, "recording", False)
-        else:
-            return False
+        if self.dual_cameras:
+            return self.dual_cameras.is_streaming
+        return False
 
     @property
     def level(self):
@@ -291,13 +300,7 @@ class Scanner:
         if not self.dual_cameras:
             return False
 
-        cams = []
-        if getattr(self.dual_cameras.master if self.xvs else self.dual_cameras.cam1, "picam2", None):
-            cams.append(self.dual_cameras.master if self.xvs else self.dual_cameras.cam1)
-            
-        slave = self.dual_cameras.slave if self.xvs else self.dual_cameras.cam2
-        if getattr(slave, "picam2", None):
-            cams.append(slave)
+        cams = [cam for cam in self.dual_cameras.cameras if getattr(cam, "picam2", None)]
 
         if not cams or not getattr(cams[0].picam2, "started", False):
             return False
@@ -364,7 +367,13 @@ class Scanner:
         log.warning("[Light] Thermal stabilization window timed out.")
         return False
 
-    def setup_and_stream(self, enable_stream: bool = True, bitrate: int = 4_000_000, **kwargs) -> list[str] | None:
+    def setup_and_stream(
+        self,
+        enable_stream: bool = True,
+        bitrate: int = 4_000_000,
+        camera_mode: Optional[str] = None,
+        **kwargs
+    ) -> list[str] | None:
         """
         Phase 1: Initializes cameras, gets initial stream image, and starts livestream.
         Returns the stream_urls immediately so the frontend can connect.
@@ -380,9 +389,29 @@ class Scanner:
         try:
             self.lights.on()
 
+            # Determine camera driver mode
+            selected_mode = (
+                camera_mode
+                or kwargs.pop("camera_mode", None)
+                or kwargs.pop("mode", None)
+                or self.camera_mode
+            )
+            if isinstance(selected_mode, str):
+                selected_mode = selected_mode.lower()
+
+            if selected_mode in ("rpi_sync", "sync", "dual_camera_rpi_sync"):
+                CameraClass = DualCameraRPISync
+            elif selected_mode in ("xvs", "dual_camera_xvs"):
+                CameraClass = DualCameraXVS
+            elif selected_mode in ("staggered", "dual_camera", "legacy"):
+                CameraClass = DualCamera
+            else:
+                log.warning("[Scanner] Unrecognized camera mode '%s', falling back to DualCameraRPISync", selected_mode)
+                CameraClass = DualCameraRPISync
+
             # retrieve cameras arguments
-            master_id = kwargs.pop("master_id", kwargs.pop("camera_id_1", 0))
-            slave_id = kwargs.pop("slave_id", kwargs.pop("camera_id_2", 1))
+            cam1_id = kwargs.pop("camera_id1", kwargs.pop("camera_id_1", kwargs.pop("master_id", 0)))
+            cam2_id = kwargs.pop("camera_id2", kwargs.pop("camera_id_2", kwargs.pop("slave_id", 1)))
 
             quality = kwargs.get("quality", DEFAULT_QUALITY)
             photo_resolution = kwargs.get("photo_resolution", DEFAULT_PHOTO_RESOLUTION)
@@ -396,18 +425,11 @@ class Scanner:
                 "preview_size": preview_resolution,
             }
 
-            if self.xvs:
-                self.dual_cameras = DualCameraXVS(
-                    master_id=master_id,
-                    slave_id=slave_id,
-                    **camera_kwargs
-                )
-            else:
-                self.dual_cameras = DualCamera(
-                    camera_id_1=master_id,
-                    camera_id_2=slave_id,
-                    **camera_kwargs
-                )
+            self.dual_cameras = CameraClass(
+                camera_id1=cam1_id,
+                camera_id2=cam2_id,
+                **camera_kwargs
+            )
 
             # keep_running=True is required so the livestream can work!
             kwargs["keep_running"] = True
@@ -431,9 +453,15 @@ class Scanner:
         """
         try:
             # Pop off initialization arguments that would crash ArducamIMX477
+            camera_kwargs.pop("camera_id1", None)
+            camera_kwargs.pop("camera_id2", None)
+            camera_kwargs.pop("camera_id_1", None)
+            camera_kwargs.pop("camera_id_2", None)
             camera_kwargs.pop("master_id", None)
             camera_kwargs.pop("slave_id", None)
             camera_kwargs.pop("video_resolution", None)
+            camera_kwargs.pop("camera_mode", None)
+            camera_kwargs.pop("mode", None)
 
             # home the motor
             self.home_z_axis()
@@ -498,17 +526,24 @@ class Scanner:
                     self.state = ScannerState.ERROR
 
     def generate_livestream(self, bitrate: int = 4_000_000):
-        """"""
+        """Starts or retrieves livestream URLs."""
         if self.state not in (ScannerState.PREPARING, ScannerState.PREPARED) or self.dual_cameras is None:
-            return
+            return None
 
         if not self.is_streaming:
             try:
-                # return URL to the streams
-                return self.dual_cameras.start_stream(bitrate=bitrate)
+                self.stream_urls = self.dual_cameras.start_stream(bitrate=bitrate)
+                return self.stream_urls
             except Exception as e:
                 self.cleanup()
                 raise ScannerError(f"generate_livestream error: {str(e)}")
+        else:
+            if not self.stream_urls:
+                try:
+                    self.stream_urls = self.dual_cameras.start_stream(bitrate=bitrate)
+                except Exception:
+                    pass
+            return self.stream_urls
 
     def stop_stream(self):
         """Stops the live stream and releases the camera devices."""

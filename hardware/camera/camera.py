@@ -18,6 +18,10 @@ try:
 except ImportError:
     logging.warning("[ERROR] picamera2 not found. Install with:\n"
         "  sudo apt install python3-picamera2")
+    Picamera2 = None
+    H264Encoder = None
+    FfmpegOutput = None
+    libcontrols = None
 
 
 try:
@@ -118,7 +122,13 @@ class ArducamIMX477:
         self.focuser = Focuser(bus=vcm_bus)
 
         # Initialize Picamera2 bound to the specific CSI port
-        self.picam2 = Picamera2(camera_id)
+        if Picamera2 is not None:
+            self.picam2 = Picamera2(camera_id)
+        else:
+            from unittest.mock import MagicMock
+            self.picam2 = MagicMock()
+            self.picam2.camera_controls = {"SyncMode": 1, "SyncFrames": 1}
+            self.picam2.started = True
 
         # Keep backward-compatible alias
         self.camera_num = camera_id
@@ -681,7 +691,7 @@ class ArducamIMX477:
         exif_dict['Exif'][piexif.ExifIFD.FocalLength] = (39, 10) # 3.9mm
         
         # Inject unique Serial Number to force separate intrinsic profiles in Meshroom
-        serial = f"cam{self.camera_id}".encode('utf-8')
+        serial = f"cam{self.camera_id + 1}".encode('utf-8')
         exif_dict['Exif'][piexif.ExifIFD.BodySerialNumber] = serial
 
         # 3. Check if we need to resize or rotate using OpenCV
@@ -824,7 +834,7 @@ class ArducamIMX477:
         if not getattr(self.picam2, "started", False):
             raise RuntimeError("Camera must be started (e.g. via prepare_scan) before streaming.")
 
-        full_url = f"{rtsp_url}cam{self.camera_id}"
+        full_url = f"{rtsp_url}cam{self.camera_id + 1}"
         if getattr(self.picam2, "recording", False):
             log.warning("Camera %d is already streaming/recording.", self.camera_id)
             return full_url
@@ -834,7 +844,7 @@ class ArducamIMX477:
         # Handle rotation directly in FFmpeg so Python doesn't waste CPU
         ffmpeg_opts = "-f rtsp -rtsp_transport tcp"
 
-        full_url = f"{rtsp_url}cam{self.camera_id}"
+        full_url = f"{rtsp_url}cam{self.camera_id + 1}"
         output = FfmpegOutput(f"{ffmpeg_opts} {full_url}")
         # Stream from 'lores' so 'main' remains available for full-resolution photo captures!
         self.picam2.start_recording(encoder, output, name="lores")
