@@ -5,7 +5,6 @@ from database import db
 
 def delete_document_from_db(filename, delete_physically=True):
     print(f"\n--- [DELETE] Starting deletion for: {filename} ---")
-    
     if delete_physically:
         file_path = os.path.join("uploads", filename)
         if os.path.exists(file_path):
@@ -27,7 +26,6 @@ def delete_document_from_db(filename, delete_physically=True):
         
     return False
 
-
 def process_document(file_path):
     filename = os.path.basename(file_path)
     print(f"\n--- [UPLOAD] Starting processing for: {filename} ---")
@@ -43,7 +41,7 @@ def process_document(file_path):
     elif extension == 'docx':
         loader = Docx2txtLoader(file_path)
         documents = loader.load()
-    elif extension == 'txt':
+    elif extension in ['txt', 'md']: # S-a adaugat suport explicit pt .md
         loader = TextLoader(file_path, encoding='utf-8')
         documents = loader.load()
     else:
@@ -55,16 +53,29 @@ def process_document(file_path):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_documents(documents)
 
-    # ---> FILTRUL NOU ADAUGAT <---
-    # Eliminam orice fragment gol, cu tip gresit (None) sau care contine doar spatii libere
     valid_chunks = [chunk for chunk in chunks if
                     chunk.page_content and isinstance(chunk.page_content, str) and chunk.page_content.strip()]
 
     if not valid_chunks:
         raise Exception("Nu am putut genera fragmente de text valide din acest document.")
 
-    # Adaugam in baza de date doar fragmentele validate
     db.add_documents(valid_chunks)
-    print(f"[SUCCESS] Saved {len(valid_chunks)} fresh chunks!\n")
-
+    print(f"[SUCCESS] Saved {len(valid_chunks)} fresh chunks for {filename}!\n")
     return len(valid_chunks)
+
+def process_directory(directory_path):
+    print(f"\n--- [UPLOAD] Starting directory processing: {directory_path} ---")
+    total_chunks = 0
+    if not os.path.exists(directory_path):
+        raise Exception(f"Directorul {directory_path} nu exista!")
+        
+    for filename in os.listdir(directory_path):
+        if filename.endswith(('.md', '.txt', '.pdf', '.docx')):
+            file_path = os.path.join(directory_path, filename)
+            try:
+                chunks = process_document(file_path)
+                total_chunks += chunks
+            except Exception as e:
+                print(f"[EROARE] Eșec la {filename}: {str(e)}")
+                
+    return total_chunks

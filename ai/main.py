@@ -1,6 +1,6 @@
 import os
 import traceback
-from document_processing import process_document
+from document_processing import process_document, process_directory
 from ai_agent import ask_agent
 
 def main():
@@ -9,20 +9,24 @@ def main():
     print("=" * 60)
     
     while True:
-        doc_path = input("\nIntrodu calea către manualul/documentația scannerului (ex: C:/docs/manual.pdf): ").strip()
-        doc_path = doc_path.strip('\"').strip('\'')
+        path = input("\nIntrodu calea către fișier SAU folderul cu documentație (ex: ../ai-docs): ").strip()
+        path = path.strip('\"').strip('\'')
         
-        if os.path.exists(doc_path):
+        if os.path.exists(path):
             break
         else:
-            print(f"[EROARE] Fișierul nu a fost găsit la calea: {doc_path}. Te rog verifică și încearcă din nou.")
+            print(f"[EROARE] '{path}' nu a fost găsit. Te rog verifică și încearcă din nou.")
 
-    print("\n[INFO] Citesc și procesez documentația... Te rog așteaptă.")
+    print("\n[INFO] Citesc și procesez datele... Te rog așteaptă.")
     try:
-        chunks_count = process_document(doc_path)
-        print(f"[SUCCES] Documentația a fost încărcată și împărțită în {chunks_count} secțiuni.")
+        if os.path.isdir(path):
+            chunks_count = process_directory(path)
+            print(f"[SUCCES] Întregul folder a fost încărcat! ({chunks_count} secțiuni valide).")
+        else:
+            chunks_count = process_document(path)
+            print(f"[SUCCES] Fișierul a fost încărcat în {chunks_count} secțiuni.")
     except Exception as e:
-        print("\n[EROARE FATALĂ] Nu am putut procesa documentul:")
+        print("\n[EROARE FATALĂ] Nu am putut procesa datele:")
         traceback.print_exc()
         return
 
