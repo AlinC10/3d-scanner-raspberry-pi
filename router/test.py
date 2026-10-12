@@ -1,7 +1,8 @@
 from enum import Enum
-from typing import Literal, Annotated
+from typing import Literal, Annotated, Optional
 import logging
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from router.scanner import scanner
@@ -32,6 +33,22 @@ class StreamTestRequest(BaseModel):
         le=10_000_000,
         description="RTSP stream bitrate in bps (e.g. 2000000 = 2 Mbps)."
     )] = 4_000_000
+
+
+class StreamActiveRequest(BaseModel):
+    camera_id: Annotated[int, Field(
+        ge=1,
+        le=2,
+        description="Camera ID to display in preview (1 for cam1, 2 for cam2)."
+    )]
+
+
+class StreamQualityRequest(BaseModel):
+    quality: Annotated[int, Field(
+        ge=1,
+        le=100,
+        description="JPEG compression quality (1 to 100)."
+    )]
 
 
 class BrightnessRequest(BaseModel):
@@ -328,6 +345,111 @@ def test_stream_status():
     return {
         "is_streaming": scanner.is_streaming,
         "stream_urls": scanner.stream_urls
+    }
+
+
+@router.get("/stream/mjpeg")
+def test_stream_mjpeg(
+    camera: Annotated[Optional[int], Query(ge=1, le=2, description="Optional camera index (1 or 2) to activate")] = None
+):
+    """
+    Streams multipart MJPEG video directly from the active camera to browser <img> elements.
+    Accepts optional camera query parameter (1 or 2) to switch active view on connection.
+    """
+    if scanner.dual_cameras is None or not getattr(scanner, "is_streaming", False):
+        raise HTTPException(
+            status_code=400,
+            detail="Cameras are not streaming. Call /test/stream/start first."
+        )
+
+    if camera is not None and hasattr(scanner.dual_cameras, "active_camera"):
+        scanner.dual_cameras.active_camera = camera
+
+    def frame_generator():
+        last_id = -1
+        while getattr(scanner, "is_streaming", False):
+            if not hasattr(scanner.dual_cameras, "wait_jpeg"):
+                break
+            frame_id, frame_bytes = scanner.dual_cameras.wait_jpeg(last_id, timeout=1.0)
+            if frame_bytes and frame_id != last_id:
+                last_id = frame_id
+                yield (
+                    b"--FRAME\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
+                    + frame_bytes + b"\r\n"
+                )
+
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=FRAME"
+    )
+
+
+@router.post("/stream/active")
+def test_stream_switch_active(
+    camera_id: Annotated[Optional[int], Query(ge=1, le=2, description="Camera ID (1 or 2)")] = None,
+    req: Optional[StreamActiveRequest] = None,
+):
+    """
+    Switches active preview camera (1 for cam1, 2 for cam2) with zero latency.
+    """
+    target_id = camera_id if camera_id is not None else (req.camera_id if req is not None else None)
+    if target_id is None:
+        raise HTTPException(status_code=400, detail="Must provide camera_id via query param or JSON body.")
+
+    if scanner.dual_cameras is None:
+        raise HTTPException(status_code=400, detail="Cameras are not initialized.")
+
+    if not hasattr(scanner.dual_cameras, "active_camera"):
+        raise HTTPException(status_code=400, detail="Active camera switching not supported by current camera driver.")
+
+    scanner.dual_cameras.active_camera = target_id
+    return {
+        "status": "success",
+        "active_camera": scanner.dual_cameras.active_camera,
+        "message": f"Switched preview to camera {target_id}."
+    }
+
+
+@router.post("/stream/quality")
+def test_stream_set_quality(
+    quality: Annotated[Optional[int], Query(ge=1, le=100, description="Quality 1-100")] = None,
+    req: Optional[StreamQualityRequest] = None,
+):
+    """
+    Dynamically updates live JPEG compression quality (1-100) on active stream.
+    """
+    target_quality = quality if quality is not None else (req.quality if req is not None else None)
+    if target_quality is None:
+        raise HTTPException(status_code=400, detail="Must provide quality via query param or JSON body.")
+
+    if scanner.dual_cameras is None:
+        raise HTTPException(status_code=400, detail="Cameras are not initialized.")
+
+    scanner.dual_cameras.quality = target_quality
+    return {
+        "status": "success",
+        "quality": scanner.dual_cameras.quality,
+        "message": f"Updated stream quality to {target_quality}."
+    }
+
+
+@router.get("/stream/sync-status")
+def test_stream_sync_status():
+    """
+    Returns hardware/software synchronization diagnostics (SyncReady, offsets, framerates, drops).
+    """
+    if scanner.dual_cameras is None:
+        raise HTTPException(status_code=400, detail="Cameras are not initialized.")
+
+    if hasattr(scanner.dual_cameras, "get_sync_status"):
+        return scanner.dual_cameras.get_sync_status()
+
+    return {
+        "ready": True,
+        "is_streaming": scanner.is_streaming,
+        "mode": scanner.dual_cameras.__class__.__name__
     }
 
 

@@ -1,0 +1,33 @@
+import sys
+from unittest.mock import MagicMock
+
+# Mock hardware, camera, and cloud dependencies for test runs without hardware
+for mod in [
+    "piexif", "cv2", "smbus2", "picamera2", "picamera2.encoders", "picamera2.outputs",
+    "libcamera", "RPi", "RPi.GPIO", "serial",
+    "pydantic", "fastapi", "fastapi.responses",
+    "cloud", "cloud.cloudflare_r2", "cloud.runpod",
+    "system", "system.file_control",
+    "hardware.motor", "hardware.endstop", "hardware.lights", "hardware.tof",
+]:
+    if mod not in sys.modules:
+        sys.modules[mod] = MagicMock()
+
+# Ensure Picamera2 class exists on picamera2 mock
+mock_p2 = sys.modules["picamera2"]
+if not hasattr(mock_p2, "Picamera2") or isinstance(mock_p2.Picamera2, MagicMock):
+    class MockPicam2:
+        def __init__(self, camera_id=0):
+            self.camera_id = camera_id
+            self.camera_controls = {"SyncMode": 1, "SyncFrames": 1}
+            self.started = True
+        def create_video_configuration(self, **kwargs): return kwargs
+        def configure(self, config): pass
+        def start(self): self.started = True
+        def stop(self): self.started = False
+        def close(self): self.started = False
+        def capture_request(self):
+            req = MagicMock()
+            req.get_metadata.return_value = {"SyncReady": True, "SensorTimestamp": 1000000000}
+            return req
+    mock_p2.Picamera2 = MockPicam2
