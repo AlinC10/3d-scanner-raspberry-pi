@@ -9,7 +9,7 @@ os.environ["MOCK_HARDWARE"] = "1"
 for mod in [
     "piexif", "cv2", "smbus2", "picamera2", "RPi", "RPi.GPIO", "gpiozero",
     "serial", "serial.tools", "serial.tools.list_ports",
-    "board", "busio", "adafruit_vl53l0x",
+    "board", "busio", "adafruit_vl53l1x",
     "fastapi", "fastapi.responses", "pydantic",
     "cloud", "cloud.runpod", "cloud.cloudflare_r2",
 ]:

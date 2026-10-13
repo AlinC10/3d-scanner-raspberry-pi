@@ -64,6 +64,7 @@ The scanner enforces strict lifecycle state transitions:
 | **Z-Axis Motor** | `Motor` | Arduino `D7`/`D6`/`D5` | Vertical lead screw elevator (1/4 microstepping = 800 steps/rev, 1.8A driver current). |
 | **Top Endstop** | `Endstop` | `GPIO 2` (Pull-Up) | Prevents carriage from over-traveling into top chassis. |
 | **Bottom Endstop** | `Endstop` | `GPIO 3` (Pull-Up) | Home reference position for Z-axis homing. |
+| **ToF Sensor** | `ToFSensor` | I2C (`SDA`/`SCL`), address `0x29` | VL53L1X laser distance sensor (short mode, 4x4 ROI, 200 ms budget) used for roof detection. (See [TOF.md](TOF.md)). |
 | **Illumination** | `DimmableLight` | `GPIO 11` (Relay) / `GPIO 12` (PWM) | Controls 12V LED lighting strips inside the scan chamber. (See [LIGHTS.md](LIGHTS.md) for PWM and relay isolation mechanics). |
 | **Dual Cameras** | `BaseDualCamera` Polymorphic Driver | CSI-2 Interfaces (`cam0`, `cam1`) | Dual Arducam IMX477 sensors managed via `DualCameraRPISync` (default `rpi_sync`), `DualCameraXVS` (`xvs`), or `DualCamera` (`staggered`). (See [CAMERA.md](CAMERA.md) for subsystem overview and [DUAL_CAMERAS.md](DUAL_CAMERAS.md) for stereo architecture). |
 
@@ -128,9 +129,9 @@ Triggered by `POST /scanner/start`, this method handles the physical 3D capture:
        - Captures stereoscopic photo pair (`capture_photo()`).
        - Enqueues photo paths into `self.upload_queue`.
        - Increments `self.total_photos += len(photo_paths)`.
-       - **ToF Verification**: Calls `tof.is_object_detected()`. If the ToF sensor sees the object during this photo stop, `object_detected_this_level` is permanently flagged `True` for this ring.
        - Rotates turntable by `angle` (using 20% trapezoidal acceleration by default to prevent heavy object slippage).
-       - Pauses for motor vibration settling (`0.2s`).
+       - **ToF Verification**: After the rotation, calls `tof.is_object_detected()` (until the object has been seen on this level). If the ToF sensor sees the object at this stop, `object_detected_this_level` is permanently flagged `True` for this ring. See [TOF.md](TOF.md).
+       - Pauses for motor vibration settling: the ToF read counts towards it and the loop sleeps whatever remains of `TURNTABLE_SETTLE_S` (`0.2s`), so every stop settles for at least 0.2 s.
      - **Roof Termination Check**: If `object_detected_this_level` is `False` at the end of the 360° ring, it means the carriage has successfully cleared the top of the object. The scan breaks the elevation loop early to save time!
      - **Elevation Step & Coil Settling Protection**:
        - `time.sleep(0.5)` — Turntable mechanical and electrical settling delay.
