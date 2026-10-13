@@ -64,6 +64,10 @@ stateDiagram-v2
 | `POST` | `/scanner/start` | `202 Accepted` | Launches the physical scan, cloud Meshroom pod, and asset download pipeline |
 | `POST` | `/scanner/cancel` | `200 OK` | Emergency stop: cuts motor power, kills lights, closes streams, terminates cloud pods |
 | `GET` | `/scanner/status` | `200 OK` | Polls current state, total captured photos, and active stream URLs |
+| `GET` | `/scanner/stream/mjpeg` | `200 OK` | Direct multipart MJPEG stream for browser `<img>` tags (`?camera=1\|2`) with on-demand encoding |
+| `POST` | `/scanner/stream/active` | `200 OK` | Instantaneous zero-latency active preview camera switch (`?camera_id=1\|2`) |
+| `POST` | `/scanner/stream/quality` | `200 OK` | Dynamically updates live stream JPEG compression quality (`1..100`, default 80) |
+| `GET` | `/scanner/stream/sync-status` | `200 OK` | Returns real-time libcamera `rpi.sync` status, frame rates, and offset telemetry |
 
 ---
 
@@ -341,28 +345,182 @@ curl -X GET http://localhost:8000/scanner/status
 
 ---
 
+## 5. Native MJPEG Video Stream (`GET /scanner/stream/mjpeg`)
+
+Delivers a high-framerate `multipart/x-mixed-replace` MJPEG stream directly consumable by HTML `<img>` elements in web browsers without requiring RTSP plugins, WebRTC transcoders, or HLS latency.
+
+### Query Parameters
+* `camera` (optional `int`, values `1` or `2`): Selects which camera sensor to stream from. If omitted, streams from the currently active camera (`cam1` by default).
+
+### Behavior & Resource Optimization
+1. **On-Demand Encoding (Spectator Tracking)**:
+   - When a browser connects to the endpoint, the server registers the connection via `dual_cameras.add_spectator(cam_idx)`.
+   - The camera grab loop only encodes frames into JPEG when `spectator_count > 0`. When no browsers are viewing, CPU encoding overhead is **0%**.
+   - Upon connection closure or network teardown, the `finally` block unregisters via `remove_spectator(cam_idx)`.
+2. **Decoupled Stream Quality**:
+   - Compresses frames using `dual_cameras.stream_quality` (default: 80).
+   - Keeps high-resolution photogrammetry captures completely isolated at full 95% quality.
+3. **Multi-Client Concurrency**:
+   - Supports multiple concurrent viewers on the same camera or different cameras simultaneously.
+   - Each client independently pulls new frames via `wait_jpeg()` without duplicate camera grabs.
+
+### Response (`200 OK`)
+* **Headers**: `Content-Type: multipart/x-mixed-replace; boundary=FRAME`
+* **Payload**: Continuous stream of JPEG frames wrapped in multipart boundaries.
+
+### Example Usage (HTML)
+```html
+<!-- Live preview of Camera 1 -->
+<img src="http://<pi-ip>:8000/scanner/stream/mjpeg?camera=1" alt="Camera 1 Live Feed" />
+
+<!-- Live preview of Camera 2 -->
+<img src="http://<pi-ip>:8000/scanner/stream/mjpeg?camera=2" alt="Camera 2 Live Feed" />
+```
+
+### Example `curl`
+```bash
+curl -N http://localhost:8000/scanner/stream/mjpeg?camera=1 > /dev/null
+```
+
+---
+
+## 6. Active Preview Camera Switch (`POST /scanner/stream/active`)
+
+Instantly toggles the active preview camera between Camera 1 (upper) and Camera 2 (lower).
+
+### Query Parameters
+* `camera_id` (required `int`, `1` or `2`): Target camera ID.
+
+### Behavior
+* **Zero Loading Latency**:
+  - In `DualCameraRPISync` mode, both cameras continuously grab frames into DMA triple buffers (`buffer_count=3`).
+  - Switching `active_camera` updates an internal index pointer. If the user changes views or toggles preview links, the video switches **immediately** with zero reconnect loading delay.
+
+### Response (`200 OK`)
+```json
+{
+  "status": "success",
+  "active_camera": 2,
+  "message": "Switched preview to camera 2."
+}
+```
+
+### Example `curl`
+```bash
+curl -X POST "http://localhost:8000/scanner/stream/active?camera_id=2"
+```
+
+---
+
+## 7. Dynamic Stream Quality Control (`POST /scanner/stream/quality`)
+
+Dynamically adjusts the live preview JPEG compression quality on the fly without stopping the stream or dropping frames.
+
+### Query Parameters
+* `quality` (required `int`, `1` to `100`): Target JPEG compression quality. Defaults to 80.
+
+### Behavior
+* In `DualCameraRPISync`, updates the live `stream_quality` property.
+* **Non-Destructive**: Photogrammetry still image quality (`quality=95`) is completely protected and remains unaffected.
+* Provides instant bandwidth adaptation for low-signal Wi-Fi setups.
+
+### Response (`200 OK`)
+```json
+{
+  "status": "success",
+  "quality": 75,
+  "message": "Updated stream quality to 75."
+}
+```
+
+### Example `curl`
+```bash
+curl -X POST "http://localhost:8000/scanner/stream/quality?quality=75"
+```
+
+---
+
+## 8. Frame Synchronization Status (`GET /scanner/stream/sync-status`)
+
+Returns real-time telemetry from the dual camera driver, including libcamera `rpi.sync` lock state, per-camera framerates, dropped frame counts, and sub-frame modulo offsets.
+
+### Response (`200 OK`)
+```json
+{
+  "ready": true,
+  "status": "SYNC_LOCKED",
+  "camera_1": {
+    "fps": 24.1,
+    "frames_grabbed": 1420,
+    "frames_dropped": 0
+  },
+  "camera_2": {
+    "fps": 24.1,
+    "frames_grabbed": 1420,
+    "frames_dropped": 0
+  },
+  "offset_modulo_ms": 0.028,
+  "active_camera": 1
+}
+```
+
+### Telemetry Field Guide
+* `ready`: `true` when both camera sensors are active and the synchronization loop has established frame alignment.
+* `status`: Current synchronization health (`"SYNC_LOCKED"`, `"STAGGERED"`, `"XVS_HARDWARE"`).
+* `offset_modulo_ms`: Inter-camera frame timestamp phase difference modulo the 41.6ms frame interval. In `rpi.sync` mode, this settles to **$<0.05\text{ ms}$ (28 µs)**.
+* `frames_dropped`: Monitored per camera. Verifies that DMA buffers are released rapidly ($<5\text{ ms}$) without exhausting kernel memory.
+
+### Example `curl`
+```bash
+curl -X GET http://localhost:8000/scanner/stream/sync-status
+```
+
+---
+
 ## Frontend Integration Pattern (JavaScript / TypeScript)
 
 ```typescript
-// 1. Prepare Scanner and get Live Stream
+// 1. Prepare Scanner and Display Live MJPEG Stream
 async function prepareScanner() {
   const res = await fetch("http://<pi-ip>:8000/scanner/prepare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enable_stream: true, bitrate: 2000000, camera_config: {} })
+    body: JSON.stringify({
+      enable_stream: true,
+      bitrate: 4000000,
+      camera_config: {
+        quality: 95,
+        photo_resolution: [4056, 3040],
+        preview_resolution: [960, 720]
+      }
+    })
   });
   const data = await res.json();
   
-  // Connect video player to live stream immediately
+  // Option A: Point an <img> tag directly to the native low-latency MJPEG stream
+  const imgElement = document.getElementById("live-stream") as HTMLImageElement;
+  imgElement.src = "http://<pi-ip>:8000/scanner/stream/mjpeg?camera=1";
+
+  // Option B: Connect an H.264 video player to the RTSP stream URL if available
   if (data.stream_urls) {
-    initializeVideoPlayer(data.stream_urls[0]);
+    console.log("RTSP URLs available:", data.stream_urls);
   }
 
-  // Poll until scanner is PREPARED
+  // Poll until scanner reaches PREPARED state
   await pollUntilState("prepared");
 }
 
-// 2. Start the Photogrammetry Scan
+// 2. Switch Camera View in UI with Zero Latency
+async function switchCamera(cameraId: 1 | 2) {
+  // Option A: Call the switch API to flip the default stream
+  await fetch(`http://<pi-ip>:8000/scanner/stream/active?camera_id=${cameraId}`, { method: "POST" });
+  
+  // Option B: Or simply update the <img> src query parameter directly!
+  const imgElement = document.getElementById("live-stream") as HTMLImageElement;
+  imgElement.src = `http://<pi-ip>:8000/scanner/stream/mjpeg?camera=${cameraId}`;
+}
+
+// 3. Start the Photogrammetry Scan
 async function startScan(jobId: string) {
   await fetch("http://<pi-ip>:8000/scanner/start", {
     method: "POST",
@@ -390,7 +548,7 @@ async function startScan(jobId: string) {
   await pollUntilState("completed");
 }
 
-// 3. Polling helper
+// 4. Polling helper
 async function pollUntilState(targetState: string) {
   while (true) {
     const res = await fetch("http://<pi-ip>:8000/scanner/status");

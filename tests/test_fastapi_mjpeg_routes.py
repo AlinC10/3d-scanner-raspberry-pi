@@ -106,10 +106,14 @@ class TestFastAPIMJPEGStreamRoutes(unittest.TestCase):
         f1 = next(gen)
         self.assertIn(b"--FRAME", f1)
         self.assertIn(b"fakejpeg1", f1)
+        mock_dual_cam.add_spectator.assert_called_with(1)
 
         f2 = next(gen)
         self.assertIn(b"--FRAME", f2)
         self.assertIn(b"fakejpeg2", f2)
+
+        gen.close()
+        mock_dual_cam.remove_spectator.assert_called_with(1)
 
     def test_switch_active_camera(self):
         mock_dual_cam = MagicMock()

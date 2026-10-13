@@ -18,6 +18,7 @@ The objectives of the codebase are to provide a well-structured interface to:
 
 The documentation is split by classes to maintain modularity:
 * [ArducamIMX477 Camera Class](ArducamIMX477.md) - The high-level interface for a single camera.
+* [Dual Camera Architecture Guide (DUAL_CAMERAS.md)](../../docs/DUAL_CAMERAS.md) - **Primary guide** covering `BaseDualCamera`, `DualCameraRPISync` (`rpi.sync`), `DualCameraXVS` (hardware sync), and `DualCamera` (staggered software sync).
 * [DualCamera Class](DualCamera.md) - The multi-threaded interface for controlling two cameras concurrently (software sync).
 * [DualCameraXVS Class](DualCameraXVS.md) - The specialized interface for true hardware synchronization (Master-Slave) via the XVS cable.
 * [Focuser Class](Focuser.md) - The hardware driver interface for the I2C motorized focus (VCM).

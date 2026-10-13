@@ -115,6 +115,15 @@ class BaseDualCamera(ABC):
             if cam:
                 cam.quality = quality
 
+    @property
+    def stream_quality(self) -> int:
+        """JPEG encoding quality for the low-resolution live preview stream (1-100)."""
+        return getattr(self, "_stream_quality", 80)
+
+    @stream_quality.setter
+    def stream_quality(self, val: int):
+        self._stream_quality = max(1, min(100, int(val)))
+
     def rotate(self, direction: str) -> List[int]:
         """Rotates both cameras."""
         futures = [self._executor.submit(cam.rotate, direction) for cam in self.cameras]

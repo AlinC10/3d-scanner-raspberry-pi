@@ -72,8 +72,9 @@ class DualCameraRPISync(BaseDualCamera):
         rotation2: int = 0,
         fps: int = 10,
         stream_size: Tuple[int, int] = (1024, 768),
+        stream_quality: int = 80,
         sync_frames: int = 30,
-        buffer_count: int = 4,
+        buffer_count: int = 3,
         ready_timeout: float = 30.0,
         auto_start: bool = False,
         **kwargs,
@@ -116,6 +117,7 @@ class DualCameraRPISync(BaseDualCamera):
         self.cameras = [self.cam1, self.cam2]
 
         self.stream_size = stream_size
+        self._stream_quality = max(1, min(100, int(stream_quality)))
         self.fps = clamp_framerate(self.size, fps)
         self.period_ns = int(1e9 / self.fps)
         self.period_us = int(1e6 / self.fps)
@@ -128,12 +130,17 @@ class DualCameraRPISync(BaseDualCamera):
         self._is_streaming = False
         self._active_idx = 0  # 0 for cam1, 1 for cam2
 
+        # Spectator tracking: number of active viewers connected to cam1 (idx 0) and cam2 (idx 1)
+        self._spectators = [0, 0]
+        self._spectator_lock = threading.Lock()
+
         self._cond = threading.Condition()
         self._ready = [threading.Event(), threading.Event()]
         self._latest = [-1, -1]
         self._drops = [0, 0]
         self._ts_hist: List[OrderedDict] = [OrderedDict(), OrderedDict()]
 
+        self._lores_slots: List[Optional[Tuple[int, int, int, Any]]] = [None, None]
         self._lores_slot: Optional[Tuple[int, int, int, Any]] = None  # (cam_idx, seq, ts, yuv_array)
         self._still: List[Optional[Tuple[int, int, Any]]] = [None, None]  # (seq, ts, still_yuv_array)
         self._raw_reqs: List[Any] = [None, None]
@@ -142,9 +149,11 @@ class DualCameraRPISync(BaseDualCamera):
         self._force_still = [False, False]
         self._still_lock = threading.Lock()
 
-        # JPEG publishing state for FastAPI MJPEG streaming
+        # JPEG publishing state for FastAPI MJPEG streaming (per camera)
         self._jpeg_cond = threading.Condition()
-        self._jpeg: Optional[bytes] = None
+        self._jpegs: List[Optional[bytes]] = [None, None]
+        self._jpeg_ids: List[int] = [0, 0]
+        self._jpeg: Optional[bytes] = None  # Legacy single-slot alias for active camera
         self._jpeg_id: int = 0
         self._pub_times: deque = deque(maxlen=30)
         self._last_jpeg_kb: float = 0.0
@@ -184,6 +193,38 @@ class DualCameraRPISync(BaseDualCamera):
         if idx not in (0, 1):
             raise ValueError(f"active must be 0 or 1 (got {idx})")
         self._active_idx = idx
+
+    @property
+    def stream_quality(self) -> int:
+        """JPEG encoding quality for the low-resolution MJPEG live preview stream (1-100)."""
+        return self._stream_quality
+
+    @stream_quality.setter
+    def stream_quality(self, val: int):
+        self._stream_quality = max(1, min(100, int(val)))
+        log.info("DualCameraRPISync: Stream JPEG quality updated to %d", self._stream_quality)
+
+    def add_spectator(self, camera_idx: int) -> None:
+        """Increment active spectator count for camera_idx (0-indexed or 1-indexed)."""
+        idx = camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else 0)
+        with self._spectator_lock:
+            self._spectators[idx] += 1
+            log.info("DualCameraRPISync: Spectator connected to cam%d (active: %d)", idx + 1, self._spectators[idx])
+
+    def remove_spectator(self, camera_idx: int) -> None:
+        """Decrement active spectator count for camera_idx (0-indexed or 1-indexed)."""
+        idx = camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else 0)
+        with self._spectator_lock:
+            self._spectators[idx] = max(0, self._spectators[idx] - 1)
+            log.info("DualCameraRPISync: Spectator disconnected from cam%d (active: %d)", idx + 1, self._spectators[idx])
+
+    def has_spectators(self, camera_idx: Optional[int] = None) -> bool:
+        """Check if there are active spectators for camera_idx or any camera."""
+        with self._spectator_lock:
+            if camera_idx is not None:
+                idx = camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else 0)
+                return self._spectators[idx] > 0
+            return any(c > 0 for c in self._spectators)
 
     # ── Continuous Streaming & Grab Lifecycle ──────────────────
 
@@ -309,9 +350,12 @@ class DualCameraRPISync(BaseDualCamera):
                 last_ts = ts
                 self._latest[cam_idx] = seq
 
-                # Selective Lores Copy: Only active camera copies ~1.1 MB buffer
+                # Selective Lores Copy: Only copy if spectators are watching this camera
                 lores = None
-                if cam_idx == self._active_idx:
+                with self._spectator_lock:
+                    has_spec = self._spectators[cam_idx] > 0
+                    fallback = (not any(self._spectators)) and (cam_idx == self._active_idx)
+                if has_spec or fallback:
                     lores = req.make_array("lores").copy()
 
                 # On-demand Still Capture Check
@@ -351,6 +395,7 @@ class DualCameraRPISync(BaseDualCamera):
                     h.popitem(last=False)
 
                 if lores is not None:
+                    self._lores_slots[cam_idx] = (cam_idx, seq, ts, lores)
                     self._lores_slot = (cam_idx, seq, ts, lores)
 
                 if still is not None and self._still[cam_idx] is None:
@@ -365,67 +410,102 @@ class DualCameraRPISync(BaseDualCamera):
     def _publisher_worker(self):
         """
         Background publisher thread.
-        Encodes lores frames to JPEG on demand only for the active camera and notifies
-        waiting FastAPI MJPEG HTTP streaming consumers.
+        Encodes lores frames to JPEG on demand only for cameras with active spectators
+        (or active preview fallback) and notifies waiting FastAPI MJPEG HTTP streaming consumers.
         """
         log.info("DualCameraRPISync: MJPEG publisher worker started.")
 
         while self._running:
             with self._cond:
                 self._cond.wait_for(
-                    lambda: self._lores_slot is not None or not self._running,
+                    lambda: any(s is not None for s in self._lores_slots) or not self._running,
                     timeout=1.0,
                 )
-                slot = self._lores_slot
+                slots = []
+                for idx in range(2):
+                    if self._lores_slots[idx] is not None:
+                        slots.append(self._lores_slots[idx])
+                        self._lores_slots[idx] = None
                 self._lores_slot = None
 
             if not self._running:
                 break
-            if slot is None:
+            if not slots:
                 continue
 
-            cam_idx, seq, ts, yuv = slot
-            if cam_idx != self._active_idx:
-                continue
+            for cam_idx, seq, ts, yuv in slots:
+                with self._spectator_lock:
+                    has_spec = self._spectators[cam_idx] > 0
+                    fallback = (not any(self._spectators)) and (cam_idx == self._active_idx)
 
-            try:
-                if OPENCV_AVAILABLE:
-                    bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-                    res = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
-                    if isinstance(res, (tuple, list)) and len(res) == 2:
-                        ok, jpg = res
-                        if not ok or not hasattr(jpg, "tobytes"):
+                if not (has_spec or fallback):
+                    continue
+
+                try:
+                    if OPENCV_AVAILABLE:
+                        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+                        res = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self._stream_quality])
+                        if isinstance(res, (tuple, list)) and len(res) == 2:
+                            ok, jpg = res
+                            if not ok or not hasattr(jpg, "tobytes"):
+                                continue
+                            data = jpg.tobytes()
+                        else:
                             continue
-                        data = jpg.tobytes()
                     else:
-                        continue
-                else:
-                    data = b""
+                        data = b""
 
-                self._last_jpeg_kb = len(data) / 1024.0
-                self._pub_times.append(time.monotonic())
+                    self._last_jpeg_kb = len(data) / 1024.0
+                    self._pub_times.append(time.monotonic())
 
-                with self._jpeg_cond:
-                    self._jpeg = data
-                    self._jpeg_id += 1
-                    self._jpeg_cond.notify_all()
-            except Exception as e:
-                log.warning("DualCameraRPISync: MJPEG encoding error: %s", e)
+                    with self._jpeg_cond:
+                        self._jpegs[cam_idx] = data
+                        self._jpeg_ids[cam_idx] += 1
+                        if cam_idx == self._active_idx:
+                            self._jpeg = data
+                            self._jpeg_id += 1
+                        self._jpeg_cond.notify_all()
+                except Exception as e:
+                    log.warning("DualCameraRPISync: MJPEG encoding error on cam%d: %s", cam_idx + 1, e)
 
         log.info("DualCameraRPISync: MJPEG publisher worker stopped.")
 
-    def wait_jpeg(self, last_id: int = -1, timeout: float = 1.0) -> Tuple[int, Optional[bytes]]:
+    def wait_jpeg(
+        self,
+        camera_or_last_id: int = -1,
+        last_id: Optional[int] = None,
+        timeout: float = 1.0,
+        camera_idx: Optional[int] = None,
+    ) -> Tuple[int, Optional[bytes]]:
         """
-        Wait for a new JPEG frame from the active camera.
-        Returns (frame_id, jpeg_bytes) or (last_id, None) if timeout occurs.
+        Wait for a new JPEG frame. Supports both per-camera and legacy signatures:
+        - wait_jpeg(cam_idx, last_id, timeout)
+        - wait_jpeg(last_id, timeout)
+        - wait_jpeg(camera_idx=0, last_id=last_id, timeout=timeout)
+        Returns (frame_id, jpeg_bytes) or (last_id, None) on timeout.
         """
+        if camera_idx is not None:
+            cam_idx = camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else self._active_idx)
+            lid = last_id if last_id is not None else -1
+        elif last_id is not None:
+            if camera_or_last_id in (0, 1):
+                cam_idx = camera_or_last_id
+            elif camera_or_last_id == 2:
+                cam_idx = 1
+            else:
+                cam_idx = self._active_idx
+            lid = last_id
+        else:
+            cam_idx = self._active_idx
+            lid = camera_or_last_id
+
         with self._jpeg_cond:
             if not self._jpeg_cond.wait_for(
-                lambda: self._jpeg_id != last_id or not self._running,
+                lambda: self._jpeg_ids[cam_idx] != lid or not self._running,
                 timeout=timeout,
             ):
-                return last_id, None
-            return self._jpeg_id, self._jpeg
+                return lid, None
+            return self._jpeg_ids[cam_idx], self._jpegs[cam_idx]
 
     def get_sync_status(self) -> Dict[str, Any]:
         """Returns diagnostic telemetry on sync status, offsets, drops, and stream fps."""
@@ -434,16 +514,22 @@ class DualCameraRPISync(BaseDualCamera):
         stream_fps = len(recent_pub) / 2.0 if len(recent_pub) > 1 else 0.0
 
         with self._cond:
-            common_seqs = set(self._ts_hist[0].keys()) & set(self._ts_hist[1].keys())
             offset_ms = None
-            if common_seqs:
-                latest_seq = max(common_seqs)
-                diff_ns = self._ts_hist[1][latest_seq] - self._ts_hist[0][latest_seq]
-                offset_ms = diff_ns / 1e6
+            if len(self._ts_hist[0]) > 0 and len(self._ts_hist[1]) > 0:
+                # Calculate sub-frame phase delta using modulo arithmetic around frame period
+                latest_ts0 = next(reversed(self._ts_hist[0].values()))
+                latest_ts1 = next(reversed(self._ts_hist[1].values()))
+                raw_diff_ns = latest_ts1 - latest_ts0
+                half_period_ns = self.period_ns // 2
+                aligned_diff_ns = ((raw_diff_ns + half_period_ns) % self.period_ns) - half_period_ns
+                offset_ms = round(aligned_diff_ns / 1e6, 3)
 
             ready_states = [e.is_set() for e in self._ready]
             drops = list(self._drops)
             latest_seqs = list(self._latest)
+
+        with self._spectator_lock:
+            specs = list(self._spectators)
 
         return {
             "ready": all(ready_states),
@@ -457,6 +543,8 @@ class DualCameraRPISync(BaseDualCamera):
             "stream_fps": stream_fps,
             "last_jpeg_kb": self._last_jpeg_kb,
             "quality": self.quality,
+            "stream_quality": self._stream_quality,
+            "spectators": specs,
         }
 
     # ── Abstract Contract Implementation ───────────────────────
@@ -472,6 +560,12 @@ class DualCameraRPISync(BaseDualCamera):
         if "focus" in kwargs and kwargs["focus"] is not None:
             self.focus_set(kwargs["focus"])
 
+        # Apply any runtime image controls passed in kwargs (exposure, gain, awb, etc.)
+        control_keys = ("exposure_time", "analogue_gain", "colour_gains", "awb_mode", "brightness", "contrast", "saturation", "sharpness")
+        runtime_controls = {k: kwargs[k] for k in control_keys if k in kwargs and kwargs[k] is not None}
+        if runtime_controls:
+            self.apply_settings(**runtime_controls)
+
         log.info("DualCameraRPISync: Awaiting SyncReady (timeout=%.1fs)...", self.ready_timeout)
         ready1 = self._ready[0].wait(self.ready_timeout)
         ready2 = self._ready[1].wait(self.ready_timeout)
@@ -485,10 +579,32 @@ class DualCameraRPISync(BaseDualCamera):
         else:
             log.info("DualCameraRPISync: Both cameras reported SyncReady!")
 
-        return [
-            {"camera_id": self.cam1.camera_id, "ready": ready1, "seq": self._latest[0]},
-            {"camera_id": self.cam2.camera_id, "ready": ready2, "seq": self._latest[1]},
-        ]
+        cam1_info = {
+            "camera_id": getattr(self.cam1, "camera_id", 0),
+            "ready": ready1,
+            "seq": self._latest[0],
+            "photo_resolution": self.size,
+            "preview_resolution": self.stream_size,
+            "quality": self.quality,
+            "stream_quality": self.stream_quality,
+            "fps": self.fps,
+            "focus": getattr(getattr(self.cam1, "focuser", None), "position", None),
+            "rotation": getattr(self.cam1, "rotation", 0),
+        }
+        cam2_info = {
+            "camera_id": getattr(self.cam2, "camera_id", 1),
+            "ready": ready2,
+            "seq": self._latest[1],
+            "photo_resolution": self.size,
+            "preview_resolution": self.stream_size,
+            "quality": self.quality,
+            "stream_quality": self.stream_quality,
+            "fps": self.fps,
+            "focus": getattr(getattr(self.cam2, "focuser", None), "position", None),
+            "rotation": getattr(self.cam2, "rotation", 0),
+        }
+        log.info("DualCameraRPISync: Prepared camera settings: cam1=%s, cam2=%s", cam1_info, cam2_info)
+        return [cam1_info, cam2_info]
 
     def start_stream(self, bitrate: int = 4_000_000) -> List[str]:
         """

@@ -525,7 +525,7 @@ class ArducamIMX477:
                 
         self._scan_prepared = True
 
-        return {
+        settings = {
             "photo_resolution": self._size,
             "preview_resolution": self._preview_size,
             "quality": self._quality,
@@ -534,6 +534,8 @@ class ArducamIMX477:
             "controls": locked,
             "show_preview": show_preview,
         }
+        log.info("ArducamIMX477 (cam%d): Prepared camera settings: %s", self._camera_id + 1, settings)
+        return settings
 
     # ── Focus (VCM) ───────────────────────────────────────────────────────────
     def focus_set(self, position: int):

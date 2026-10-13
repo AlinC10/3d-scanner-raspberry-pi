@@ -72,6 +72,8 @@ class TestDualCameraRPISync(unittest.TestCase):
         self.assertEqual(cam.active_camera, 1)
         self.assertEqual(cam.active, 0)
         self.assertFalse(cam.is_streaming)
+        self.assertEqual(cam.stream_quality, 80)
+        self.assertEqual(cam.buffer_count, 3)
 
         # Test active camera toggles
         cam.active_camera = 2
@@ -318,6 +320,100 @@ class TestDualCameraRPISync(unittest.TestCase):
             self.assertTrue(req1.acquire.called or req2.acquire.called)
             # Verify save_dng was called
             self.assertTrue(req1.save_dng.called or req2.save_dng.called)
+
+        cam.close()
+
+    @patch("hardware.dual_camera_rpi_sync.ArducamIMX477")
+    def test_spectator_tracking_and_stream_quality(self, mock_arducam):
+        mock_cam1 = MagicMock()
+        mock_cam1.camera_id = 0
+        mock_cam2 = MagicMock()
+        mock_cam2.camera_id = 1
+        mock_arducam.side_effect = [mock_cam1, mock_cam2]
+
+        cam = DualCameraRPISync(auto_start=False, stream_quality=85)
+        self.assertEqual(cam.stream_quality, 85)
+        self.assertEqual(cam.buffer_count, 3)
+
+        # Test stream_quality property
+        cam.stream_quality = 75
+        self.assertEqual(cam.stream_quality, 75)
+        # Quality clamping
+        cam.stream_quality = 150
+        self.assertEqual(cam.stream_quality, 100)
+        cam.stream_quality = -10
+        self.assertEqual(cam.stream_quality, 1)
+
+        # Test spectator tracking
+        self.assertFalse(cam.has_spectators())
+        self.assertFalse(cam.has_spectators(0))
+        self.assertFalse(cam.has_spectators(1))
+
+        cam.add_spectator(0)
+        self.assertTrue(cam.has_spectators())
+        self.assertTrue(cam.has_spectators(0))
+        self.assertFalse(cam.has_spectators(1))
+
+        cam.add_spectator(1)
+        self.assertTrue(cam.has_spectators(1))
+
+        cam.remove_spectator(0)
+        self.assertFalse(cam.has_spectators(0))
+        self.assertTrue(cam.has_spectators(1))
+
+        cam.remove_spectator(1)
+        self.assertFalse(cam.has_spectators())
+
+        # Test wait_jpeg signature flexibility
+        # Set dummy jpeg bytes in both slots
+        with cam._jpeg_cond:
+            cam._jpegs[0] = b"cam0_jpeg"
+            cam._jpeg_ids[0] = 5
+            cam._jpegs[1] = b"cam1_jpeg"
+            cam._jpeg_ids[1] = 8
+            cam._jpeg = b"cam0_jpeg"
+            cam._jpeg_id = 5
+
+        # 1. Legacy call: wait_jpeg(last_id)
+        fid, data = cam.wait_jpeg(last_id=4)
+        self.assertEqual(fid, 5)
+        self.assertEqual(data, b"cam0_jpeg")
+
+        # 2. Per-camera call: wait_jpeg(camera_idx, last_id)
+        fid1, data1 = cam.wait_jpeg(1, last_id=7)
+        self.assertEqual(fid1, 8)
+        self.assertEqual(data1, b"cam1_jpeg")
+
+        # 3. Keyword camera_idx call
+        fid0, data0 = cam.wait_jpeg(camera_idx=0, last_id=4)
+        self.assertEqual(fid0, 5)
+        self.assertEqual(data0, b"cam0_jpeg")
+
+        cam.close()
+
+    @patch("hardware.dual_camera_rpi_sync.ArducamIMX477")
+    def test_modulo_offset_calculation(self, mock_arducam):
+        mock_cam1 = MagicMock()
+        mock_cam1.camera_id = 0
+        mock_cam2 = MagicMock()
+        mock_cam2.camera_id = 1
+        mock_arducam.side_effect = [mock_cam1, mock_cam2]
+
+        cam = DualCameraRPISync(fps=10, auto_start=False)
+        # 10 fps -> period_ns = 100,000,000 ns (100 ms)
+
+        # Simulate camera 1 at ts = 1,000,000,000 ns
+        # Simulate camera 2 at ts = 1,100,028,000 ns (raw difference = 100.028 ms, which is 1 frame + 28 us)
+        with cam._cond:
+            cam._ts_hist[0][100] = 1_000_000_000
+            cam._ts_hist[1][100] = 1_100_028_000
+
+        status = cam.get_sync_status()
+        # Modulo arithmetic should yield +0.028 ms instead of 100.028 ms
+        self.assertIsNotNone(status["offset_ms"])
+        self.assertAlmostEqual(status["offset_ms"], 0.028, places=3)
+        self.assertIn("stream_quality", status)
+        self.assertIn("spectators", status)
 
         cam.close()
 

@@ -266,6 +266,7 @@ class Scanner:
             pass
         finally:
             self.z_axis_motor.stop()
+            time.sleep(0.5)
             self.z_axis_motor.disable()
 
     def move_z_to_top(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1):
@@ -286,6 +287,7 @@ class Scanner:
             pass
         finally:
             self.z_axis_motor.stop()
+            time.sleep(0.5)
             self.z_axis_motor.disable()
     def wait_for_light_stable(
         self,
@@ -434,8 +436,25 @@ class Scanner:
             # keep_running=True is required so the livestream can work!
             kwargs["keep_running"] = True
 
+            stream_camera_settings = {
+                "camera_mode": selected_mode,
+                "driver": getattr(CameraClass, "__name__", None) or type(CameraClass).__name__,
+                "camera_id1": cam1_id,
+                "camera_id2": cam2_id,
+                "photo_resolution": photo_resolution,
+                "preview_resolution": preview_resolution,
+                "video_resolution": video_resolution,
+                "photo_quality": quality,
+                "stream_quality": getattr(self.dual_cameras, "stream_quality", 80),
+                "enable_stream": enable_stream,
+                "bitrate": bitrate,
+                **{k: v for k, v in kwargs.items() if k not in ("photo_resolution", "preview_resolution", "quality")},
+            }
+            log.info("[Scanner] Initializing camera stream & scan configuration: %s", stream_camera_settings)
+
             # prepare cameras for scanning (initial setup facing whatever direction)
-            self.dual_cameras.prepare_scan(**kwargs)
+            prepare_results = self.dual_cameras.prepare_scan(**kwargs)
+            log.info("[Scanner] Applied camera settings from prepare_scan: %s", prepare_results)
 
             if enable_stream:
                 self.stream_urls = self.generate_livestream(bitrate)
@@ -505,7 +524,9 @@ class Scanner:
 
                 # Recalibrate AE/AWB and focus in front of the illuminated object
                 camera_kwargs["keep_running"] = True
-                self.dual_cameras.prepare_scan(**camera_kwargs)
+                log.info("[Scanner] In-position camera recalibration settings (home + 30mm): %s", camera_kwargs)
+                recalib_results = self.dual_cameras.prepare_scan(**camera_kwargs)
+                log.info("[Scanner] Applied recalibration settings from prepare_scan: %s", recalib_results)
                 
             except Exception:
                 self.lights.unlock_brightness()
@@ -695,6 +716,7 @@ class Scanner:
                     break
 
                 try:
+                    time.sleep(0.5)                 # Settling time for turntable slice
                     self.turntable_motor.disable()  # Cut turntable coil current
                     self.z_axis_motor.enable()      # Energize Z-axis
                     self.move_z_up(
@@ -705,6 +727,7 @@ class Scanner:
                         ramp_percent=z_ramp_percent,
                         decel_percent=z_decel_percent
                     )
+                    time.sleep(0.5)                 # Settling time for Z-axis climb
                     self.z_axis_motor.disable()     # Done climbing, release Z
                     self.turntable_motor.enable()   # Re-enable turntable for next slice
                 except TopEndstopTriggered:

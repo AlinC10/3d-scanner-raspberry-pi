@@ -176,6 +176,7 @@ def scanner_stream_mjpeg(
     """
     Streams multipart MJPEG video directly from the active camera to browser <img> elements.
     Accepts optional camera query parameter (1 or 2) to switch active view on connection.
+    Only encodes JPEGs on demand while viewers are connected.
     """
     if scanner.dual_cameras is None or not getattr(scanner, "is_streaming", False):
         raise HTTPException(
@@ -186,20 +187,28 @@ def scanner_stream_mjpeg(
     if camera is not None and hasattr(scanner.dual_cameras, "active_camera"):
         scanner.dual_cameras.active_camera = camera
 
+    cam_idx = (camera - 1) if camera in (1, 2) else getattr(scanner.dual_cameras, "active", 0)
+
     def frame_generator():
-        last_id = -1
-        while getattr(scanner, "is_streaming", False):
-            if not hasattr(scanner.dual_cameras, "wait_jpeg"):
-                break
-            frame_id, frame_bytes = scanner.dual_cameras.wait_jpeg(last_id, timeout=1.0)
-            if frame_bytes and frame_id != last_id:
-                last_id = frame_id
-                yield (
-                    b"--FRAME\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
-                    + frame_bytes + b"\r\n"
-                )
+        if hasattr(scanner.dual_cameras, "add_spectator"):
+            scanner.dual_cameras.add_spectator(cam_idx)
+        try:
+            last_id = -1
+            while getattr(scanner, "is_streaming", False):
+                if not hasattr(scanner.dual_cameras, "wait_jpeg"):
+                    break
+                frame_id, frame_bytes = scanner.dual_cameras.wait_jpeg(cam_idx, last_id, timeout=1.0)
+                if frame_bytes and frame_id != last_id:
+                    last_id = frame_id
+                    yield (
+                        b"--FRAME\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
+                        + frame_bytes + b"\r\n"
+                    )
+        finally:
+            if hasattr(scanner.dual_cameras, "remove_spectator"):
+                scanner.dual_cameras.remove_spectator(cam_idx)
 
     return StreamingResponse(
         frame_generator(),
@@ -238,10 +247,22 @@ def scanner_stream_set_quality(
     if scanner.dual_cameras is None:
         raise HTTPException(status_code=400, detail="Cameras are not initialized.")
 
-    scanner.dual_cameras.quality = quality
+    try:
+        from hardware.dual_camera_rpi_sync import DualCameraRPISync
+        is_rpi_sync = isinstance(scanner.dual_cameras, DualCameraRPISync)
+    except Exception:
+        is_rpi_sync = False
+
+    if is_rpi_sync:
+        scanner.dual_cameras.stream_quality = quality
+        current_q = scanner.dual_cameras.stream_quality
+    else:
+        scanner.dual_cameras.quality = quality
+        current_q = scanner.dual_cameras.quality
+
     return {
         "status": "success",
-        "quality": scanner.dual_cameras.quality,
+        "quality": current_q,
         "message": f"Updated stream quality to {quality}."
     }
 
