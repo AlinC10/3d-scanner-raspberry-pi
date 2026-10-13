@@ -118,6 +118,7 @@ class DualCameraXVS(BaseDualCamera):
         # Synchronize AE/AWB controls from Master (cam1) to Slave (cam2)
         self._sync_slave_controls(master_res, slave_res, kwargs)
 
+        log.info("DualCameraXVS: Prepared camera settings: master=%s, slave=%s", master_res, slave_res)
         return [master_res, slave_res]
 
     def start_stream(self, bitrate: int = 4_000_000) -> List[str]:

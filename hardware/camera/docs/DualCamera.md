@@ -6,7 +6,7 @@ The `DualCamera` class (`dual_camera.py`) provides an interface to control two A
 
 This class uses a `ThreadPoolExecutor` from the `concurrent.futures` module to dispatch hardware and software commands to both cameras simultaneously. This allows parallel execution of functions such as capturing photos, autofocus sweeps, and updating settings without the latency of sequential execution.
 
-*Note: This multithreading approach is an intermediate software synchronization step until full hardware synchronization via the XVS (Master-Slave) line is configured.*
+*Note: This multithreading approach (staggered 0.15s dispatch) is a development/fallback driver implementing the [`BaseDualCamera`](../../base_dual_camera.py) abstract base class. For production photogrammetry on Raspberry Pi 5, use [`DualCameraRPISync`](../../dual_camera_rpi_sync.py) (`rpi.sync`), or [`DualCameraXVS`](../../dual_camera_xvs.py) for hardware pin sync. See the comprehensive guide in [DUAL_CAMERAS.md](../../docs/DUAL_CAMERAS.md).*
 
 ## Setup & Initialization
 

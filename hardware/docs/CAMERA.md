@@ -9,19 +9,24 @@ This document serves as the high-level architecture overview and navigation inde
 ## 🗂️ Module Architecture & File Map
 
 ```
-hardware/camera/
-├── camera.py           # ArducamIMX477: Core sensor driver & picamera2 pipeline
-├── focuser.py          # Focuser: I2C hardware driver for VCM motorized focus
-├── config/             # System constants and shared optical defaults
-│   ├── camera_default.py
-│   └── vcm.py
-└── docs/               # In-depth component guides
-    ├── ArducamIMX477.md            # Detailed single-camera API reference
-    ├── Focuser.md                  # Low-level VCM I2C DAC register guide
-    ├── Focus_Guide.md              # Depth of field, hyperfocal & stacking guide
-    ├── DualCamera.md               # Software multi-threaded dual camera guide
-    ├── DualCameraXVS.md            # Hardware XVS sync setup & timing guide
-    └── Meshroom_Rig_Walkthrough.md # Multi-camera stereoscopic rig guide
+hardware/
+├── base_dual_camera.py     # BaseDualCamera: ABC contract for stereo drivers
+├── dual_camera_rpi_sync.py # DualCameraRPISync: Production libcamera rpi.sync driver
+├── dual_camera_xvs.py      # DualCameraXVS: Hardware XVS pin synchronization
+├── dual_camera.py          # DualCamera: Staggered multi-threaded fallback
+├── camera/
+│   ├── camera.py           # ArducamIMX477: Core sensor driver & picamera2 pipeline
+│   ├── focuser.py          # Focuser: I2C hardware driver for VCM motorized focus
+│   ├── config/             # System constants and shared optical defaults
+│   │   ├── camera_default.py
+│   │   └── vcm.py
+│   └── docs/               # In-depth component guides
+│       ├── ArducamIMX477.md            # Detailed single-camera API reference
+│       ├── Focuser.md                  # Low-level VCM I2C DAC register guide
+│       ├── Focus_Guide.md              # Depth of field, hyperfocal & stacking guide
+│       └── Meshroom_Rig_Walkthrough.md # Multi-camera stereoscopic rig guide
+└── docs/
+    └── DUAL_CAMERAS.md     # Comprehensive guide for all dual-camera drivers
 ```
 
 ---
@@ -62,7 +67,7 @@ Rather than duplicating low-level specifications, consult the dedicated guides i
 | **Single Camera API** | [ArducamIMX477.md](../camera/docs/ArducamIMX477.md) | Constructor, still captures, RTSP streaming, rotation, resolution configs. |
 | **VCM Motor & I2C** | [Focuser.md](../camera/docs/Focuser.md) | DW9714 10-bit DAC format, I2C bus auto-detection, smooth ramping, state persistence. |
 | **Optics & Focus Guide** | [Focus_Guide.md](../camera/docs/Focus_Guide.md) | Circle of confusion, hyperfocal distance calculations, focus bracketing. |
-| **Stereo Dual Camera** | [DUAL_CAMERAS.md](DUAL_CAMERAS.md) | Software multi-threading (`DualCamera`) vs Hardware XVS Sync (`DualCameraXVS`). |
+| **Stereo Dual Camera** | [DUAL_CAMERAS.md](DUAL_CAMERAS.md) | Polymorphic hierarchy (`BaseDualCamera`), software synchronization via `rpi.sync` (`DualCameraRPISync`), hardware sync (`DualCameraXVS`), and multi-threaded staggered fallback (`DualCamera`). |
 | **Meshroom Rig Setup** | [Meshroom_Rig_Walkthrough.md](../camera/docs/Meshroom_Rig_Walkthrough.md) | Stereo baseline, `/0/` and `/1/` folder segregation, identical timestamp naming. |
 
 ---

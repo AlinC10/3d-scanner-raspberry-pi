@@ -96,6 +96,7 @@ class DualCamera(BaseDualCamera):
         # Synchronize AE/AWB controls from cam1 to cam2 if auto features were used
         self._sync_slave_controls(res1, res2, kwargs)
 
+        log.info("DualCamera: Prepared camera settings: cam1=%s, cam2=%s", res1, res2)
         return [res1, res2]
 
     def start_stream(self, bitrate: int = 4_000_000) -> List[str]:

@@ -15,13 +15,17 @@ Interactive OpenAPI docs are accessible at: `http://<pi-ip>:8000/docs#/Hardware%
 | **Lighting** | `POST` | `/test/lights/on` | Turn illumination LEDs ON |
 | **Lighting** | `POST` | `/test/lights/off` | Turn illumination LEDs OFF |
 | **Lighting** | `POST` | `/test/lights/toggle` | Toggle illumination LEDs state |
-| **Homing** | `POST` | `/test/motor/home-bottom` | Move carriage down until bottom limit switch triggers |
-| **Homing** | `POST` | `/test/motor/move-to-top` | Move carriage up until top limit switch triggers |
-| **Motor Movement** | `POST` | `/test/motor/z-move` | Move Z-axis by distance in millimeters (`up` or `down`) |
-| **Motor Movement** | `POST` | `/test/turntable/rotate` | Rotate turntable by degrees (`clockwise` or counter) |
+| **Homing** | `POST` | `/test/motor/home-bottom` | Move carriage down until bottom limit switch triggers (0.5s settling delay) |
+| **Homing** | `POST` | `/test/motor/move-to-top` | Move carriage up until top limit switch triggers (0.5s settling delay) |
+| **Motor Movement** | `POST` | `/test/motor/z-move` | Move Z-axis by distance in millimeters with 0.5s coil de-energization settling delay |
+| **Motor Movement** | `POST` | `/test/turntable/rotate` | Rotate turntable by degrees with 0.5s coil de-energization settling delay |
 | **Camera & Video** | `POST` | `/test/stream/start` | Launch RTSP live stream and return stream URLs |
-| **Camera & Video** | `POST` | `/test/stream/stop` | Stop RTSP stream and release camera devices |
+| **Camera & Video** | `POST` | `/test/stream/stop` | Stop RTSP/MJPEG streams and release camera devices |
 | **Camera & Video** | `GET` | `/test/stream/status` | Read streaming status and active stream URLs |
+| **Camera & Video** | `GET` | `/test/stream/mjpeg` | Direct multipart MJPEG stream for browser `<img>` tags (`?camera=1\|2`) with on-demand encoding |
+| **Camera & Video** | `POST` | `/test/stream/active` | Instantaneous zero-latency active preview camera switch (`?camera_id=1\|2`) |
+| **Camera & Video** | `POST` | `/test/stream/quality` | Dynamically updates live stream JPEG compression quality (`1..100`, default 80) |
+| **Camera & Video** | `GET` | `/test/stream/sync-status` | Returns real-time libcamera `rpi.sync` status, frame rates, and offset telemetry |
 | **Camera & Video** | `POST` | `/test/camera/snap` | Capture a synchronized test photo pair from both cameras |
 | **Safety & Reset** | `POST` | `/test/cleanup` | Emergency cut on motor torque, lights, and cameras |
 
@@ -148,17 +152,22 @@ Moves the carriage upward until the top limit switch activates.
 ### `POST /test/motor/z-move`
 Moves the Z-axis carriage by a specified distance in millimeters. Automatically halted if an endstop is reached.
 
+> [!NOTE]
+> **Coil Settling Protection**: Upon completion (or abort), a mandatory **0.5-second settling pause** (`time.sleep(0.5)`) is enforced in the `finally:` block before calling `disable()`. Cutting coil current immediately while the lead screw or rotor is decelerating induces inductive back-EMF flyback spikes that can brown out the 5V logic rail and reset the Arduino (`OSError: [Errno 5] Input/output error`).
+
 * **Request Body**:
   ```json
   {
     "distance_mm": 15.0,
     "direction": "up",
-    "delay": 0.0010
+    "delay": 0.0010,
+    "acceleration": false
   }
   ```
   * `distance_mm` (float, default `10.0`, range `0.1`–`200.0`): Travel distance.
   * `direction` (`"up"` | `"down"`, default `"up"`).
   * `delay` (float, default `0.0010`): Step pulse delay.
+  * `acceleration` (bool, default `false`): Trapezoidal acceleration profile.
 
 * **Response (`200 OK`)**:
   ```json
@@ -189,17 +198,24 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
 ### `POST /test/turntable/rotate`
 Rotates the turntable platter by a specific angle.
 
+> [!NOTE]
+> **Coil Settling Protection**: Like the Z-axis, rotation enforces a **0.5-second settling pause** (`time.sleep(0.5)`) in the `finally:` block before calling `disable()`. This eliminates inertia-induced angular overshoot and dampens inductive current spikes before torque is released.
+
 * **Request Body**:
   ```json
   {
     "angle": 18.0,
     "clockwise": true,
-    "delay": 0.0010
+    "delay": 0.0010,
+    "acceleration": true,
+    "ramp_percent": 0.2
   }
   ```
   * `angle` (float, default `18.0`, range `0.1`–`360.0`).
   * `clockwise` (bool, default `true`).
   * `delay` (float, default `0.0010`).
+  * `acceleration` (bool, default `true`).
+  * `ramp_percent` (float, default `0.2`).
 
 * **Response (`200 OK`)**:
   ```json
@@ -227,7 +243,7 @@ Initializes the dual camera array and starts the H.264 RTSP livestream without m
 * **Request Body** (optional):
   ```json
   {
-    "bitrate": 2000000
+    "bitrate": 4000000
   }
   ```
 
@@ -247,13 +263,13 @@ Initializes the dual camera array and starts the H.264 RTSP livestream without m
   ```bash
   curl -X POST http://localhost:8000/test/stream/start \
        -H "Content-Type: application/json" \
-       -d '{"bitrate": 2000000}'
+       -d '{"bitrate": 4000000}'
   ```
 
 ---
 
 ### `POST /test/stream/stop`
-Stops the RTSP livestream encoder and releases camera hardware locks.
+Stops the RTSP/MJPEG live stream encoders and releases camera hardware locks.
 
 * **Response (`200 OK`)**:
   ```json
@@ -283,6 +299,90 @@ Returns whether the stream is active and its RTSP URLs.
       "rtsp://localhost:8554/cam1"
     ]
   }
+  ```
+
+---
+
+### `GET /test/stream/mjpeg`
+Direct multipart/x-mixed-replace MJPEG video stream directly viewable in browser `<img>` elements.
+
+* **Query Parameters**:
+  * `camera` (optional `int`, range `1..2`): Selects which camera feed to activate. Defaults to active preview camera.
+* **On-Demand Encoding**: Tracks connected spectators with zero CPU encoding overhead when no clients are viewing.
+* **Response (`200 OK`)**:
+  `Content-Type: multipart/x-mixed-replace; boundary=FRAME`
+* **Example `curl`**:
+  ```bash
+  curl -N http://localhost:8000/test/stream/mjpeg?camera=1 > /dev/null
+  ```
+
+---
+
+### `POST /test/stream/active`
+Switches the active preview camera (1 or 2) with zero latency.
+
+* **Query Parameters or Body**:
+  * `camera_id` (required `int`, `1` or `2`): Target camera ID.
+* **Response (`200 OK`)**:
+  ```json
+  {
+    "status": "success",
+    "active_camera": 2,
+    "message": "Switched preview to camera 2."
+  }
+  ```
+* **Example `curl`**:
+  ```bash
+  curl -X POST "http://localhost:8000/test/stream/active?camera_id=2"
+  ```
+
+---
+
+### `POST /test/stream/quality`
+Dynamically adjusts the live preview JPEG compression quality without affecting still capture resolution or quality.
+
+* **Query Parameters or Body**:
+  * `quality` (required `int`, `1..100`): Live stream compression quality (default 80).
+* **Response (`200 OK`)**:
+  ```json
+  {
+    "status": "success",
+    "quality": 80,
+    "message": "Updated stream quality to 80."
+  }
+  ```
+* **Example `curl`**:
+  ```bash
+  curl -X POST "http://localhost:8000/test/stream/quality?quality=80"
+  ```
+
+---
+
+### `GET /test/stream/sync-status`
+Returns real-time synchronization diagnostics from the active camera driver (`DualCameraRPISync`, `DualCameraXVS`, or `DualCamera`).
+
+* **Response (`200 OK`)**:
+  ```json
+  {
+    "ready": true,
+    "status": "SYNC_LOCKED",
+    "camera_1": {
+      "fps": 24.2,
+      "frames_grabbed": 840,
+      "frames_dropped": 0
+    },
+    "camera_2": {
+      "fps": 24.2,
+      "frames_grabbed": 840,
+      "frames_dropped": 0
+    },
+    "offset_modulo_ms": 0.028,
+    "active_camera": 1
+  }
+  ```
+* **Example `curl`**:
+  ```bash
+  curl -X GET http://localhost:8000/test/stream/sync-status
   ```
 
 ---
