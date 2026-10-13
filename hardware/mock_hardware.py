@@ -19,4 +19,4 @@ class MockHardware:
         sys.modules['serial.tools'] = MagicMock()
         sys.modules['serial.tools.list_ports'] = MagicMock()
         
-        sys.modules['VL53L0X'] = MagicMock()
+        sys.modules['adafruit_vl53l1x'] = MagicMock()

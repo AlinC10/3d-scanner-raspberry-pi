@@ -24,6 +24,11 @@ import statistics
 log = logging.getLogger(__name__)
 
 TOF_BACKGROUND_DISTANCE_MM = 535
+# An object is detected only when the reading is closer than the backdrop by more than this
+# margin, so ToF noise on the empty backdrop does not count as an object. Calibrate on the rig.
+TOF_CLEARANCE_MARGIN_MM = 25
+# Minimum pause after each turntable move before the next photo, so the object stops vibrating.
+TURNTABLE_SETTLE_S = 0.2
 
 class ScannerError(Exception):
     pass
@@ -691,16 +696,18 @@ class Scanner:
                     )
 
                     # --- Settle Time & ToF Object Detection ---
-                    # The ToF sensor has a 200ms timing budget.
-                    # Taking a measurement inherently blocks the thread for ~200ms, 
-                    # perfectly doubling as our physical motor settling time!
+                    # A ToF reading waits for a fresh measurement (up to one timing budget),
+                    # which already counts towards the settling time. A read can return sooner
+                    # than that, so the remainder of TURNTABLE_SETTLE_S is slept afterwards.
+                    settle_start = time.monotonic()
                     if not object_detected_this_level:
-                        if self.tof.is_object_detected(threshold=TOF_BACKGROUND_DISTANCE_MM):
+                        if self.tof.is_object_detected(threshold=TOF_BACKGROUND_DISTANCE_MM - TOF_CLEARANCE_MARGIN_MM):
                             object_detected_this_level = True
                             log.debug("Object detected by ToF sensor.")
-                    else:
-                        # If we already found the object, skip ToF and just sleep 0.2s to settle
-                        time.sleep(0.2)
+
+                    remaining_settle = TURNTABLE_SETTLE_S - (time.monotonic() - settle_start)
+                    if remaining_settle > 0:
+                        time.sleep(remaining_settle)
 
                 # Exit outer loop if cancelled during the inner loop
                 if self._cancel_event.is_set():

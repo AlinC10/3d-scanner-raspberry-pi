@@ -79,7 +79,7 @@ def get_endstops_status():
 @router.get("/tof")
 def get_tof_distance():
     """
-    Reads the Time-of-Flight (VL53L0X) laser distance sensor.
+    Reads the Time-of-Flight (VL53L1X) laser distance sensor.
     Returns the distance to the subject in mm.
     """
     try:
