@@ -19,38 +19,37 @@ def init_slave():
     cam1.start()
     return cam1
 
-executor = ThreadPoolExecutor(max_workers=2)
+if __name__ == "__main__":
+    executor = ThreadPoolExecutor(max_workers=2)
 
-f_master = executor.submit(init_master)
-time.sleep(1)
-f_slave = executor.submit(init_slave)
+    f_master = executor.submit(init_master)
+    time.sleep(1)
+    f_slave = executor.submit(init_slave)
 
-master = f_master.result()
-slave = f_slave.result()
+    master = f_master.result()
+    slave = f_slave.result()
 
-print("Both started. Wait a second for exposure to settle...")
-time.sleep(2)
+    print("Both started. Wait a second for exposure to settle...")
+    time.sleep(2)
 
-print("Capturing using request queues...")
+    def capture_slave():
+        req = slave.capture_request()
+        req.save("main", "test_photo_slave_1.jpg")
+        req.release()
+        print("Slave done!")
 
-def capture_slave():
-    req = slave.capture_request()
-    req.save("main", "test_photo_slave_1.jpg")
-    req.release()
-    print("Slave done!")
+    def capture_master():
+        req = master.capture_request()
+        req.save("main", "test_photo_master_0.jpg")
+        req.release()
+        print("Master done!")
 
-def capture_master():
-    req = master.capture_request()
-    req.save("main", "test_photo_master_0.jpg")
-    req.release()
-    print("Master done!")
+    f_cap_s = executor.submit(capture_slave)
+    f_cap_m = executor.submit(capture_master)
 
-f_cap_s = executor.submit(capture_slave)
-f_cap_m = executor.submit(capture_master)
+    f_cap_s.result()
+    f_cap_m.result()
 
-f_cap_s.result()
-f_cap_m.result()
-
-slave.stop()
-master.stop()
-print("Success!")
+    slave.stop()
+    master.stop()
+    print("Success!")

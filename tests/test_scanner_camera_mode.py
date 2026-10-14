@@ -16,10 +16,12 @@ for mod in [
 
 # Setup Endstop classes
 mock_endstop = sys.modules["hardware.endstop"]
-class MockTopEndstopTriggered(Exception): pass
-class MockBottomEndstopTriggered(Exception): pass
-mock_endstop.TopEndstopTriggered = MockTopEndstopTriggered
-mock_endstop.BottomEndstopTriggered = MockBottomEndstopTriggered
+if not hasattr(mock_endstop, "TopEndstopTriggered") or isinstance(mock_endstop.TopEndstopTriggered, MagicMock):
+    class MockTopEndstopTriggered(Exception): pass
+    mock_endstop.TopEndstopTriggered = MockTopEndstopTriggered
+if not hasattr(mock_endstop, "BottomEndstopTriggered") or isinstance(mock_endstop.BottomEndstopTriggered, MagicMock):
+    class MockBottomEndstopTriggered(Exception): pass
+    mock_endstop.BottomEndstopTriggered = MockBottomEndstopTriggered
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 

@@ -15,11 +15,17 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- STARTUP ---
+    # Open the Arduino serial port and claim the GPIO pins once, here, and not as a side effect of importing the
+    # router module. A failure aborts the startup, as it did when this ran at import time.
+    from router.scanner import scanner
+    scanner.get()
     yield
     # --- SHUTDOWN ---
     log.info("FastAPI server shutting down. Initiating hardware cleanup...")
     try:
         from router.scanner import scanner
+        if not scanner.initialized:
+            return  # the hardware was never opened: nothing to power down
         scanner.emergency_stop()  # Instantly halt any running background loops/motors
         scanner.cleanup()         # Power down the lights and release motor torque
         scanner.close_hardware()  # Release the GPIO pins & I2C to the OS

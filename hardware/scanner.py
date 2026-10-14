@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 import threading
 import time
 from queue import Queue
@@ -14,7 +14,7 @@ from .dual_camera import DualCamera
 from .dual_camera_xvs import DualCameraXVS
 from .dual_camera_rpi_sync import DualCameraRPISync
 from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
-from .motor import Motor
+from .motor import Motor, TURNTABLE_END_DELAY_DEFAULT
 from .lights import DimmableLight
 from .tof import ToFSensor
 import cloud.cloudflare_r2 as r2
@@ -29,6 +29,8 @@ TOF_BACKGROUND_DISTANCE_MM = 535
 TOF_CLEARANCE_MARGIN_MM = 25
 # Minimum pause after each turntable move before the next photo, so the object stops vibrating.
 TURNTABLE_SETTLE_S = 0.2
+# How often the Z-axis watchdog samples the limit switch in the direction of travel while the carriage moves.
+ENDSTOP_POLL_S = 0.005
 
 class ScannerError(Exception):
     pass
@@ -62,9 +64,9 @@ class Scanner:
         self.up_endstop = Endstop(pin=22, pull_up=True, bounce_time=0.02)
         self.down_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
 
-        # Wire up safety interrupts: Any endstop hit immediately stops the Z-axis motor mid-loop
-        self.up_endstop.when_pressed = self.z_axis_motor.stop
-        self.down_endstop.when_pressed = self.z_axis_motor.stop
+        # Wire up safety interrupts: Any endstop hit immediately aborts in-flight Z-axis steps
+        self.up_endstop.when_pressed = self._on_top_endstop_hit
+        self.down_endstop.when_pressed = self._on_bottom_endstop_hit
 
         self.lights = DimmableLight(relay_pin=11, pwm_channel=0, frequency=10000)
 
@@ -84,6 +86,13 @@ class Scanner:
         self.state = ScannerState.IDLE
         self._lock = threading.Lock()
         self._cancel_event = threading.Event()
+        # Set only while a Z move is in flight. The endstop callbacks send a *universal* STOP byte, so they must
+        # not fire it while the Z axis is idle (it would abort the turntable or cut every motor).
+        self._z_moving = threading.Event()
+        # The universal STOP must be sent at most once per Z move: a second one would reach an idle Arduino and
+        # cut the other motor as well.
+        self._z_stop_sent = False
+        self._z_stop_lock = threading.Lock()
 
         self._level = 0
         self.total_photos = 0
@@ -105,6 +114,62 @@ class Scanner:
     @property
     def level(self):
         return self._level
+
+    def _on_top_endstop_hit(self) -> None:
+        """Invoked when the physical upper ceiling limit switch is pressed."""
+        if not self._z_moving.is_set():
+            log.warning("[Scanner] TOP limit switch pressed while the Z-axis is not moving; ignored.")
+            return
+        log.warning("[Scanner] TOP limit switch triggered mid-motion!")
+        self._stop_z_once()
+
+    def _on_bottom_endstop_hit(self) -> None:
+        """Invoked when the physical bottom home limit switch is pressed."""
+        if not self._z_moving.is_set():
+            log.warning("[Scanner] BOTTOM limit switch pressed while the Z-axis is not moving; ignored.")
+            return
+        log.info("[Scanner] BOTTOM limit switch triggered.")
+        self._stop_z_once()
+
+    def _begin_z_motion(self) -> None:
+        """Marks a Z move as in flight (the endstop callbacks only act while this is set)."""
+        with self._z_stop_lock:
+            self._z_stop_sent = False
+        self._z_moving.set()
+
+    def _end_z_motion(self, watcher) -> None:
+        if watcher is not None:
+            stop_event, thread = watcher
+            stop_event.set()
+            thread.join(timeout=0.5)
+        self._z_moving.clear()
+
+    def _stop_z_once(self) -> None:
+        """Sends the (universal) STOP at most once per Z move, however many sources notice the endstop."""
+        with self._z_stop_lock:
+            if self._z_stop_sent:
+                return
+            self._z_stop_sent = True
+        self.z_axis_motor.stop()
+
+    def _start_endstop_watch(self, endstop, label: str):
+        """
+        Level-based watchdog for the limit switch in the direction of travel. The gpiozero callback reacts to the
+        press *edge* only; this also catches a switch that became active between the pre-check and the first step,
+        or an edge that was missed. Returns (stop_event, thread) for `_end_z_motion`.
+        """
+        stop_event = threading.Event()
+
+        def watch():
+            while not stop_event.wait(ENDSTOP_POLL_S):
+                if endstop.is_active:
+                    log.warning("[Scanner] %s limit switch active during Z travel (watchdog); stopping.", label)
+                    self._stop_z_once()
+                    return
+
+        thread = threading.Thread(target=watch, name=f"z-endstop-watch-{label.lower()}", daemon=True)
+        thread.start()
+        return stop_event, thread
 
     def _upload_worker(self, stop_event: threading.Event):
         """Background thread worker that uploads photos one by one."""
@@ -215,85 +280,131 @@ class Scanner:
 
             self._upload_thread = None
 
-    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
-        """Move Z-axis UP. Blocked if the top endstop is already active."""
-        if self.up_endstop.is_active:
-            raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
+    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
+        """Move Z-axis UP. Blocked if the top endstop is already active or hit mid-flight."""
+        # Flag first, then check the endstop: a press between the two would otherwise be ignored by the callback.
+        self._begin_z_motion()
+        watcher = None
+        try:
+            if self.up_endstop.is_active:
+                raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
 
-        self.z_axis_motor.rotate(clockwise=True, steps=steps, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
+            watcher = self._start_endstop_watch(self.up_endstop, "TOP")
+            success = self.z_axis_motor.rotate(
+                clockwise=True,
+                steps=steps,
+                delay=delay,
+                step_type=step_type,
+                acceleration=acceleration,
+                start_delay=start_delay,
+                ramp_percent=ramp_percent,
+                decel_percent=decel_percent,
+                end_delay=end_delay
+            )
+        finally:
+            self._end_z_motion(watcher)
+        if not success and self.up_endstop.is_active:
+            raise TopEndstopTriggered("Top limit switch hit during upward travel!")
+        return success
 
-    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
-        """Move Z-axis DOWN. Blocked if the bottom endstop is already active."""
-        if self.down_endstop.is_active:
-            raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
+    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
+        """Move Z-axis DOWN. Blocked if the bottom endstop is already active or hit mid-flight."""
+        # Flag first, then check the endstop: a press between the two would otherwise be ignored by the callback.
+        self._begin_z_motion()
+        watcher = None
+        try:
+            if self.down_endstop.is_active:
+                raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
 
-        self.z_axis_motor.rotate(clockwise=False, steps=steps, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
+            watcher = self._start_endstop_watch(self.down_endstop, "BOTTOM")
+            success = self.z_axis_motor.rotate(
+                clockwise=False,
+                steps=steps,
+                delay=delay,
+                step_type=step_type,
+                acceleration=acceleration,
+                start_delay=start_delay,
+                ramp_percent=ramp_percent,
+                decel_percent=decel_percent,
+                end_delay=end_delay
+            )
+        finally:
+            self._end_z_motion(watcher)
+        if not success and self.down_endstop.is_active:
+            raise BottomEndstopTriggered("Bottom limit switch hit during downward travel!")
+        return success
         
-    def move_z_up_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
-        if self.up_endstop.is_active:
-            raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
-            
-        self.z_axis_motor.rotate_angle(clockwise=True, angle=angle, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
+    def move_z_up_angle(self, angle: float = 18.0, step_type: Optional[str] = None, **kwargs) -> bool:
+        steps = self.z_axis_motor.angle_to_steps_conversion(angle=angle, step_type=step_type)
+        return self.move_z_up(steps=steps, step_type=step_type, **kwargs)
 
-    def move_z_down_angle(self, angle: float= 18.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
-        if self.down_endstop.is_active:
-            raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
-            
-        self.z_axis_motor.rotate_angle(clockwise=False, angle=angle, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
+    def move_z_down_angle(self, angle: float = 18.0, step_type: Optional[str] = None, **kwargs) -> bool:
+        steps = self.z_axis_motor.angle_to_steps_conversion(angle=angle, step_type=step_type)
+        return self.move_z_down(steps=steps, step_type=step_type, **kwargs)
 
-    def move_z_up_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
-        if self.up_endstop.is_active:
-            raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
+    def move_z_up_distance(self, distance: float = 100.0, step_type: Optional[str] = None, **kwargs) -> bool:
+        steps = self.z_axis_motor.distance_to_step_conversion(distance=distance, step_type=step_type)
+        return self.move_z_up(steps=steps, step_type=step_type, **kwargs)
 
-        self.z_axis_motor.rotate_distance(clockwise=True, distance=distance, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
-
-    def move_z_down_distance(self, distance: float= 100.0, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = None, ramp_percent: float = 0.2, decel_percent: Optional[float] = None):
-        if self.down_endstop.is_active:
-            raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
-
-        self.z_axis_motor.rotate_distance(clockwise=False, distance=distance, delay=delay, step_type=step_type, acceleration=acceleration, start_delay=start_delay, ramp_percent=ramp_percent, decel_percent=decel_percent)
+    def move_z_down_distance(self, distance: float = 100.0, step_type: Optional[str] = None, **kwargs) -> bool:
+        steps = self.z_axis_motor.distance_to_step_conversion(distance=distance, step_type=step_type)
+        return self.move_z_down(steps=steps, step_type=step_type, **kwargs)
 
     def home_z_axis(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1):
-        """The z-axis motor will rotate until it will reach the bottom (home) endstop."""
-        self.z_axis_motor.enable()
+        """
+        The z-axis motor will rotate until it reaches the bottom (home) endstop.
 
+        :raises ScannerError: if the bottom endstop was not reached (move aborted, serial error, or the
+            50000-step travel limit ran out). Motor errors are propagated, never swallowed.
+        """
+        homed = False
+        self.z_axis_motor.enable()
         try:
             self.move_z_down(
-                steps=50000, 
+                steps=50000,
                 delay=delay,
                 acceleration=True,
                 start_delay=start_delay,
                 ramp_percent=ramp_percent
             )
         except BottomEndstopTriggered:
-            pass
-        except Exception as e:
-            pass
+            homed = True
         finally:
-            self.z_axis_motor.stop()
-            time.sleep(0.5)
-            self.z_axis_motor.disable()
+            self.z_axis_motor.disable() # Automatically settles for 0.5s then cuts power
+
+        # The move can also end on the switch without raising (it was released again, or the callback raced the check)
+        if homed or self.down_endstop.is_active:
+            log.info("[Scanner] Carriage successfully homed to bottom endstop.")
+            return
+        raise ScannerError("Homing failed: the bottom endstop was not reached.")
 
     def move_z_to_top(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1):
-        """The z-axis motor will rotate UP until it reaches the top endstop."""
-        self.z_axis_motor.enable()
+        """
+        The z-axis motor will rotate UP until it reaches the top endstop.
 
+        :raises ScannerError: if the top endstop was not reached (move aborted, serial error, or the
+            50000-step travel limit ran out). Motor errors are propagated, never swallowed.
+        """
+        reached = False
+        self.z_axis_motor.enable()
         try:
             self.move_z_up(
-                steps=50000, 
+                steps=50000,
                 delay=delay,
-                acceleration=True, 
+                acceleration=True,
                 start_delay=start_delay,
                 ramp_percent=ramp_percent
             )
         except TopEndstopTriggered:
-            pass
-        except Exception as e:
-            pass
+            reached = True
         finally:
-            self.z_axis_motor.stop()
-            time.sleep(0.5)
-            self.z_axis_motor.disable()
+            self.z_axis_motor.disable() # Automatically settles for 0.5s then cuts power
+
+        if reached or self.up_endstop.is_active:
+            log.info("[Scanner] Carriage successfully reached top endstop.")
+            return
+        raise ScannerError("Move to top failed: the top endstop was not reached.")
+
     def wait_for_light_stable(
         self,
         samples: int = 4,
@@ -487,11 +598,19 @@ class Scanner:
             camera_kwargs.pop("camera_mode", None)
             camera_kwargs.pop("mode", None)
 
-            # home the motor
-            self.home_z_axis()
+            # home the motor (a cancel during the move makes the homing report "not reached": not an error)
+            try:
+                self.home_z_axis()
+            except ScannerError:
+                if self._cancel_event.is_set():
+                    return
+                raise
             if self._cancel_event.is_set(): return
 
-            self.move_z_up_distance(distance=30.0)
+            if not self.move_z_up_distance(distance=30.0):
+                if self._cancel_event.is_set():
+                    return
+                raise ScannerError("The Z-axis move to the scan start position (+30 mm) was aborted.")
             if self._cancel_event.is_set(): return
 
             # Clean up the cloud bucket before capturing new assets
@@ -583,6 +702,91 @@ class Scanner:
                 self.dual_cameras = None
                 self.stream_urls = None
 
+    def _capture_turntable_slice(
+        self,
+        images_dir: str,
+        angle: float,
+        steps: int,
+        delay_turntable: float,
+        turntable_acceleration: bool = True,
+        turntable_start_delay: Optional[float] = None,
+        turntable_ramp_percent: float = 0.2,
+        turntable_decel_percent: Optional[float] = None,
+        level_label: Optional[Union[int, str]] = None,
+        check_tof: bool = True,
+        turntable_end_delay: Optional[float] = TURNTABLE_END_DELAY_DEFAULT,
+    ) -> bool:
+        """
+        Captures a 360-degree slice of photos by rotating the turntable in increments of `angle`.
+        Returns True if an object was detected by the ToF sensor (or if check_tof is False).
+        """
+        if level_label is None:
+            level_label = self._level
+
+        total_shots = max(1, round(360.0 / angle))
+        object_detected_this_level = False
+
+        for shot in range(total_shots):
+            if self._cancel_event.is_set():
+                break
+
+            # emergency_stop() closes the cameras and sets self.dual_cameras = None from another thread
+            cameras = self.dual_cameras
+            if cameras is None:
+                if self._cancel_event.is_set():
+                    break
+                raise ScannerError("The camera system is not available.")
+
+            # 1. Capture 2 photos using DualCamera / DualCameraXVS (Master & Slave)
+            photo_paths = cameras.capture_photo(
+                output_prefix=f"lvl_{level_label}_shot_{shot}",
+                output_dir=images_dir,
+                meshroom_rig=True
+            )
+
+            # Track total physical images for the RAM heuristic
+            self.total_photos += len(photo_paths)
+
+            # 2. Enqueue each photo path for background upload!
+            for path in photo_paths:
+                self.upload_queue.put(path)
+
+            if self._cancel_event.is_set():
+                break
+
+            # 3. Rotate turntable to next position
+            rotated = self.turntable_motor.rotate(
+                clockwise=True,
+                steps=steps,
+                delay=delay_turntable,
+                acceleration=turntable_acceleration,
+                start_delay=turntable_start_delay,
+                ramp_percent=turntable_ramp_percent,
+                decel_percent=turntable_decel_percent,
+                end_delay=turntable_end_delay,
+                verbose=False
+            )
+            if not rotated:
+                if self._cancel_event.is_set():
+                    break
+                # An aborted rotation means every following photo would be taken at a wrong angle
+                raise ScannerError(
+                    f"Turntable rotation aborted at level {level_label}, shot {shot}; scan positions are no longer valid."
+                )
+
+            # --- Settle Time & ToF Object Detection ---
+            settle_start = time.monotonic()
+            if check_tof and not object_detected_this_level:
+                if self.tof.is_object_detected(threshold=TOF_BACKGROUND_DISTANCE_MM - TOF_CLEARANCE_MARGIN_MM):
+                    object_detected_this_level = True
+                    log.debug("Object detected by ToF sensor.")
+
+            remaining_settle = TURNTABLE_SETTLE_S - (time.monotonic() - settle_start)
+            if remaining_settle > 0:
+                time.sleep(remaining_settle)
+
+        return object_detected_this_level
+
     def scan(
         self, 
         angle: float = 18.0, 
@@ -596,7 +800,10 @@ class Scanner:
         z_acceleration: bool = False,
         z_start_delay: Optional[float] = None,
         z_ramp_percent: float = 0.2,
-        z_decel_percent: Optional[float] = None
+        z_decel_percent: Optional[float] = None,
+        turntable_end_delay: Optional[float] = TURNTABLE_END_DELAY_DEFAULT,
+        z_end_delay: Optional[float] = None,
+        finish_state: str = ScannerState.IDLE
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.
@@ -615,6 +822,12 @@ class Scanner:
         :param z_start_delay: Starting delay in seconds for Z-axis ramp.
         :param z_ramp_percent: Fraction (0.0 - 1.0) of steps used for Z-axis acceleration.
         :param z_decel_percent: Optional separate fraction (0.0 - 1.0) for Z-axis deceleration.
+        :param turntable_end_delay: Step delay in seconds at the end of the turntable deceleration, so every
+            stop ends slowly (clamped to [END_DELAY_MIN, END_DELAY_MAX]). None disables the slow tail.
+        :param z_end_delay: Same as turntable_end_delay for the Z-axis (None = off, the default).
+        :param finish_state: State to leave the scanner in after a scan that completed normally. cleanup() resets it
+            to IDLE, which would briefly allow a new /prepare before the cloud pipeline starts; the orchestrator
+            passes PROCESSING to close that gap. Failed and cancelled scans keep their own terminal state.
         """
         # Lock only for state validation, transition, and variable setup
         with self._lock:
@@ -623,31 +836,36 @@ class Scanner:
             if self.dual_cameras is None:
                 raise ScannerError("Dual Camera System is not initialized. Run prepare_scan() before scan().")
 
+            # Validate the mechanical parameters BEFORE touching any state or hardware: a bad angle or z_move_mm
+            # must leave the scanner PREPARED, not half-started (energized motors, running upload worker).
+            steps = self.turntable_motor.angle_to_steps_conversion(angle)
+            z_steps = self.z_axis_motor.distance_to_step_conversion(distance=z_move_mm)
+
             # Reset cancellation flag and photo counter for a fresh scan
             self._cancel_event.clear()
             self.total_photos = 0
 
-            steps = self.turntable_motor.angle_to_steps_conversion(angle)
-
-            if not isinstance(steps, int):
-                raise ValueError(f"""Angle should be a multiple of 1.8 * step_type to obtain an integer number for 
-                steps. Current angles and number of steps: {angle} degrees -> {steps} steps""")
-
             self.state = ScannerState.RUNNING
 
-        # Lock released — physical execution begins without blocking emergency_stop()
-        self.turntable_motor.enable()
-        self.z_axis_motor.disable() # Z-axis is idle while taking photos on the first layer
-        
+        # The slow-stop tail is part of the deceleration ramp: without acceleration there is nothing to apply it to
+        if not turntable_acceleration:
+            turntable_end_delay = None
+        if not z_acceleration:
+            z_end_delay = None
+        scan_ok = False
+
+        # Lock released - physical execution begins without blocking emergency_stop()
         images_dir = str(Path(__file__).resolve().parent.parent / "input_images")
 
-        fc.create_clean_dir(images_dir)
-
-        self.start_upload_worker()
-
-        # move z-axis to the next floor
-        z_steps = self.z_axis_motor.distance_to_step_conversion(distance=z_move_mm)
         try:
+            # Everything that touches the hardware lives inside the try, so cleanup() always runs
+            self.turntable_motor.enable()
+            self.z_axis_motor.disable() # Z-axis is idle while taking photos on the first layer
+
+            fc.create_clean_dir(images_dir)
+
+            self.start_upload_worker()
+
             self._level = 1
             
             # Until the top endstop triggers or cancellation is requested
@@ -657,57 +875,19 @@ class Scanner:
                     log.warning("[Scanner] Scan aborted by user.")
                     break
 
-                total_shots = max(1, round(360.0 / angle))
-                object_detected_this_level = False
-                
-                for shot in range(total_shots):
-                    # Check for cancellation before each photo
-                    if self._cancel_event.is_set():
-                        break
-
-                    # 1. Capture 2 photos using DualCamera / DualCameraXVS (Master & Slave)
-                    photo_paths = self.dual_cameras.capture_photo(
-                        output_prefix=f"lvl_{self._level}_shot_{shot}",
-                        output_dir=images_dir,
-                        meshroom_rig=True
-                    )
-
-                    # Track total physical images for the RAM heuristic
-                    self.total_photos += len(photo_paths)
-
-                    # 2. Enqueue each photo path for background upload!
-                    for path in photo_paths:
-                        self.upload_queue.put(path)
-
-                    # Check for cancellation before rotating
-                    if self._cancel_event.is_set():
-                        break
-
-                    # 3. Rotate turntable to next position
-                    self.turntable_motor.rotate(
-                        clockwise=True,
-                        steps=steps,
-                        delay=delay_turntable,
-                        acceleration=turntable_acceleration,
-                        start_delay=turntable_start_delay,
-                        ramp_percent=turntable_ramp_percent,
-                        decel_percent=turntable_decel_percent,
-                        verbose=False
-                    )
-
-                    # --- Settle Time & ToF Object Detection ---
-                    # A ToF reading waits for a fresh measurement (up to one timing budget),
-                    # which already counts towards the settling time. A read can return sooner
-                    # than that, so the remainder of TURNTABLE_SETTLE_S is slept afterwards.
-                    settle_start = time.monotonic()
-                    if not object_detected_this_level:
-                        if self.tof.is_object_detected(threshold=TOF_BACKGROUND_DISTANCE_MM - TOF_CLEARANCE_MARGIN_MM):
-                            object_detected_this_level = True
-                            log.debug("Object detected by ToF sensor.")
-
-                    remaining_settle = TURNTABLE_SETTLE_S - (time.monotonic() - settle_start)
-                    if remaining_settle > 0:
-                        time.sleep(remaining_settle)
+                object_detected_this_level = self._capture_turntable_slice(
+                    images_dir=images_dir,
+                    angle=angle,
+                    steps=steps,
+                    delay_turntable=delay_turntable,
+                    turntable_acceleration=turntable_acceleration,
+                    turntable_start_delay=turntable_start_delay,
+                    turntable_ramp_percent=turntable_ramp_percent,
+                    turntable_decel_percent=turntable_decel_percent,
+                    level_label=self._level,
+                    check_tof=True,
+                    turntable_end_delay=turntable_end_delay,
+                )
 
                 # Exit outer loop if cancelled during the inner loop
                 if self._cancel_event.is_set():
@@ -716,37 +896,80 @@ class Scanner:
                 # --- End of Level Evaluation ---
                 if not object_detected_this_level:
                     log.info(f"ToF Sensor cleared the object at level {self._level}. Terminating scan early.")
+                    self.turntable_motor.disable()
                     break
 
                 # If endstop was triggered during the slice, exit loop
                 if self.up_endstop.is_active:
+                    self.turntable_motor.disable()
                     break
 
                 try:
-                    time.sleep(0.5)                 # Settling time for turntable slice
-                    self.turntable_motor.disable()  # Cut turntable coil current
+                    # The settle pauses are interruptible and the cancel flag is re-checked before every step:
+                    # a cancel that lands during a pause must not still lift the carriage.
+                    self.turntable_motor.disable(interrupt=self._cancel_event)  # Holding torque settles for 0.5s then cuts power
+                    if self._cancel_event.is_set():
+                        break
                     self.z_axis_motor.enable()      # Energize Z-axis
-                    self.move_z_up(
+                    if self._cancel_event.is_set():
+                        break
+                    z_moved = self.move_z_up(
                         steps=z_steps,
                         delay=delay_z_motor,
                         acceleration=z_acceleration,
                         start_delay=z_start_delay,
                         ramp_percent=z_ramp_percent,
-                        decel_percent=z_decel_percent
+                        decel_percent=z_decel_percent,
+                        end_delay=z_end_delay
                     )
-                    time.sleep(0.5)                 # Settling time for Z-axis climb
-                    self.z_axis_motor.disable()     # Done climbing, release Z
+                    self.z_axis_motor.disable(interrupt=self._cancel_event)     # Done climbing, settles for 0.5s then cuts power
+                    if self._cancel_event.is_set():
+                        break
+                    if not z_moved:
+                        raise ScannerError("The Z-axis climb was aborted before reaching the next level.")
+                    if self.up_endstop.is_active:
+                        # The climb ended exactly on the top switch: rotate() reported success, but the carriage is at
+                        # the ceiling. Take the final ring instead of silently leaving the loop without it.
+                        raise TopEndstopTriggered("Top limit switch reached at the end of the climb.")
                     self.turntable_motor.enable()   # Re-enable turntable for next slice
                 except TopEndstopTriggered:
-                    # Reached the ceiling, break out of the scan loop
+                    log.info("[Scanner] Carriage reached the TOP ceiling during climb. Performing final top-level photo ring...")
+                    self.z_axis_motor.disable()
+                    self.turntable_motor.enable()
+                    self._level += 1
+                    self._capture_turntable_slice(
+                        images_dir=images_dir,
+                        angle=angle,
+                        steps=steps,
+                        delay_turntable=delay_turntable,
+                        turntable_acceleration=turntable_acceleration,
+                        turntable_start_delay=turntable_start_delay,
+                        turntable_ramp_percent=turntable_ramp_percent,
+                        turntable_decel_percent=turntable_decel_percent,
+                        level_label=self._level,
+                        check_tof=False,
+                        turntable_end_delay=turntable_end_delay,
+                    )
+                    self.turntable_motor.disable()
                     break
                 
                 self._level += 1
 
+            scan_ok = True
+
         except Exception as e:
-            raise ScannerError(f"Error during scan: {str(e)}")
+            if self._cancel_event.is_set():
+                # The cancel tore the hardware down (cameras closed, motors stopped) under the scan thread: the
+                # resulting error is a consequence, not a failure.
+                log.info("[Scanner] Scan stopped by cancellation (%s).", e)
+            else:
+                raise ScannerError(f"Error during scan: {str(e)}")
         finally:
             self.cleanup()
+            if scan_ok and finish_state != ScannerState.IDLE and not self._cancel_event.is_set():
+                with self._lock:
+                    if self.state == ScannerState.IDLE:  # cleanup() just reset RUNNING -> IDLE
+                        self.state = finish_state
             # Tell the worker that no more images are coming
             # Don't wait for uploads if the user cancelled
             wait = not self._cancel_event.is_set()

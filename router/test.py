@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from router.scanner import scanner
+from router.scanner import scanner, ScannerState
 from hardware.endstop import TopEndstopTriggered, BottomEndstopTriggered
 from hardware.scanner import ScannerError
 from hardware.lights import LightLockedError
@@ -17,6 +17,19 @@ router = APIRouter(
     prefix="/test",
     tags=["Hardware Diagnostics & Tests"],
 )
+
+def _require_motors_free() -> None:
+    """
+    Manual motor tests must not run while a prepare/scan owns the rig: they would cut torque or move the
+    platter/carriage in the middle of a scan. Only idle / finished states are allowed.
+    """
+    allowed = getattr(ScannerState, "PREPARE_ALLOWED", ("idle", "completed", "cancelled", "error"))
+    if scanner.state not in allowed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Scanner is busy (state: {scanner.state}). Cancel it with POST /scanner/cancel first."
+        )
+
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -141,14 +154,9 @@ def get_motor_status():
     "enabled" = Coil is energized, motor holding torque is ON.
     "disabled" = Coil is off, motor free wheels.
     """
-    def is_enabled(motor):
-        if motor.en_device is None:
-            return True
-        return motor.en_device.value == 0
-
     return {
-        "turntable": "enabled" if is_enabled(scanner.turntable_motor) else "disabled",
-        "z_axis": "enabled" if is_enabled(scanner.z_axis_motor) else "disabled"
+        "turntable": "enabled" if getattr(scanner.turntable_motor, "is_enabled", False) else "disabled",
+        "z_axis": "enabled" if getattr(scanner.z_axis_motor, "is_enabled", False) else "disabled"
     }
 
 @router.post("/motor/enable")
@@ -157,6 +165,7 @@ def test_motor_enable(target: MotorTarget = MotorTarget.ALL):
     Manually energizes the motor coils (holding torque ON).
     Useful to verify wiring and check if the motor locks up.
     """
+    _require_motors_free()
     if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
         scanner.turntable_motor.enable()
     if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
@@ -169,6 +178,7 @@ def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
     """
     Manually releases motor torque (holding torque OFF / free wheel).
     """
+    _require_motors_free()
     if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
         scanner.turntable_motor.disable()
     if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
@@ -189,6 +199,7 @@ def test_home_bottom(
     Moves the Z-axis carriage DOWN until the bottom (home) limit switch is triggered.
     Stops and releases torque upon reaching the switch.
     """
+    _require_motors_free()
     try:
         test_motor_enable(MotorTarget.Z_AXIS)
         scanner.home_z_axis(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
@@ -211,6 +222,7 @@ def test_move_to_top(
     Moves the Z-axis carriage UP until the top limit switch is triggered.
     Stops and releases torque upon reaching the switch.
     """
+    _require_motors_free()
     try:
         test_motor_enable(MotorTarget.Z_AXIS)
         scanner.move_z_to_top(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
@@ -231,25 +243,28 @@ def test_z_move(req: ZMoveRequest):
     Moves the Z-axis carriage by a specific distance in millimeters.
     Automatically blocked if the target limit switch is active.
     """
+    _require_motors_free()
     scanner.z_axis_motor.enable()
     try:
         if req.direction == "up":
             scanner.move_z_up_distance(
-                distance=req.distance_mm, 
+                distance=req.distance_mm,
                 delay=req.delay,
                 acceleration=req.acceleration,
                 start_delay=req.start_delay,
                 ramp_percent=req.ramp_percent,
-                decel_percent=req.decel_percent
+                decel_percent=req.decel_percent,
+                end_delay=req.end_delay
             )
         else:
             scanner.move_z_down_distance(
-                distance=req.distance_mm, 
+                distance=req.distance_mm,
                 delay=req.delay,
                 acceleration=req.acceleration,
                 start_delay=req.start_delay,
                 ramp_percent=req.ramp_percent,
-                decel_percent=req.decel_percent
+                decel_percent=req.decel_percent,
+                end_delay=req.end_delay
             )
 
         return {
@@ -264,8 +279,6 @@ def test_z_move(req: ZMoveRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Z-axis movement error: {str(e)}")
     finally:
-        scanner.z_axis_motor.stop()
-        time.sleep(0.5)
         scanner.z_axis_motor.disable()
 
 
@@ -274,6 +287,7 @@ def test_turntable_rotate(req: TurntableRotateRequest):
     """
     Rotates the turntable by a specific angle in degrees (e.g. 18°).
     """
+    _require_motors_free()
     scanner.turntable_motor.enable()
     try:
         scanner.turntable_motor.rotate_angle(
@@ -283,7 +297,8 @@ def test_turntable_rotate(req: TurntableRotateRequest):
             acceleration=req.acceleration,
             start_delay=req.start_delay,
             ramp_percent=req.ramp_percent,
-            decel_percent=req.decel_percent
+            decel_percent=req.decel_percent,
+            end_delay=req.end_delay
         )
         return {
             "status": "success",
@@ -293,8 +308,6 @@ def test_turntable_rotate(req: TurntableRotateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Turntable rotation error: {str(e)}")
     finally:
-        scanner.turntable_motor.stop()
-        time.sleep(0.5)
         scanner.turntable_motor.disable()
 
 
@@ -508,6 +521,7 @@ def test_cleanup():
     - Closes cameras and terminates live stream.
     - Resets hardware state to IDLE.
     """
+    _require_motors_free()
     try:
         scanner.cleanup()
         return {

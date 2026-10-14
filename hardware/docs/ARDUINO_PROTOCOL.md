@@ -111,7 +111,23 @@ Commands are sent as ASCII strings, separated by spaces, and terminated by a new
 | `0x04` | `4` | `DISABLE` | `4 <id>\n` | `0\n` or error | Drives EN pin HIGH (cuts coil current to cool motor & driver). |
 | `0x05` | `5` | `ROTATE` | `5 <id> <steps> <dir> <us>\n` | `0\n` or `4\n` | Executes blocking stepping loop. `dir`: 1=CW, 0=CCW. |
 | `0x06` | `6` | `STOP` | `6 <id>\n` | `0\n` or error | In-band software stop for specific motor `<id>`. Releases torque. |
-| `0x10` | `16` | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel>\n` | `0\n` or `4\n` | Trapezoidal velocity ramping move. |
+| `0x10` | `16` | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel> [<end_us>]\n` | `0\n` or `4\n` | Constant-acceleration speed-ramp move. Optional `<end_us>` = slow-stop tail (see 6.1). |
+
+### 6.1 `ACCEL_ROTATE` speed profile
+
+| Argument | Meaning |
+| :--- | :--- |
+| `<target_us>` | Cruise step period. |
+| `<start_us>` | Step period at the beginning of the acceleration ramp (clamped to `>= target_us`). |
+| `<accel>` / `<decel>` | Number of steps spent accelerating / decelerating (scaled down proportionally if `accel + decel > steps`). |
+| `<end_us>` *(optional)* | Step period of the **last** deceleration step. `0` or missing = `<start_us>` (previous behaviour). Clamped to `>= target_us`. |
+
+* Speed is a straight ramp in time (constant acceleration): for step `i` of an `n`-step ramp, `v^2 = v_a^2 + (v_b^2 - v_a^2) * i / n`, with `v = 1e6 / period_us`.
+  * Acceleration: `v_a = 1/start_us` -> `v_b = 1/target_us`.
+  * Deceleration: `v_a = 1/target_us` -> `v_b = 1/end_us`.
+* Steps are scheduled against an absolute `micros()` deadline, so the cost of computing the next period is hidden inside the wait and does not stretch the ramp.
+* The firmware waits for the last step period to elapse before replying, so the rotor has settled on the final step when the Pi receives `0\n`.
+* Old firmware ignores the extra argument and old hosts simply omit it, so the two sides can be upgraded independently.
 
 ---
 
@@ -124,7 +140,7 @@ To solve this, we use an **Out-of-Band Universal Abort Byte**: `0xFF` (`255`).
 
 * The Raspberry Pi injects `0xFF` onto the serial line *without* a newline. 
 * Inside `Motor::rotate()`, between every single microsecond step, the C++ code runs `Serial.peek()`.
-* If it detects `0xFF` or `!`, it instantly aborts the stepping loop (latency $\le 1.0\text{ ms}$).
+* If it detects `0xFF` or `!`, it instantly aborts the stepping loop (latency $\le 1.0\text{ ms}$). `Motor::rotateRamp()` also polls while waiting between steps, so the latency stays $\le 1\text{ ms}$ even during the slow tail (step periods up to 30 ms).
 * **Scope Differences:**
   * **Mid-Motion (`Motor::rotate`)**: The active, rotating motor cuts its own power (`this->disable()`), clears the serial buffer, and returns `STATUS_ERR_ABORTED` (`4\n`). (In this rig, only one motor moves at a time, so disabling the active one makes the whole system safe).
   * **Idle (`CommandHandler::update`)**: If the byte is received while idle, the global orchestrator loops over all configured motors and disables them all, cutting total system torque.

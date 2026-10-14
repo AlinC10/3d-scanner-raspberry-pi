@@ -13,6 +13,18 @@ for mod in [
     if mod not in sys.modules:
         sys.modules[mod] = MagicMock()
 
+# Configure serial mock so subpackages like serial.tools.list_ports resolve
+mock_serial = sys.modules["serial"]
+mock_serial.__path__ = []
+sys.modules["serial.tools"] = MagicMock()
+sys.modules["serial.tools.list_ports"] = MagicMock()
+
+# Ensure Endstop exceptions inherit from Exception
+class TopEndstopTriggered(Exception): pass
+class BottomEndstopTriggered(Exception): pass
+sys.modules["hardware.endstop"].TopEndstopTriggered = TopEndstopTriggered
+sys.modules["hardware.endstop"].BottomEndstopTriggered = BottomEndstopTriggered
+
 # Ensure Picamera2 class exists on picamera2 mock
 mock_p2 = sys.modules["picamera2"]
 if not hasattr(mock_p2, "Picamera2") or isinstance(mock_p2.Picamera2, MagicMock):
