@@ -77,7 +77,7 @@ The following table maps the Python `ArduinoCommand` Enum values to the exact ph
 | **`4`** | `DISABLE` | `4 <id>\n` | `0\n` | Pulls driver EN pin HIGH (releases torque). |
 | **`5`** | `ROTATE` | `5 <id> <steps> <dir> <us>\n` | `0\n` or `4\n` | Executes physical step pulses (`dir`: 1=CW, 0=CCW). |
 | **`6`** | `STOP` | `6 <id>\n` | `0\n` | In-band software stop for motor `<id>`. |
-| **`16`** (`0x10`) | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel>\n` | `0\n` or `4\n` | Trapezoidal velocity ramping move. |
+| **`16`** (`0x10`) | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel> [<end_us>]\n` | `0\n` or `4\n` | Constant-acceleration speed-ramp move (speed is linear in time). Optional `<end_us>` is the step period of the last deceleration step (slow stop); omitted or `0` decelerates back down to `<start_us>`. |
 | **`255`** (`0xFF`) | `EMERGENCY_STOP` | Raw `0xFF` byte (no `\n`) | `4\n` (from `ROTATE`) | Out-of-band Universal Abort: halts motion instantly in $\le 1\text{ ms}$. |
 
 **Reserved Future Features:**

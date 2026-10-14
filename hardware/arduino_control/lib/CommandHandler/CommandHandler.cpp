@@ -54,9 +54,10 @@ void CommandHandler::parseAndExecute(const char* cmd) {
                 const uint32_t start_delay = strtoul(p, &p, 10);
                 const uint32_t accel = strtoul(p, &p, 10);
                 const uint32_t decel = strtoul(p, &p, 10);
-                
+                const uint32_t end_delay = strtoul(p, &p, 10); // optional: 0 / missing -> no slow tail
+
                 if (id < this->motorCount && this->motors[id].isConfigured()) {
-                    const uint8_t status = this->motors[id].rotateRamp(cw, steps, target_delay, start_delay, accel, decel);
+                    const uint8_t status = this->motors[id].rotateRamp(cw, steps, target_delay, start_delay, accel, decel, end_delay);
                     Serial.println(status);
                 } else {
                     Serial.println(id >= this->motorCount ? STATUS_ERR_INVALID_ARG : STATUS_ERR_NOT_CONFIGURED);
@@ -76,9 +77,10 @@ void CommandHandler::parseAndExecute(const char* cmd) {
             const uint32_t start_delay = strtoul(p, &p, 10);
             const uint32_t accel = strtoul(p, &p, 10);
             const uint32_t decel = strtoul(p, &p, 10);
-            
+            const uint32_t end_delay = strtoul(p, &p, 10); // optional: 0 / missing -> no slow tail
+
             if (id < this->motorCount && this->motors[id].isConfigured()) {
-                const uint8_t status = this->motors[id].rotateRamp(cw, steps, target_delay, start_delay, accel, decel);
+                const uint8_t status = this->motors[id].rotateRamp(cw, steps, target_delay, start_delay, accel, decel, end_delay);
                 Serial.println(status);
             } else {
                 Serial.println(id >= this->motorCount ? STATUS_ERR_INVALID_ARG : STATUS_ERR_NOT_CONFIGURED);

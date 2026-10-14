@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import Annotated, Literal
 from hardware.camera.config import AF_ROI, AF_STEP, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_VIDEO_RESOLUTION, DEFAULT_PHOTO_RESOLUTION, DEFAULT_QUALITY
+from hardware.motor import END_DELAY_MIN, END_DELAY_MAX, TURNTABLE_END_DELAY_DEFAULT
 
 
 class DualCameraConfig(BaseModel):
@@ -86,6 +87,15 @@ class TurntableRotateRequest(BaseModel):
         ge=0.00005,
         description="Starting delay in seconds for the ramp."
     )] = None
+    end_delay: Annotated[float | None, Field(
+        ge=END_DELAY_MIN,
+        le=END_DELAY_MAX,
+        description=(
+            "Step delay in seconds at the end of the deceleration ramp, so the turntable stops slowly "
+            f"({END_DELAY_MIN}-{END_DELAY_MAX} s). null disables the slow stop. "
+            "Ignored when acceleration is false or there is no deceleration phase."
+        )
+    )] = TURNTABLE_END_DELAY_DEFAULT
 
 
 class ZMoveRequest(BaseModel):
@@ -118,6 +128,14 @@ class ZMoveRequest(BaseModel):
         ge=0.00005,
         description="Starting delay in seconds for the ramp."
     )] = 0.0040
+    end_delay: Annotated[float | None, Field(
+        ge=END_DELAY_MIN,
+        le=END_DELAY_MAX,
+        description=(
+            "Optional step delay in seconds at the end of the deceleration ramp for a slow stop "
+            f"({END_DELAY_MIN}-{END_DELAY_MAX} s). null (default) disables it."
+        )
+    )] = None
 
 
 class MechanicalConfig(BaseModel):

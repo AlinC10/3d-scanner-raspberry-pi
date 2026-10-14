@@ -14,7 +14,7 @@ from .dual_camera import DualCamera
 from .dual_camera_xvs import DualCameraXVS
 from .dual_camera_rpi_sync import DualCameraRPISync
 from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
-from .motor import Motor
+from .motor import Motor, TURNTABLE_END_DELAY_DEFAULT
 from .lights import DimmableLight
 from .tof import ToFSensor
 import cloud.cloudflare_r2 as r2
@@ -225,39 +225,41 @@ class Scanner:
 
             self._upload_thread = None
 
-    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None) -> bool:
+    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
         """Move Z-axis UP. Blocked if the top endstop is already active or hit mid-flight."""
         if self.up_endstop.is_active:
             raise TopEndstopTriggered("Cannot move UP: Top limit switch is already reached!")
 
         success = self.z_axis_motor.rotate(
-            clockwise=True, 
-            steps=steps, 
-            delay=delay, 
-            step_type=step_type, 
-            acceleration=acceleration, 
-            start_delay=start_delay, 
-            ramp_percent=ramp_percent, 
-            decel_percent=decel_percent
+            clockwise=True,
+            steps=steps,
+            delay=delay,
+            step_type=step_type,
+            acceleration=acceleration,
+            start_delay=start_delay,
+            ramp_percent=ramp_percent,
+            decel_percent=decel_percent,
+            end_delay=end_delay
         )
         if not success and self.up_endstop.is_active:
             raise TopEndstopTriggered("Top limit switch hit during upward travel!")
         return success
 
-    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None) -> bool:
+    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
         """Move Z-axis DOWN. Blocked if the bottom endstop is already active or hit mid-flight."""
         if self.down_endstop.is_active:
             raise BottomEndstopTriggered("Cannot move DOWN: Bottom (home) limit switch is already reached!")
 
         success = self.z_axis_motor.rotate(
-            clockwise=False, 
-            steps=steps, 
-            delay=delay, 
-            step_type=step_type, 
-            acceleration=acceleration, 
-            start_delay=start_delay, 
-            ramp_percent=ramp_percent, 
-            decel_percent=decel_percent
+            clockwise=False,
+            steps=steps,
+            delay=delay,
+            step_type=step_type,
+            acceleration=acceleration,
+            start_delay=start_delay,
+            ramp_percent=ramp_percent,
+            decel_percent=decel_percent,
+            end_delay=end_delay
         )
         if not success and self.down_endstop.is_active:
             raise BottomEndstopTriggered("Bottom limit switch hit during downward travel!")
@@ -615,6 +617,7 @@ class Scanner:
         turntable_decel_percent: Optional[float] = None,
         level_label: Optional[Union[int, str]] = None,
         check_tof: bool = True,
+        turntable_end_delay: Optional[float] = TURNTABLE_END_DELAY_DEFAULT,
     ) -> bool:
         """
         Captures a 360-degree slice of photos by rotating the turntable in increments of `angle`.
@@ -656,6 +659,7 @@ class Scanner:
                 start_delay=turntable_start_delay,
                 ramp_percent=turntable_ramp_percent,
                 decel_percent=turntable_decel_percent,
+                end_delay=turntable_end_delay,
                 verbose=False
             )
 
@@ -685,7 +689,9 @@ class Scanner:
         z_acceleration: bool = False,
         z_start_delay: Optional[float] = None,
         z_ramp_percent: float = 0.2,
-        z_decel_percent: Optional[float] = None
+        z_decel_percent: Optional[float] = None,
+        turntable_end_delay: Optional[float] = TURNTABLE_END_DELAY_DEFAULT,
+        z_end_delay: Optional[float] = None
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.
@@ -704,6 +710,9 @@ class Scanner:
         :param z_start_delay: Starting delay in seconds for Z-axis ramp.
         :param z_ramp_percent: Fraction (0.0 - 1.0) of steps used for Z-axis acceleration.
         :param z_decel_percent: Optional separate fraction (0.0 - 1.0) for Z-axis deceleration.
+        :param turntable_end_delay: Step delay in seconds at the end of the turntable deceleration, so every
+            stop ends slowly (clamped to [END_DELAY_MIN, END_DELAY_MAX]). None disables the slow tail.
+        :param z_end_delay: Same as turntable_end_delay for the Z-axis (None = off, the default).
         """
         # Lock only for state validation, transition, and variable setup
         with self._lock:
@@ -757,6 +766,7 @@ class Scanner:
                     turntable_decel_percent=turntable_decel_percent,
                     level_label=self._level,
                     check_tof=True,
+                    turntable_end_delay=turntable_end_delay,
                 )
 
                 # Exit outer loop if cancelled during the inner loop
@@ -783,7 +793,8 @@ class Scanner:
                         acceleration=z_acceleration,
                         start_delay=z_start_delay,
                         ramp_percent=z_ramp_percent,
-                        decel_percent=z_decel_percent
+                        decel_percent=z_decel_percent,
+                        end_delay=z_end_delay
                     )
                     self.z_axis_motor.disable()     # Done climbing, settles for 0.5s then cuts power
                     self.turntable_motor.enable()   # Re-enable turntable for next slice
@@ -803,6 +814,7 @@ class Scanner:
                         turntable_decel_percent=turntable_decel_percent,
                         level_label=self._level,
                         check_tof=False,
+                        turntable_end_delay=turntable_end_delay,
                     )
                     self.turntable_motor.disable()
                     break

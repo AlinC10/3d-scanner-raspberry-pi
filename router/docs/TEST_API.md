@@ -167,7 +167,8 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
   * `distance_mm` (float, default `10.0`, range `0.1`–`200.0`): Travel distance.
   * `direction` (`"up"` | `"down"`, default `"up"`).
   * `delay` (float, default `0.0010`): Step pulse delay.
-  * `acceleration` (bool, default `false`): Trapezoidal acceleration profile.
+  * `acceleration` (bool, default `false`): Speed ramp (constant acceleration).
+  * `end_delay` (float, optional, default `null`, range `0.005`–`0.030`): Step delay in seconds at the end of the deceleration for a slow stop. `null` disables it; ignored when `acceleration` is `false`.
 
 * **Response (`200 OK`)**:
   ```json
@@ -208,7 +209,8 @@ Rotates the turntable platter by a specific angle.
     "clockwise": true,
     "delay": 0.0010,
     "acceleration": true,
-    "ramp_percent": 0.2
+    "ramp_percent": 0.2,
+    "end_delay": 0.015
   }
   ```
   * `angle` (float, default `18.0`, range `0.1`–`360.0`).
@@ -216,6 +218,7 @@ Rotates the turntable platter by a specific angle.
   * `delay` (float, default `0.0010`).
   * `acceleration` (bool, default `true`).
   * `ramp_percent` (float, default `0.2`).
+  * `end_delay` (float, default `0.015`, range `0.005`–`0.030`, `null` = off): Step delay in seconds at the very end of the deceleration. The turntable decelerates down to this slow step rate, so the platter (on a bearing) does not keep rotating after the last step, even with a heavy object. Values outside the range are rejected with `422`. Ignored when `acceleration` is `false`.
 
 * **Response (`200 OK`)**:
   ```json

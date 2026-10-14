@@ -83,7 +83,9 @@ def _orchestrate_pipeline(req: StartRequest):
             z_acceleration=req.mechanical.z_axis.acceleration,
             z_start_delay=req.mechanical.z_axis.start_delay,
             z_ramp_percent=req.mechanical.z_axis.ramp_percent,
-            z_decel_percent=req.mechanical.z_axis.decel_percent
+            z_decel_percent=req.mechanical.z_axis.decel_percent,
+            turntable_end_delay=req.mechanical.turntable.end_delay,
+            z_end_delay=req.mechanical.z_axis.end_delay
         )
         
         # Check if it was cancelled during the scan

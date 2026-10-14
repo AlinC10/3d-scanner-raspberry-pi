@@ -129,7 +129,7 @@ Triggered by `POST /scanner/start`, this method handles the physical 3D capture:
        - Captures stereoscopic photo pair (`capture_photo()`).
        - Enqueues photo paths into `self.upload_queue`.
        - Increments `self.total_photos += len(photo_paths)`.
-       - Rotates turntable by `angle` (using 20% trapezoidal acceleration by default to prevent heavy object slippage).
+       - Rotates turntable by `angle` (using a 20% constant-acceleration speed ramp by default to prevent heavy object slippage, ending in a slow tail of `turntable_end_delay` = `15 ms` per step so the platter has almost no kinetic energy left when it stops).
        - **ToF Verification**: After the rotation, calls `tof.is_object_detected()` (until the object has been seen on this level). If the ToF sensor sees the object at this stop, `object_detected_this_level` is permanently flagged `True` for this ring. See [TOF.md](TOF.md).
        - Pauses for motor vibration settling: the ToF read counts towards it and the loop sleeps whatever remains of `TURNTABLE_SETTLE_S` (`0.2s`), so every stop settles for at least 0.2 s.
      - **Roof Termination Check**: If `object_detected_this_level` is `False` at the end of the 360° ring, it means the carriage has successfully cleared the top of the object. The scan breaks the elevation loop early to save time!
@@ -220,8 +220,11 @@ Moves carriage UP by distance in millimeters. Blocked if top limit switch is act
 #### `move_z_down_distance(distance: float = 100.0, delay: float = 0.002, ...) -> None`
 Moves carriage DOWN by distance in millimeters. Blocked if bottom limit switch is active.
 
-#### `scan(angle: float = 18.0, delay_turntable: float = 0.0010, z_move_mm: float = 100.0, delay_z_motor: float = 0.0010, turntable_acceleration: bool = True, ...) -> None`
+#### `scan(angle: float = 18.0, delay_turntable: float = 0.0010, z_move_mm: float = 100.0, delay_z_motor: float = 0.0010, turntable_acceleration: bool = True, ..., turntable_end_delay: float | None = 0.015, z_end_delay: float | None = None) -> None`
 Executes full physical scanning and parallel image upload sequence with independent acceleration profiles and 0.5s motor power settling delays during level transitions.
+* `turntable_end_delay`: step delay (s) at the end of each turntable deceleration (slow stop), clamped to `[0.005, 0.030]`; `None` disables it. Default `0.015`.
+* `z_end_delay`: same for the Z-axis; `None` (default) disables it.
+* `move_z_up()` / `move_z_down()` and the `move_z_*_distance()` helpers accept `end_delay` as well (default `None`).
 
 #### `generate_livestream(bitrate: int = 4_000_000) -> list[str] | None`
 Generates RTSP stream endpoints using the active camera driver.

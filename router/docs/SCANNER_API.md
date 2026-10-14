@@ -195,7 +195,8 @@ Starts the automated scanning and cloud 3D generation workflow.
       "acceleration": true,
       "ramp_percent": 0.2,
       "decel_percent": null,
-      "start_delay": null
+      "start_delay": null,
+      "end_delay": 0.015
     },
     "z_axis": {
       "distance_mm": 100.0,
@@ -204,7 +205,8 @@ Starts the automated scanning and cloud 3D generation workflow.
       "acceleration": false,
       "ramp_percent": 0.2,
       "decel_percent": null,
-      "start_delay": null
+      "start_delay": null,
+      "end_delay": null
     }
   },
   "cloud": {
@@ -229,11 +231,13 @@ Starts the automated scanning and cloud 3D generation workflow.
 | `turntable.ramp_percent` | `float` | `0.2` | Fraction of total steps for acceleration ramp (`0.0` to `1.0`). |
 | `turntable.decel_percent` | `float \| null` | `null` | Separate deceleration fraction. If `null`, mirrors `ramp_percent`. |
 | `turntable.start_delay` | `float \| null` | `null` | Initial launch delay in seconds. Defaults to `3 * delay` (light objects) or `5x–8x` for heavy items. |
+| `turntable.end_delay` | `float \| null` | `0.015` | Step delay in seconds at the end of each deceleration (slow stop), range `0.005`–`0.030`; `null` disables it. Out-of-range values are rejected (`422`). |
 | `z_axis.delay` | `float` | `0.0010` | Cruise pulse delay in seconds for vertical lead screw elevator. |
 | `z_axis.acceleration` | `bool` | `false` | Disabled by default on Z-axis to prevent lead screw shuddering. |
 | `z_axis.ramp_percent` | `float` | `0.2` | Fraction of steps for acceleration if `z_axis.acceleration` is enabled. |
 | `z_axis.decel_percent` | `float \| null` | `null` | Optional separate deceleration fraction for Z-axis. |
 | `z_axis.start_delay` | `float \| null` | `null` | Starting launch delay for Z-axis if acceleration is enabled. |
+| `z_axis.end_delay` | `float \| null` | `null` | Optional slow-stop step delay for the Z-axis, range `0.005`–`0.030`; `null` (default) disables it. |
 
 ### Response (`202 Accepted` - `StartResponse`)
 ```json

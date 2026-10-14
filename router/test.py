@@ -230,21 +230,23 @@ def test_z_move(req: ZMoveRequest):
     try:
         if req.direction == "up":
             scanner.move_z_up_distance(
-                distance=req.distance_mm, 
+                distance=req.distance_mm,
                 delay=req.delay,
                 acceleration=req.acceleration,
                 start_delay=req.start_delay,
                 ramp_percent=req.ramp_percent,
-                decel_percent=req.decel_percent
+                decel_percent=req.decel_percent,
+                end_delay=req.end_delay
             )
         else:
             scanner.move_z_down_distance(
-                distance=req.distance_mm, 
+                distance=req.distance_mm,
                 delay=req.delay,
                 acceleration=req.acceleration,
                 start_delay=req.start_delay,
                 ramp_percent=req.ramp_percent,
-                decel_percent=req.decel_percent
+                decel_percent=req.decel_percent,
+                end_delay=req.end_delay
             )
 
         return {
@@ -276,7 +278,8 @@ def test_turntable_rotate(req: TurntableRotateRequest):
             acceleration=req.acceleration,
             start_delay=req.start_delay,
             ramp_percent=req.ramp_percent,
-            decel_percent=req.decel_percent
+            decel_percent=req.decel_percent,
+            end_delay=req.end_delay
         )
         return {
             "status": "success",

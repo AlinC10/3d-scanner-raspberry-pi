@@ -1,6 +1,7 @@
 # Plan: Rampa de viteza + oprire lenta (`end_delay`)
 
-> Status: PLAN, nimic implementat. Inlocuieste versiunea veche a acestui fisier (doar profil `sqrt`, fara viteza finala).
+> Status: IMPLEMENTAT (netestat pe hardware). Vezi `PRE_TEST_CHECKLIST.md` pentru pasii de dinainte de testare.
+> Inlocuieste versiunea veche a acestui fisier (doar profil `sqrt`, fara viteza finala).
 
 ## 1. Obiectiv
 
