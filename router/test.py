@@ -141,14 +141,9 @@ def get_motor_status():
     "enabled" = Coil is energized, motor holding torque is ON.
     "disabled" = Coil is off, motor free wheels.
     """
-    def is_enabled(motor):
-        if motor.en_device is None:
-            return True
-        return motor.en_device.value == 0
-
     return {
-        "turntable": "enabled" if is_enabled(scanner.turntable_motor) else "disabled",
-        "z_axis": "enabled" if is_enabled(scanner.z_axis_motor) else "disabled"
+        "turntable": "enabled" if getattr(scanner.turntable_motor, "is_enabled", False) else "disabled",
+        "z_axis": "enabled" if getattr(scanner.z_axis_motor, "is_enabled", False) else "disabled"
     }
 
 @router.post("/motor/enable")
@@ -264,8 +259,6 @@ def test_z_move(req: ZMoveRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Z-axis movement error: {str(e)}")
     finally:
-        scanner.z_axis_motor.stop()
-        time.sleep(0.5)
         scanner.z_axis_motor.disable()
 
 
@@ -293,8 +286,6 @@ def test_turntable_rotate(req: TurntableRotateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Turntable rotation error: {str(e)}")
     finally:
-        scanner.turntable_motor.stop()
-        time.sleep(0.5)
         scanner.turntable_motor.disable()
 
 

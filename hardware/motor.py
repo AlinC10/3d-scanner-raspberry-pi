@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from typing import Optional
 
 from hardware.arduino_bridge import ArduinoBridge, ArduinoCommand, ArduinoStatus
@@ -49,11 +50,17 @@ class Motor:
         self.en_pin = en_pin if en_pin is not None else -1
         self.step_type = step_type
         
+        self._is_enabled = False
         self.bridge = ArduinoBridge.get_instance(port=port)
         
         resp = self.bridge.send_command(f"{ArduinoCommand.CONFIG.value} {self.motor_id} {self.step_pin} {self.dir_pin} {self.en_pin}")
         if resp != str(ArduinoStatus.OK.value):
             raise MotorError(f"Failed to configure motor {self.motor_id} on Arduino: received error status '{resp}'")
+
+    @property
+    def is_enabled(self) -> bool:
+        """Returns True if the motor is currently energized / holding torque."""
+        return self._is_enabled
 
     def handle_driver_fault(self) -> None:
         """
@@ -69,14 +76,26 @@ class Motor:
         resp = self.bridge.send_command(f"{ArduinoCommand.ENABLE.value} {self.motor_id}")
         if resp != str(ArduinoStatus.OK.value):
             log.warning(f"Failed to enable motor {self.motor_id}: {resp}")
+        else:
+            self._is_enabled = True
 
-    def disable(self) -> None:
+    def disable(self, settle_delay: float = 0.5) -> None:
         """
-        Disables the motor driver by instructing the Arduino to set the EN pin HIGH.
+        Disables the motor driver after an optional holding torque settling window.
+        
+        :param settle_delay: Time in seconds to hold rigid magnetic torque before cutting power.
+                             Defaults to 0.5s for normal mechanical stabilization.
+                             Set to 0.0 for immediate shutoff (e.g. emergency stops).
+        :type settle_delay: float
         """
+        if settle_delay > 0 and self._is_enabled:
+            time.sleep(settle_delay)
+
         resp = self.bridge.send_command(f"{ArduinoCommand.DISABLE.value} {self.motor_id}")
         if resp != str(ArduinoStatus.OK.value):
             log.warning(f"Failed to disable motor {self.motor_id}: {resp}")
+        else:
+            self._is_enabled = False
 
     def angle_to_steps_conversion(self, angle: int | float = 18, step_type: Optional[str] = None) -> int:
         """
@@ -333,15 +352,16 @@ class Motor:
         """
         Interrupts a currently running rotate sequence by sending an out-of-band universal stop.
         
-        :param release_torque: Whether to also release holding torque (default: False). Note: the out-of-band STOP command automatically releases torque on the Arduino side.
+        :param release_torque: Whether to also release holding torque (default: False).
         :type release_torque: bool
         """
         self.bridge.send_stop()
+        self._is_enabled = False
         if release_torque:
-            self.disable()
+            self.disable(settle_delay=0.0)
 
     def close(self) -> None:
         """
         Safely disables the motor and cleans up.
         """
-        self.disable()
+        self.disable(settle_delay=0.0)

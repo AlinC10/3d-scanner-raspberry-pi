@@ -100,10 +100,10 @@ class ZMoveRequest(BaseModel):
     delay: Annotated[float, Field(
         ge=0.00005,
         description="Delay in seconds between step pulses for the motor."
-    )] = 0.0010
+    )] = 0.0015
     acceleration: Annotated[bool, Field(
         description="Whether to use trapezoidal acceleration ramping."
-    )] = False
+    )] = True
     ramp_percent: Annotated[float, Field(
         ge=0.0,
         le=1.0,
@@ -117,7 +117,7 @@ class ZMoveRequest(BaseModel):
     start_delay: Annotated[float | None, Field(
         ge=0.00005,
         description="Starting delay in seconds for the ramp."
-    )] = None
+    )] = 0.0040
 
 
 class MechanicalConfig(BaseModel):
