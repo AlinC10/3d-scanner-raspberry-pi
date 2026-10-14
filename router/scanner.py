@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from typing import Optional, Annotated
 import logging
+import threading
 from schemas.scanner import *
 
 import os
@@ -22,15 +23,49 @@ router = APIRouter(
     tags=["Scanner"],
 )
 
-# The scanner is initialized once and kept in memory as a singleton across the FastAPI application lifecycle.
-import os
-MOCK_HARDWARE = os.environ.get("MOCK_HARDWARE") == "1"
+class _LazyScanner:
+    """
+    Process-wide scanner singleton that is built on first use instead of at import time.
 
-if MOCK_HARDWARE:
-    from hardware.scanner_mock import ScannerMock
-    scanner = ScannerMock(xvs=False)
-else:
-    scanner = Scanner(xvs=False) if not MOCK_HARDWARE else Scanner(xvs=False)
+    Building a Scanner opens the Arduino serial port (which resets the board) and claims the GPIO pins, so doing it
+    as an import side effect also happened in tooling, tests and the --reload watcher. The application creates it
+    explicitly in its lifespan startup (`scanner.get()`); attribute access builds it on demand otherwise.
+    The hardware can only be owned by one process: run a single worker.
+    """
+
+    def __init__(self, factory):
+        object.__setattr__(self, "_factory", factory)
+        object.__setattr__(self, "_instance", None)
+        object.__setattr__(self, "_init_lock", threading.Lock())
+
+    @property
+    def initialized(self) -> bool:
+        return object.__getattribute__(self, "_instance") is not None
+
+    def get(self):
+        instance = object.__getattribute__(self, "_instance")
+        if instance is None:
+            with object.__getattribute__(self, "_init_lock"):
+                instance = object.__getattribute__(self, "_instance")
+                if instance is None:
+                    instance = object.__getattribute__(self, "_factory")()
+                    object.__setattr__(self, "_instance", instance)
+        return instance
+
+    def __getattr__(self, name):
+        return getattr(self.get(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self.get(), name, value)
+
+
+# `Scanner` is already the mock class when MOCK_HARDWARE=1 (see the imports above)
+scanner = _LazyScanner(lambda: Scanner(xvs=False))
+
+# A POST /start is accepted while the scanner is still PREPARED (scan() flips the state later, in a background
+# task). This flag closes that window so two quick requests cannot start two pipelines.
+_start_lock = threading.Lock()
+_start_state = {"pending": False}
 
 def _finish_preparation_worker(kwargs: dict):
     scanner.finish_preparation(**kwargs)
@@ -71,23 +106,35 @@ def _orchestrate_pipeline(req: StartRequest):
     """
     try:
         # 1. Mechanical Scan
-        scanner.scan(
-            angle=req.mechanical.turntable.angle,
-            delay_turntable=req.mechanical.turntable.delay,
-            z_move_mm=req.mechanical.z_axis.distance_mm,
-            delay_z_motor=req.mechanical.z_axis.delay,
-            turntable_acceleration=req.mechanical.turntable.acceleration,
-            turntable_start_delay=req.mechanical.turntable.start_delay,
-            turntable_ramp_percent=req.mechanical.turntable.ramp_percent,
-            turntable_decel_percent=req.mechanical.turntable.decel_percent,
-            z_acceleration=req.mechanical.z_axis.acceleration,
-            z_start_delay=req.mechanical.z_axis.start_delay,
-            z_ramp_percent=req.mechanical.z_axis.ramp_percent,
-            z_decel_percent=req.mechanical.z_axis.decel_percent
-        )
+        try:
+            scanner.scan(
+                angle=req.mechanical.turntable.angle,
+                delay_turntable=req.mechanical.turntable.delay,
+                z_move_mm=req.mechanical.z_axis.distance_mm,
+                delay_z_motor=req.mechanical.z_axis.delay,
+                turntable_acceleration=req.mechanical.turntable.acceleration,
+                turntable_start_delay=req.mechanical.turntable.start_delay,
+                turntable_ramp_percent=req.mechanical.turntable.ramp_percent,
+                turntable_decel_percent=req.mechanical.turntable.decel_percent,
+                z_acceleration=req.mechanical.z_axis.acceleration,
+                z_start_delay=req.mechanical.z_axis.start_delay,
+                z_ramp_percent=req.mechanical.z_axis.ramp_percent,
+                z_decel_percent=req.mechanical.z_axis.decel_percent,
+                turntable_end_delay=req.mechanical.turntable.end_delay,
+                z_end_delay=req.mechanical.z_axis.end_delay,
+                finish_state=ScannerState.PROCESSING  # no IDLE gap between the scan and the cloud pipeline
+            )
+        except RuntimeError as e:
+            # scan() refused to start (the scanner is no longer PREPARED, e.g. cancelled in between).
+            # That is not a failure of the running state: do not overwrite it.
+            log.warning("Scan not started: %s", e)
+            return
         
-        # Check if it was cancelled during the scan
-        if scanner.state == ScannerState.CANCELLED:
+        # Check if it was cancelled during the scan (the cancel flag is set before emergency_stop() has time to
+        # publish the CANCELLED state)
+        cancel_event = getattr(scanner, "_cancel_event", None)
+        if scanner.state == ScannerState.CANCELLED or (cancel_event is not None and cancel_event.is_set()):
+            scanner.state = ScannerState.CANCELLED
             log.info("Scan was cancelled, aborting cloud pipeline.")
             return
 
@@ -134,15 +181,22 @@ def _orchestrate_pipeline(req: StartRequest):
         log.error("Pipeline failed: %s", e)
         if scanner.state != ScannerState.CANCELLED:
             scanner.state = ScannerState.ERROR
+    finally:
+        with _start_lock:
+            _start_state["pending"] = False
 
 @router.post("/start", response_model=StartResponse, status_code=202)
 def start_scan(req: StartRequest, background_tasks: BackgroundTasks):
     """
     Delegates the mechanical scan and cloud execution to a background pipeline.
     """
-    if scanner.state != ScannerState.PREPARED:
-        raise HTTPException(status_code=400, detail=f"Cannot start scan from state {scanner.state}. Must be PREPARED.")
-        
+    with _start_lock:
+        if scanner.state != ScannerState.PREPARED:
+            raise HTTPException(status_code=400, detail=f"Cannot start scan from state {scanner.state}. Must be PREPARED.")
+        if _start_state["pending"]:
+            raise HTTPException(status_code=409, detail="A scan start was already accepted and is in progress.")
+        _start_state["pending"] = True
+
     background_tasks.add_task(_orchestrate_pipeline, req)
     return StartResponse(status="accepted", message="Pipeline started.")
 

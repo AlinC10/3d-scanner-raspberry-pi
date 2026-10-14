@@ -76,6 +76,43 @@ $$\text{Steps} = \text{angle\_to\_steps\_conversion}(\theta_{\text{degrees}}, \t
 
 ---
 
+### 3. Speed Ramp & Slow Stop (`end_delay`)
+
+The Arduino generates the step pulses, controlling the **period between steps** (`delay`, speed = `1 / delay`). `rotate()` sends:
+
+| Parameter | Meaning |
+|---|---|
+| `delay` | Cruise step period (seconds). |
+| `start_delay` | Step period at the start of the acceleration ramp (default `3 * delay`). |
+| `ramp_percent` / `decel_percent` | Fraction of the steps used to accelerate / decelerate. |
+| `end_delay` | **Optional.** Step period reached at the last deceleration step, so the move ends slowly. |
+
+```
+speed
+  v_cruise      ┌────────────┐
+               /              \
+  v_start     /                \
+                                 \
+                                  v_end   <- last steps are slow (end_delay)
+              accel   cruise    decel      -> steps
+```
+
+* **Constant acceleration:** the ramps are straight lines in speed over time (`v^2` is linear in the step count). The previous firmware interpolated the *delay* linearly, which gave a hyperbolic speed curve with a very large acceleration at one end of the ramp.
+* **Slow stop:** with `end_delay` the deceleration goes from `1/delay` down to `1/end_delay` instead of `1/start_delay`. Ending at only a few tens of steps per second leaves the turntable (on a bearing) almost no kinetic energy, even with a heavy object.
+* **Range and defaults** (constants in `motor.py`):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `END_DELAY_MIN` | `0.005` s | 200 microsteps/s |
+| `END_DELAY_MAX` | `0.030` s | 33 microsteps/s |
+| `TURNTABLE_END_DELAY_DEFAULT` | `0.015` s | 67 microsteps/s; default for the turntable in `Scanner.scan()` and the API schema |
+
+  `Motor.rotate()` clamps a requested value into `[END_DELAY_MIN, END_DELAY_MAX]` (logging a warning) and never lets it be faster than `delay`. The API schemas reject values outside the range (HTTP 422).
+* **Off by default** on `Motor` and the Z-axis (`end_delay=None`: decelerate down to `start_delay`). It is ignored, with a warning, when `acceleration=False` or when the move has no deceleration steps.
+* **Short moves:** the ramp length is a *fraction of the steps*, so an 18° move (160 steps at 1/16) has only 32 deceleration steps at `decel_percent=0.2`. For heavy objects use a lower cruise speed (e.g. `delay=0.002`) and a larger `decel_percent` (e.g. `0.5`).
+
+---
+
 ## ⚡ Thermal & Coil Power Management
 
 Stepper motors consume full holding current even when stationary, which causes coils and drivers to overheat if left energized while idle. 
@@ -108,12 +145,13 @@ Motor(
 
 ### Core Methods
 
-#### `rotate(clockwise: bool = True, steps: int = 200, delay: float = 0.002, acceleration: bool = True, ramp_percent: float = 0.2, decel_percent: float = None, start_delay: float = None, **kwargs) -> bool`
-Rotates the motor using trapezoidal acceleration profiles.
+#### `rotate(clockwise: bool = True, steps: int = 200, delay: float = 0.002, acceleration: bool = True, ramp_percent: float = 0.2, decel_percent: float = None, start_delay: float = None, end_delay: float = None, **kwargs) -> bool`
+Rotates the motor using a constant-acceleration speed ramp (see *Speed Ramp & Slow Stop*).
 * Converts float `delay` (seconds) into integer `target_us` (microseconds).
 * Supports asymmetric ramping (different `ramp_percent` and `decel_percent`).
+* `end_delay` (optional, seconds): step period at the last deceleration step for a slow stop. Clamped to `[0.005, 0.030]`; `None` keeps the old behaviour. Sent as the optional 8th argument of `ACCEL_ROTATE`.
 * Dispatches `ACCEL_ROTATE` (`0x10`) if ramping is used, otherwise falls back to constant-velocity `ROTATE` (`0x05`).
-* Dynamically calculates a PySerial timeout based on accurate integral step timing.
+* Dynamically calculates a PySerial timeout from the exact duration of each constant-acceleration phase (`t = 2 * steps / (v_a + v_b)`).
 * Returns `True` if completed, or `False` if aborted early by `0xFF`.
 
 #### `stop(release_torque: bool = False) -> None`

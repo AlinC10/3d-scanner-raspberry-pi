@@ -58,6 +58,9 @@ class ArduinoBridge:
         self.baudrate = baudrate
         self.serial: Optional[serial.Serial] = None
         self._configs = []
+        # Incremented on every (re)connection: opening the port resets the Arduino, so every motor driver is
+        # disabled again and any state cached by the callers (Motor.is_enabled) is stale.
+        self.connection_epoch = 0
         
         # We use a two-lock architecture to allow emergency stops to preempt active commands.
         
@@ -136,6 +139,7 @@ class ArduinoBridge:
             if self.serial and self.serial.is_open:
                 self.serial.close()
             self.serial = serial.Serial(target_port, self.baudrate, timeout=3.0)
+            self.connection_epoch += 1
         except serial.SerialException as e:
             log.error(f"[ArduinoBridge] Failed to open port {target_port}: {e}")
             return
@@ -199,13 +203,21 @@ class ArduinoBridge:
                 self.serial.timeout = timeout
                 
             try:
+                # Whatever is still in the input buffer is stale (a late answer of a timed-out command, the boot
+                # banner of an Arduino that reset on its own): drop it, otherwise it would be taken for the answer
+                # to this command and every later one would be off by one.
+                self.serial.reset_input_buffer()
+
                 # Acquire write lock just for the physical bytes transfer
                 with self._write_lock:
                     self.serial.write(clean_cmd.encode("utf-8"))
                     self.serial.flush()
 
                 # Block until the Arduino executes the command and returns its Status Code (e.g., '0' or '4')
-                line = self.serial.readline().decode("utf-8", errors="ignore").strip()
+                line = self._read_status_line()
+                if not line:
+                    log.error(f"[ArduinoBridge] No answer to '{cmd.strip()}' within {timeout}s. Stopping the Arduino to resync.")
+                    self._resync_after_timeout()
                 return line
             except serial.SerialException as e:
                 log.error(f"[ArduinoBridge] Serial connection lost during send_command: {e}. Attempting to reconnect...")
@@ -215,6 +227,35 @@ class ArduinoBridge:
                 # Restore the default timeout for the next command
                 if self.serial and self.serial.is_open:
                     self.serial.timeout = old_timeout
+
+    def _read_status_line(self, max_lines: int = 5) -> str:
+        """
+        Reads the numeric status line of the current transaction. Non-numeric lines (debug output, garbage after a
+        reset) are skipped. Returns '' on timeout.
+        """
+        for _ in range(max_lines):
+            line = self.serial.readline().decode("utf-8", errors="ignore").strip()
+            if not line:
+                return ""
+            if line.isdigit():
+                return line
+            log.warning(f"[ArduinoBridge] Ignoring unexpected line from Arduino: {line!r}")
+        return ""
+
+    def _resync_after_timeout(self) -> None:
+        """
+        After a timeout the Arduino may still be stepping and will answer later. Abort it (0xFF), swallow that
+        late answer and empty the buffer so the next command starts from a clean stream.
+        """
+        try:
+            with self._write_lock:
+                self.serial.write(bytes([ArduinoCommand.EMERGENCY_STOP.value]))
+                self.serial.flush()
+            self.serial.timeout = 0.5
+            self.serial.readline()  # '4' if a move was still running, nothing if the Arduino was idle
+            self.serial.reset_input_buffer()
+        except Exception as e:
+            log.warning(f"[ArduinoBridge] Resync after timeout failed: {e}")
 
     def send_stop(self):
         """

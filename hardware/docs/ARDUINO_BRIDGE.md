@@ -53,6 +53,15 @@ Because the `ROTATE` command is synchronous (the Arduino will not return `0\n` u
 $$ \text{Timeout} = (\text{steps} \times \text{delay\_seconds}) \times 1.5 + 3.0\text{s} $$
 This ensures Python correctly blocks for the duration of the movement without falsely triggering a serial `TimeoutException`.
 
+### Response Resynchronisation
+
+`send_command()` keeps the request/response stream aligned even after failures:
+
+* The input buffer is flushed before every write, so a late reply of an earlier timed-out move (or the `0` boot banner of an Arduino that reset on its own) cannot be taken for the answer to the next command.
+* Only numeric status lines are accepted; anything else is logged and skipped.
+* On a timeout the bridge sends `0xFF` (the move may still be running), swallows the late `4`, flushes the buffer and returns `''`.
+* `connection_epoch` is incremented on every (re)connection. A reconnect resets the Arduino (all drivers disabled), and `Motor.is_enabled` uses the epoch to drop stale "energized" state.
+
 ### Out-of-Band Emergency Stop (`0xFF`)
 If the system is executing a 30-second rotation and an endstop limit switch is struck, Python must abort the rotation instantly. But because Thread A is holding the `_response_lock` waiting for the 30-second move to finish, a normal `STOP` command would be blocked.
 
@@ -77,7 +86,7 @@ The following table maps the Python `ArduinoCommand` Enum values to the exact ph
 | **`4`** | `DISABLE` | `4 <id>\n` | `0\n` | Pulls driver EN pin HIGH (releases torque). |
 | **`5`** | `ROTATE` | `5 <id> <steps> <dir> <us>\n` | `0\n` or `4\n` | Executes physical step pulses (`dir`: 1=CW, 0=CCW). |
 | **`6`** | `STOP` | `6 <id>\n` | `0\n` | In-band software stop for motor `<id>`. |
-| **`16`** (`0x10`) | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel>\n` | `0\n` or `4\n` | Trapezoidal velocity ramping move. |
+| **`16`** (`0x10`) | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel> [<end_us>]\n` | `0\n` or `4\n` | Constant-acceleration speed-ramp move (speed is linear in time). Optional `<end_us>` is the step period of the last deceleration step (slow stop); omitted or `0` decelerates back down to `<start_us>`. |
 | **`255`** (`0xFF`) | `EMERGENCY_STOP` | Raw `0xFF` byte (no `\n`) | `4\n` (from `ROTATE`) | Out-of-band Universal Abort: halts motion instantly in $\le 1\text{ ms}$. |
 
 **Reserved Future Features:**

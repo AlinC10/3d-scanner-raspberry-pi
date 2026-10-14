@@ -4,19 +4,24 @@ This module provides isolated HTTP endpoints to test, calibrate, and verify indi
 
 Interactive OpenAPI docs are accessible at: `http://<pi-ip>:8000/docs#/Hardware%20Diagnostics%20%26%20Tests`
 
+> [!WARNING]
+> **Busy guard**: the endpoints that move or (de)energize the motors (`/test/motor/*`, `/test/turntable/rotate`, `/test/cleanup`) answer `409 Conflict` unless the scanner is `idle`, `completed`, `cancelled` or `error`. During `preparing`, `prepared` and `running` use `POST /scanner/cancel` first. Read-only endpoints (endstops, ToF, status) are always available.
+
 ---
 
 ## Quick Reference Table
 
 | Category | Method | Endpoint | Description |
 |---|---|---|---|
-| **Limit Switches** | `GET` | `/test/endstops` | Read top and bottom endstop electrical states |
-| **Lighting** | `GET` | `/test/lights` | Get lighting relay state |
-| **Lighting** | `POST` | `/test/lights/on` | Turn illumination LEDs ON |
-| **Lighting** | `POST` | `/test/lights/off` | Turn illumination LEDs OFF |
-| **Lighting** | `POST` | `/test/lights/toggle` | Toggle illumination LEDs state |
-| **Homing** | `POST` | `/test/motor/home-bottom` | Move carriage down until bottom limit switch triggers (0.5s settling delay) |
-| **Homing** | `POST` | `/test/motor/move-to-top` | Move carriage up until top limit switch triggers (0.5s settling delay) |
+| **Limit Switches** | `GET` | `/test/endstops` | Read top and bottom endstop states |
+| **Sensors** | `GET` | `/test/tof` | Read the VL53L1X time-of-flight distance (mm) |
+| **Lighting** | `POST` | `/test/lights/enable` | Turn illumination LEDs ON (optional JSON body `{"brightness": 0.0-1.0}`) |
+| **Lighting** | `POST` | `/test/lights/disable` | Turn illumination LEDs OFF |
+| **Motor State** | `GET` | `/test/motor/status` | Torque state (`enabled` / `disabled`) of both steppers |
+| **Motor State** | `POST` | `/test/motor/enable` | Energize the coils (`?target=turntable\|z_axis\|all`) |
+| **Motor State** | `POST` | `/test/motor/disable` | Release the coils (`?target=turntable\|z_axis\|all`) |
+| **Homing** | `POST` | `/test/motor/home-bottom` | Move carriage down until the bottom limit switch triggers (0.5s settling delay) |
+| **Homing** | `POST` | `/test/motor/move-to-top` | Move carriage up until the top limit switch triggers (0.5s settling delay) |
 | **Motor Movement** | `POST` | `/test/motor/z-move` | Move Z-axis by distance in millimeters with 0.5s coil de-energization settling delay |
 | **Motor Movement** | `POST` | `/test/turntable/rotate` | Rotate turntable by degrees with 0.5s coil de-energization settling delay |
 | **Camera & Video** | `POST` | `/test/stream/start` | Launch RTSP live stream and return stream URLs |
@@ -39,14 +44,12 @@ Reads the live electrical status of both physical limit switches.
 * **Response (`200 OK`)**:
   ```json
   {
-    "top_endstop": false,
     "bottom_endstop": true,
-    "status": "triggered"
+    "top_endstop": false
   }
   ```
   * `top_endstop`: `true` if carriage is contacting the top limit switch.
   * `bottom_endstop`: `true` if carriage is contacting the bottom limit switch.
-  * `status`: `"triggered"` if either switch is active; `"clear"` if neither is active.
 
 * **Example `curl`**:
   ```bash
@@ -55,59 +58,67 @@ Reads the live electrical status of both physical limit switches.
 
 ---
 
+### `GET /test/tof`
+Reads the VL53L1X time-of-flight sensor (distance to the subject).
+
+* **Response (`200 OK`)**: `{"status": "success", "distance_mm": 412}`
+* **Error (`500`)**: `ToF Sensor Error: ...` when the sensor cannot be read.
+
+---
+
 ## 2. Illumination System
 
-### `GET /test/lights`
-Returns the current state of the LED lights, including brightness (0.0 to 1.0) and whether they are actively locked by an ongoing 360-degree scan.
+### `POST /test/lights/enable`
+Powers the LED panels ON at the requested brightness (defaults to full brightness when no body is sent).
+
+* **Request Body** (optional): `{"brightness": 0.5}` (`brightness` float, `0.0` to `1.0`).
 * **Response (`200 OK`)**:
   ```json
-  {
-    "is_on": true,
-    "brightness": 0.8,
-    "locked": false
-  }
+  {"status": "success", "state": "enabled", "brightness": 0.5, "message": "Lights enabled."}
   ```
-
-### `POST /test/lights/on`
-Powers the lights ON, automatically applying the previous brightness level (or defaulting to 100% if it was 0).
-* **Response (`200 OK`)**: `{"status": "success", "is_on": true, "brightness": 1.0}`
 * **Error (`409 Conflict`)**: Lights are locked (scan in progress).
 
-### `POST /test/lights/off`
-Instantly drops PWM brightness to 0 and cuts relay power (Zero-Current Switching).
-* **Response (`200 OK`)**: `{"status": "success", "is_on": false}`
-* **Error (`409 Conflict`)**: Lights are locked (scan in progress).
+### `POST /test/lights/disable`
+Turns the LED panels OFF (relay cut, PWM to 0).
 
-### `POST /test/lights/toggle`
-Flips the current lighting state.
-* **Response (`200 OK`)**: `{"status": "success", "is_on": true, "brightness": 1.0}`
-* **Error (`409 Conflict`)**: Lights are locked (scan in progress).
-
-### `POST /test/lights/brightness`
-Dims the LED strips using RP1 hardware PWM.
-* **Request Body**:
-  ```json
-  {
-    "brightness": 0.5
-  }
-  ```
-  * `brightness` (float, range `0.0` to `1.0`): 0 is off, 1.0 is full brightness.
-* **Response (`200 OK`)**: `{"status": "success", "brightness": 0.5, "is_on": true}`
+* **Response (`200 OK`)**: `{"status": "success", "state": "disabled", "message": "Lights disabled."}`
 * **Error (`409 Conflict`)**: Lights are locked (scan in progress).
 
 * **Example `curl`**:
   ```bash
-  curl -X POST http://localhost:8000/test/lights/brightness \
+  curl -X POST http://localhost:8000/test/lights/enable \
        -H "Content-Type: application/json" \
        -d '{"brightness": 0.25}'
   ```
 
 ---
 
-## 3. Motor Homing & Limit Seeking
+## 3. Motor State, Homing & Limit Seeking
+
+### `GET /test/motor/status`
+Returns the electrical holding state of both steppers.
+
+* **Response (`200 OK`)**: `{"turntable": "enabled", "z_axis": "disabled"}`
+  (`enabled` = coils energized and holding torque; `disabled` = free-wheeling). The state is invalidated after an
+  Arduino reconnect, because the board resets with every driver disabled.
+
+### `POST /test/motor/enable` / `POST /test/motor/disable`
+Energizes / releases the coils manually, to verify wiring and check if a motor locks up.
+
+* **Query Parameters**: `target` = `turntable` | `z_axis` | `all` (default `all`).
+* **Response (`200 OK`)**: `{"status": "success", "target": "all", "state": "enabled"}`
+* **Error (`409 Conflict`)**: A prepare/scan owns the rig (see the busy guard above).
+
+---
 
 ### `POST /test/motor/home-bottom`
-Moves the carriage downward in small increments (20 steps at 0.0010s delay) until the bottom limit switch activates. When triggered, the motor automatically disables torque.
+Moves the carriage downward (a single move of up to 50000 steps with an acceleration ramp) until the bottom limit switch
+is active, then releases the torque after the 0.5s settling pause.
+
+* **Query Parameters** (all optional):
+  * `delay` (float, default `0.0015`): Cruise step delay in seconds.
+  * `start_delay` (float, default `0.004`): Starting delay of the ramp.
+  * `ramp_percent` (float, default `0.1`): Fraction of the move used for acceleration.
 
 * **Response (`200 OK`)**:
   ```json
@@ -117,6 +128,8 @@ Moves the carriage downward in small increments (20 steps at 0.0010s delay) unti
     "bottom_endstop": true
   }
   ```
+* **Error (`500`)**: `Homing failed: ...` when the switch was not reached (aborted move, serial error, travel limit).
+* **Error (`409 Conflict`)**: Scanner busy.
 
 * **Example `curl`**:
   ```bash
@@ -126,10 +139,8 @@ Moves the carriage downward in small increments (20 steps at 0.0010s delay) unti
 ---
 
 ### `POST /test/motor/move-to-top`
-Moves the carriage upward until the top limit switch activates.
-
-* **Query Parameters**:
-  * `delay` (optional float, default `0.0010`, min `0.0001`, max `0.01`): Step pulse delay.
+Moves the carriage upward until the top limit switch is active. Same query parameters, errors and settling behaviour as
+`home-bottom`.
 
 * **Response (`200 OK`)**:
   ```json
@@ -142,7 +153,7 @@ Moves the carriage upward until the top limit switch activates.
 
 * **Example `curl`**:
   ```bash
-  curl -X POST "http://localhost:8000/test/motor/move-to-top?delay=0.0010"
+  curl -X POST "http://localhost:8000/test/motor/move-to-top?delay=0.0015"
   ```
 
 ---
@@ -167,7 +178,8 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
   * `distance_mm` (float, default `10.0`, range `0.1`–`200.0`): Travel distance.
   * `direction` (`"up"` | `"down"`, default `"up"`).
   * `delay` (float, default `0.0010`): Step pulse delay.
-  * `acceleration` (bool, default `false`): Trapezoidal acceleration profile.
+  * `acceleration` (bool, default `false`): Speed ramp (constant acceleration).
+  * `end_delay` (float, optional, default `null`, range `0.005`–`0.030`): Step delay in seconds at the end of the deceleration for a slow stop. `null` disables it; ignored when `acceleration` is `false`.
 
 * **Response (`200 OK`)**:
   ```json
@@ -208,7 +220,8 @@ Rotates the turntable platter by a specific angle.
     "clockwise": true,
     "delay": 0.0010,
     "acceleration": true,
-    "ramp_percent": 0.2
+    "ramp_percent": 0.2,
+    "end_delay": 0.015
   }
   ```
   * `angle` (float, default `18.0`, range `0.1`–`360.0`).
@@ -216,6 +229,7 @@ Rotates the turntable platter by a specific angle.
   * `delay` (float, default `0.0010`).
   * `acceleration` (bool, default `true`).
   * `ramp_percent` (float, default `0.2`).
+  * `end_delay` (float, default `0.015`, range `0.005`–`0.030`, `null` = off): Step delay in seconds at the very end of the deceleration. The turntable decelerates down to this slow step rate, so the platter (on a bearing) does not keep rotating after the last step, even with a heavy object. Values outside the range are rejected with `422`. Ignored when `acceleration` is `false`.
 
 * **Response (`200 OK`)**:
   ```json
@@ -445,7 +459,7 @@ When first bringing up or troubleshooting the physical rig:
    - Manually press the bottom switch with your finger -> `bottom_endstop` should flip to `true`.
    - Manually press the top switch -> `top_endstop` should flip to `true`.
 2. **Verify Lighting**:
-   - Call `POST /test/lights/toggle` -> chamber LEDs should turn on.
+   - Call `POST /test/lights/enable` -> chamber LEDs should turn on.
 3. **Verify Turntable**:
    - Call `POST /test/turntable/rotate` with `angle: 18` -> turntable should rotate smoothly 18 degrees and release holding current.
 4. **Verify Z-Axis Homing**:
