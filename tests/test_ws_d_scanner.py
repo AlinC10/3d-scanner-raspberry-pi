@@ -497,14 +497,36 @@ class TestTravelLimit(unittest.TestCase):
             self.s.move_z_to_top()
         self.assertEqual(self.s.z_axis_motor.rotate.call_args.kwargs["steps"], self._budget_mm() * 100)
 
-    def test_acceleration_is_on_by_default_for_homing_and_move_to_top(self):
+    def test_homing_and_move_to_top_run_at_constant_speed_by_default(self):
         for call in (self.s.home_z_axis, self.s.move_z_to_top):
             self.s.z_axis_motor.rotate.reset_mock()
             with self.assertRaises(ScannerError):
                 call()
             kw = self.s.z_axis_motor.rotate.call_args.kwargs
+            self.assertFalse(kw["acceleration"])
+            self.assertIsNone(kw["start_delay"])
+            self.assertEqual(kw["delay"], scanner_module.Z_PREPARE_DELAY_S)
+
+    def test_acceleration_can_be_switched_on_for_homing_and_move_to_top(self):
+        for call in (self.s.home_z_axis, self.s.move_z_to_top):
+            self.s.z_axis_motor.rotate.reset_mock()
+            with self.assertRaises(ScannerError):
+                call(acceleration=True)
+            kw = self.s.z_axis_motor.rotate.call_args.kwargs
             self.assertTrue(kw["acceleration"])
             self.assertEqual(kw["start_delay"], 0.004)
+
+    def test_preparation_climb_of_30_mm_has_no_acceleration(self):
+        self.s.state = ScannerState.PREPARING
+        self.s.down_endstop.is_active = True      # homing succeeds immediately
+        self.s.wait_for_light_stable = lambda **kwargs: True
+        self.s.z_axis_motor.rotate.reset_mock()
+        self.s.finish_preparation()
+        climbs = [c for c in self.s.z_axis_motor.rotate.call_args_list if c.kwargs.get("clockwise") is True]
+        self.assertTrue(climbs)
+        for call in climbs:
+            self.assertFalse(call.kwargs["acceleration"])
+            self.assertEqual(call.kwargs["delay"], scanner_module.Z_PREPARE_DELAY_S)
 
     def test_acceleration_can_be_switched_off_for_homing_and_move_to_top(self):
         for call in (self.s.home_z_axis, self.s.move_z_to_top):

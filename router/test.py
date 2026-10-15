@@ -214,10 +214,10 @@ def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
 
 @router.post("/motor/home-bottom")
 def test_home_bottom(
-    delay: float = Query(0.0015, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Cruise step delay in seconds"),
+    delay: float = Query(0.0010, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Step delay in seconds (constant speed unless acceleration=true)"),
     start_delay: float = Query(0.004, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Starting ramp delay"),
     ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration"),
-    acceleration: bool = Query(True, description="Ramp the speed up from start_delay. false: constant speed at `delay` (start_delay and ramp_percent are ignored)")
+    acceleration: bool = Query(False, description="true: ramp the speed up from start_delay. false (default): constant speed at `delay` (start_delay and ramp_percent are ignored)")
 ):
     """
     Moves the Z-axis carriage DOWN until the bottom (home) limit switch is triggered.
@@ -244,10 +244,10 @@ def test_home_bottom(
 
 @router.post("/motor/move-to-top")
 def test_move_to_top(
-    delay: float = Query(0.0015, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Cruise step delay in seconds"),
+    delay: float = Query(0.0010, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Step delay in seconds (constant speed unless acceleration=true)"),
     start_delay: float = Query(0.004, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Starting ramp delay"),
     ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration"),
-    acceleration: bool = Query(True, description="Ramp the speed up from start_delay. false: constant speed at `delay` (start_delay and ramp_percent are ignored)")
+    acceleration: bool = Query(False, description="true: ramp the speed up from start_delay. false (default): constant speed at `delay` (start_delay and ramp_percent are ignored)")
 ):
     """
     Moves the Z-axis carriage UP until the top limit switch is triggered.
