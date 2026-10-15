@@ -90,6 +90,9 @@ ENDSTOP_POLL_S = 0.005
 # homing / move-to-top may travel past it before giving up. Their sum is the step budget of those two moves.
 Z_TRAVEL_MAX_MM = 475
 Z_HOMING_MARGIN_MM = 15
+# Z moves of the preparation (homing, +30 mm climb, move to top): constant speed, no ramp, at the same step delay as
+# the manual z-move and the scan climb (the profile that runs smoothly on the rig).
+Z_PREPARE_DELAY_S = 0.0010
 
 class ScannerError(Exception):
     pass
@@ -839,7 +842,7 @@ class Scanner:
         steps = self.z_axis_motor.distance_to_step_conversion(distance=distance, step_type=step_type)
         return self.move_z_down(steps=steps, step_type=step_type, **kwargs)
 
-    def home_z_axis(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = True):
+    def home_z_axis(self, delay: float = Z_PREPARE_DELAY_S, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = False):
         """
         The z-axis motor will rotate until it reaches the bottom (home) endstop.
 
@@ -875,7 +878,7 @@ class Scanner:
                 return
             raise ScannerError("Homing failed: the bottom endstop was not reached.")
 
-    def move_z_to_top(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = True):
+    def move_z_to_top(self, delay: float = Z_PREPARE_DELAY_S, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = False):
         """
         The z-axis motor will rotate UP until it reaches the top endstop.
 
@@ -1256,7 +1259,7 @@ class Scanner:
 
             # Energize explicitly: homing ended with disable(), do not rely on the firmware's auto-enable
             self.z_axis_motor.enable()
-            if not self.move_z_up_distance(distance=30.0):
+            if not self.move_z_up_distance(distance=30.0, delay=Z_PREPARE_DELAY_S, acceleration=False):
                 # Never leave the Z driver energized on an abort or a cancel (it is idle now)
                 self.z_axis_motor.disable(settle_delay=0.0)
                 if self._cancel_event.is_set():

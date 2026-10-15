@@ -121,14 +121,14 @@ Energizes / releases the coils manually, to verify wiring and check if a motor l
 ---
 
 ### `POST /test/motor/home-bottom`
-Moves the carriage downward (a single move limited to the Z travel plus a 15 mm margin, 165 mm, with an acceleration ramp)
+Moves the carriage downward (a single move limited to the Z travel plus a 15 mm margin, at constant speed unless `acceleration=true`)
 until the bottom limit switch is active, then releases the torque after the 0.5s settling pause.
 
 * **Query Parameters** (all optional):
-  * `delay` (float, default `0.0015`, range `0.0001`-`0.05`): Cruise step delay in seconds.
+  * `delay` (float, default `0.0010`, range `0.0001`-`0.05`): Step delay in seconds (constant speed unless `acceleration=true`).
   * `start_delay` (float, default `0.004`, range `0.0001`-`0.05`): Starting delay of the ramp.
   * `ramp_percent` (float, default `0.1`, range `0.0`-`1.0`): Fraction of the move used for acceleration.
-  * `acceleration` (bool, default `true`): `false` runs the whole move at the constant `delay` (no ramp, like `z-move`); `start_delay` and `ramp_percent` are then ignored.
+  * `acceleration` (bool, default `false`): `false` runs the whole move at the constant `delay` (no ramp, like `z-move`); `start_delay` and `ramp_percent` are then ignored. `true` ramps the speed up from `start_delay`.
 
 * **Response (`200 OK`)**:
   ```json
