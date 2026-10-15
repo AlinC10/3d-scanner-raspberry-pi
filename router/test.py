@@ -224,7 +224,8 @@ def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
 def test_home_bottom(
     delay: float = Query(0.0015, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Cruise step delay in seconds"),
     start_delay: float = Query(0.004, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Starting ramp delay"),
-    ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration")
+    ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration"),
+    acceleration: bool = Query(True, description="Ramp the speed up from start_delay. false: constant speed at `delay` (start_delay and ramp_percent are ignored)")
 ):
     """
     Moves the Z-axis carriage DOWN until the bottom (home) limit switch is triggered.
@@ -234,7 +235,7 @@ def test_home_bottom(
     try:
         with scanner.motion_guard():
             test_motor_enable(MotorTarget.Z_AXIS)
-            scanner.home_z_axis(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
+            scanner.home_z_axis(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent, acceleration=acceleration)
         return {
             "status": "success",
             "message": "Carriage successfully homed to bottom endstop.",
@@ -253,7 +254,8 @@ def test_home_bottom(
 def test_move_to_top(
     delay: float = Query(0.0015, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Cruise step delay in seconds"),
     start_delay: float = Query(0.004, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Starting ramp delay"),
-    ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration")
+    ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration"),
+    acceleration: bool = Query(True, description="Ramp the speed up from start_delay. false: constant speed at `delay` (start_delay and ramp_percent are ignored)")
 ):
     """
     Moves the Z-axis carriage UP until the top limit switch is triggered.
@@ -263,7 +265,7 @@ def test_move_to_top(
     try:
         with scanner.motion_guard():
             test_motor_enable(MotorTarget.Z_AXIS)
-            scanner.move_z_to_top(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
+            scanner.move_z_to_top(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent, acceleration=acceleration)
         return {
             "status": "success",
             "message": "Carriage successfully reached top endstop.",
