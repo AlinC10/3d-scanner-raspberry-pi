@@ -82,7 +82,7 @@ TURNTABLE_SETTLE_S = 0.2
 ENDSTOP_POLL_S = 0.005
 # Mechanical travel of the Z axis (specification, to be confirmed by measuring the rig) and the extra distance
 # homing / move-to-top may travel past it before giving up. Their sum is the step budget of those two moves.
-Z_TRAVEL_MAX_MM = 150
+Z_TRAVEL_MAX_MM = 475
 Z_HOMING_MARGIN_MM = 15
 
 class ScannerError(Exception):
