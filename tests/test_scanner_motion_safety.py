@@ -438,6 +438,51 @@ class TestFoundBugs(unittest.TestCase):
         self.s._stop_z_once()
         self.s.z_axis_motor.stop.assert_not_called()
 
+    def test_bottom_edge_does_not_stop_a_move_that_goes_up(self):
+        # the +30 mm climb right after homing was aborted by a late / bouncing edge of the switch it was leaving
+        self.s._z_direction = "up"
+        self.s._begin_z_motion()
+        self.s._on_bottom_endstop_hit()
+        self.s.z_axis_motor.stop.assert_not_called()
+        self.s._end_z_motion(None)
+
+    def test_top_edge_does_not_stop_a_move_that_goes_down(self):
+        self.s._z_direction = "down"
+        self.s._begin_z_motion()
+        self.s._on_top_endstop_hit()
+        self.s.z_axis_motor.stop.assert_not_called()
+        self.s._end_z_motion(None)
+
+    def test_edge_of_the_switch_in_the_travel_direction_still_stops(self):
+        for direction, callback in (("up", self.s._on_top_endstop_hit), ("down", self.s._on_bottom_endstop_hit)):
+            self.s.z_axis_motor.stop.reset_mock()
+            self.s._z_direction = direction
+            self.s._begin_z_motion()
+            callback()
+            self.s.z_axis_motor.stop.assert_called_once()
+            self.s._end_z_motion(None)
+
+    def test_direction_is_set_by_the_move_and_cleared_after_it(self):
+        seen = []
+        self.s.z_axis_motor.rotate.side_effect = lambda **kw: seen.append(self.s._z_direction) or True
+        self.s.move_z_up(steps=10)
+        self.s.move_z_down(steps=10)
+        self.assertEqual(seen, ["up", "down"])
+        self.assertIsNone(self.s._z_direction)
+
+    def test_homing_then_climb_survives_a_late_bottom_edge(self):
+        calls = []
+
+        def rotate(**kw):
+            calls.append(self.s._z_direction)
+            if self.s._z_direction == "up":
+                self.s._on_bottom_endstop_hit()     # the stale edge of the homing press arrives during the climb
+            return True
+
+        self.s.z_axis_motor.rotate.side_effect = rotate
+        self.assertTrue(self.s.move_z_up(steps=3000))
+        self.s.z_axis_motor.stop.assert_not_called()
+
     def test_stop_is_still_sent_during_the_move(self):
         self.s._begin_z_motion()
         self.s._stop_z_once()
