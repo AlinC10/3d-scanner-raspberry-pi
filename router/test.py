@@ -52,14 +52,6 @@ class MotorTarget(str, Enum):
 
 from schemas.scanner import ZMoveRequest, TurntableRotateRequest
 
-class StreamTestRequest(BaseModel):
-    bitrate: Annotated[int, Field(
-        ge=500_000,
-        le=10_000_000,
-        description="RTSP stream bitrate in bps (e.g. 2000000 = 2 Mbps)."
-    )] = 4_000_000
-
-
 class StreamActiveRequest(BaseModel):
     camera_id: Annotated[int, Field(
         ge=1,
@@ -377,10 +369,13 @@ def test_turntable_rotate(req: TurntableRotateRequest):
 # ── 6. Livestream & Camera Testing ───────────────────────────────────────────
 
 @router.post("/stream/start")
-def test_stream_start(req: StreamTestRequest = StreamTestRequest()):
+def test_stream_start():
     """
-    Initializes dual cameras and starts the H.264 RTSP livestream.
-    Returns the RTSP stream URLs.
+    Initializes the dual cameras and the lights and starts the MJPEG live preview.
+    Returns the preview URLs (`/test/stream/mjpeg?camera=1|2`), which can be used as `<img src>`.
+
+    A pure hardware test: it does not touch Cloudflare R2, the ToF sensor or the disk-space check that
+    `POST /scanner/prepare` runs first.
     """
     try:
         if scanner.is_streaming and scanner.stream_urls:
@@ -390,7 +385,7 @@ def test_stream_start(req: StreamTestRequest = StreamTestRequest()):
                 "is_streaming": True
             }
 
-        urls = scanner.setup_and_stream(enable_stream=True, bitrate=req.bitrate)
+        urls = scanner.setup_and_stream(enable_stream=True, preflight=False)
         return {
             "status": "success",
             "stream_urls": urls,
@@ -403,7 +398,7 @@ def test_stream_start(req: StreamTestRequest = StreamTestRequest()):
 @router.post("/stream/stop")
 def test_stream_stop():
     """
-    Stops the active RTSP live stream and closes the camera hardware locks.
+    Stops the live preview and closes the cameras.
     """
     try:
         scanner.stop_stream()
@@ -561,7 +556,7 @@ def test_camera_snap():
     """
     try:
         if scanner.dual_cameras is None:
-            scanner.setup_and_stream(enable_stream=False)
+            scanner.setup_and_stream(enable_stream=False, preflight=False)
 
         photo_paths = scanner.dual_cameras.capture_photo()
         return {

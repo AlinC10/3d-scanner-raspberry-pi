@@ -12,6 +12,10 @@ from hardware.camera.config import (
     DEFAULT_PHOTO_RESOLUTION,
     DEFAULT_VIDEO_RESOLUTION,
     DEFAULT_PREVIEW_RESOLUTION,
+    AF_STEP,
+    AF_ROI,
+    VCM_MIN_POS,
+    VCM_MAX_POS,
 )
 
 try:
@@ -163,6 +167,11 @@ class DualCameraRPISync(BaseDualCamera):
         self._latest = [-1, -1]
         self._drops = [0, 0]
         self._ts_hist: List[OrderedDict] = [OrderedDict(), OrderedDict()]
+
+        # Autofocus sweep: while a camera's flag is set the grab worker keeps a copy of its newest lores frame here
+        self._af_active = [False, False]
+        self._af_frame: List[Optional[Tuple[int, Any]]] = [None, None]  # (seq, lores yuv array)
+        self.autofocus_positions: Optional[List[int]] = None  # result of the last sweep
 
         self._lores_slots: List[Optional[Tuple[int, int, int, Any]]] = [None, None]
         self._lores_slot: Optional[Tuple[int, int, int, Any]] = None  # (cam_idx, seq, ts, yuv_array)
@@ -416,7 +425,8 @@ class DualCameraRPISync(BaseDualCamera):
                 with self._spectator_lock:
                     has_spec = self._spectators[cam_idx] > 0
                     fallback = (not any(self._spectators)) and (cam_idx == self._active_idx)
-                if has_spec or fallback:
+                need_af = self._af_active[cam_idx]
+                if has_spec or fallback or need_af:
                     lores = req.make_array("lores").copy()
 
                 # On-demand Still Capture Check
@@ -460,6 +470,8 @@ class DualCameraRPISync(BaseDualCamera):
                 if lores is not None:
                     self._lores_slots[cam_idx] = (cam_idx, seq, ts, lores)
                     self._lores_slot = (cam_idx, seq, ts, lores)
+                    if self._af_active[cam_idx]:
+                        self._af_frame[cam_idx] = (seq, lores)
 
                 if still is not None and self._still[cam_idx] is None:
                     self._still[cam_idx] = (seq, ts, still, still_meta)
@@ -507,6 +519,11 @@ class DualCameraRPISync(BaseDualCamera):
                 try:
                     if OPENCV_AVAILABLE:
                         bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+                        # The ISP pads the rows to the buffer stride: drop the padding columns (no-op otherwise)
+                        shape = getattr(bgr, "shape", None)
+                        if isinstance(shape, tuple) and len(shape) >= 2 and isinstance(shape[1], int) \
+                                and shape[1] > self.stream_size[0]:
+                            bgr = bgr[:, : self.stream_size[0]]
                         res = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self._stream_quality])
                         if isinstance(res, (tuple, list)) and len(res) == 2:
                             ok, jpg = res
@@ -608,6 +625,9 @@ class DualCameraRPISync(BaseDualCamera):
             "quality": self.quality,
             "stream_quality": self._stream_quality,
             "spectators": specs,
+            # What each sensor is really using right now (a black picture shows up here as a tiny exposure_time)
+            "cam1_controls": _summarize_metadata(getattr(self.cam1, "_last_metadata", None)),
+            "cam2_controls": _summarize_metadata(getattr(self.cam2, "_last_metadata", None)),
         }
 
     # ── Abstract Contract Implementation ───────────────────────
@@ -631,9 +651,15 @@ class DualCameraRPISync(BaseDualCamera):
         self._start_pipeline()
 
         kw1, kw2 = self._split_camera_kwargs(kwargs)
-        if "focus" in kwargs and kwargs["focus"] is not None:
-            self.focus_set(kwargs["focus"])
+        focus_arg = kwargs.get("focus")
+        auto_focus = isinstance(focus_arg, str)
+        if auto_focus and focus_arg.strip().lower() != "auto":
+            raise ValueError(f"focus must be an integer position, a pair of them or 'auto' (got {focus_arg!r})")
+        if focus_arg is not None and not auto_focus:
+            self.focus_set(focus_arg)
         else:
+            # focus="auto" also starts from the saved position; the sweep itself runs below, once the cameras are
+            # SyncReady and only in the in-position call (lock_auto): that is where the object is lit and in view.
             # No explicit focus: put the lenses back to the saved position. After a
             # reboot/camera restart the VCM is at 0, so the write is forced (CAM-2).
             failed_focus = []
@@ -669,6 +695,17 @@ class DualCameraRPISync(BaseDualCamera):
         else:
             log.info("DualCameraRPISync: Both cameras reported SyncReady!")
 
+        autofocus_done = False
+        if auto_focus and lock_auto:
+            if not (ready1 and ready2):
+                raise RuntimeError("Autofocus needs both cameras SyncReady; they did not align in time.")
+            # The sweep leaves every lens on its sharpest position and nothing moves it afterwards: that is the lock
+            self.focus_sweep_autofocus(
+                step=int(kwargs.get("autofocus_step") or AF_STEP),
+                roi=tuple(kwargs.get("autofocus_roi") or AF_ROI),
+            )
+            autofocus_done = True
+
         locks: List[Optional[dict]] = [None, None]
         if lock_auto:
             if ready1 and ready2:
@@ -689,6 +726,7 @@ class DualCameraRPISync(BaseDualCamera):
                 "stream_quality": self.stream_quality,
                 "fps": self.fps,
                 "focus": getattr(getattr(cam, "focuser", None), "position", None),
+                "autofocus": autofocus_done,
                 "rotation": getattr(cam, "rotation", 0),
                 "locked": lock is not None and all(
                     lock.get(k) is not None for k in ("ExposureTime", "AnalogueGain", "ColourGains")
@@ -696,12 +734,89 @@ class DualCameraRPISync(BaseDualCamera):
                 "exposure_time": lock.get("ExposureTime") if lock else None,
                 "analogue_gain": lock.get("AnalogueGain") if lock else None,
                 "colour_gains": [float(g) for g in gains] if gains is not None else None,
+                # The values the sensor reports right now (after the controls above were applied)
+                "current": _summarize_metadata(getattr(cam, "_last_metadata", None)),
             }
 
         cam1_info = _info(0, self.cam1, ready1)
         cam2_info = _info(1, self.cam2, ready2)
         log.info("DualCameraRPISync: Prepared camera settings: cam1=%s, cam2=%s", cam1_info, cam2_info)
         return [cam1_info, cam2_info]
+
+    def _wait_af_frame(self, cam_idx: int, min_seq: int, timeout: float = 3.0) -> Optional[Any]:
+        """The newest lores frame of a camera captured after `min_seq` (None on timeout or when closing)."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                item = self._af_frame[cam_idx]
+                if item is not None and item[0] >= min_seq:
+                    return item[1]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._running or self._closing:
+                    return None
+                self._cond.wait(min(remaining, 0.2))
+
+    def _sweep(self, positions: List[List[int]], roi: tuple) -> List[Dict[int, float]]:
+        """Moves each lens through its own list of positions (same length) and scores a fresh frame at each stop."""
+        scores: List[Dict[int, float]] = [{}, {}]
+        for i in range(len(positions[0])):
+            if not self._running or self._closing:
+                raise RuntimeError("Autofocus aborted: the cameras are being closed.")
+            moves = [
+                self._executor.submit(cam.focuser.set_position, positions[c][i], True)
+                for c, cam in enumerate(self.cameras)
+            ]
+            for m in moves:
+                m.result()
+            for c in range(2):
+                # The frame in flight while the lens moved is not valid: wait for one that starts afterwards
+                frame = self._wait_af_frame(c, self._latest[c] + 2)
+                if frame is None:
+                    raise RuntimeError(f"Autofocus: no fresh frame from camera {c + 1} at position {positions[c][i]}.")
+                scores[c][positions[c][i]] = ArducamIMX477._sharpness(frame, roi)
+        return scores
+
+    def focus_sweep_autofocus(self, step: int = AF_STEP, roi: tuple = AF_ROI) -> List[int]:
+        """
+        Software autofocus over the RUNNING pipeline: both lenses sweep the VCM range (coarse step, then a fine pass
+        around each best position), scoring the Laplacian sharpness of the ROI in the lores frames the grab workers
+        already deliver (the cameras cannot be read twice). Each lens is left on its sharpest position, which is also
+        saved, so the focus found stays locked for the whole scan.
+
+        :raises RuntimeError: if OpenCV or the stream is not available, no frame arrives, or the cameras close.
+        """
+        if not OPENCV_AVAILABLE:
+            raise RuntimeError("Autofocus needs OpenCV (python3-opencv).")
+        if not (self._running and self._is_streaming):
+            raise RuntimeError("Autofocus needs the cameras to be streaming (call prepare_scan first).")
+        step = max(1, int(step))
+        coarse = list(range(VCM_MIN_POS, VCM_MAX_POS + 1, step))
+        log.info("DualCameraRPISync: Autofocus sweep over %d positions (step %d)...", len(coarse), step)
+
+        self._af_frame = [None, None]
+        self._af_active = [True, True]
+        try:
+            first = self._sweep([coarse, coarse], roi)
+            best = [max(s, key=s.get) for s in first]
+
+            fine_step = max(1, step // 5)
+            offsets = list(range(-step, step + 1, fine_step))
+            fine = [
+                [min(max(b + off, VCM_MIN_POS), VCM_MAX_POS) for off in offsets]
+                for b in best
+            ]
+            second = self._sweep(fine, roi)
+            best = [max(s, key=s.get) for s in second]
+
+            for cam, position in zip(self.cameras, best):
+                cam.focuser.set_position(position, True)
+        finally:
+            self._af_active = [False, False]
+            self._af_frame = [None, None]
+
+        self.autofocus_positions = list(best)
+        log.info("DualCameraRPISync: Autofocus done, locked positions: cam1=%d cam2=%d", best[0], best[1])
+        return list(best)
 
     def _lock_auto_exposure(self, runtime_controls: dict, settle_time: Optional[float]) -> List[Optional[dict]]:
         """

@@ -35,16 +35,16 @@ Complete image capture and optical parameter block.
 * `slave_id`: `Literal[0, 1]` (default: `1`) — Camera ID for the slave sensor.
 * `quality`: `int` (default: `95`) — Enforced `10 <= quality <= 100` (JPEG compression quality).
 * `photo_resolution`: `tuple[int, int]` (default: `(4056, 3040)`) — Full 12MP sensor capture size.
-* `video_resolution`: `tuple[int, int]` (default: `(1920, 1080)`) — Stream encoding size.
-* `preview_resolution`: `tuple[int, int]` (default: `(1280, 720)`) — Live preview stream resolution.
-* `rotation`: `Literal[0, 90, 180, 270]` or `tuple` (default: `0`).
-* `focus`: `int | str | tuple | None` — VCM focus position (`0`–`1023`), `"auto"` for sweep, or independent tuple `(300, 450)`.
+* `preview_resolution`: `tuple[int, int]` (default: `(960, 720)`) — size of the live MJPEG preview (even values, `160x120` up to `photo_resolution`).
+* `rotation`: `Literal[0, 90, 180, 270]` or a `(cam1, cam2)` pair (default: `0`) — rotation of the saved photos (not of the live preview).
+* `focus`: `int | "auto" | tuple | None` — VCM focus position (`0`–`1023`) or independent pair `(300, 450)`; `null` restores the saved position; `"auto"` sweeps in the in-position recalibration and keeps the best position locked for the scan.
 * `settle_time`: `float` (default: `2.0`s) — Time to allow sensor to meter scene before locking.
-* `exposure_time`: `int | None` — Manual exposure in microseconds.
-* `analogue_gain`: `float | None` — Manual analog sensor gain.
-* `colour_gains`: `tuple[float, float] | None` — Manual red/blue gains.
+* `exposure_time`: `int | None` (`> 0`) — Manual exposure in microseconds. `0` is rejected (it gave black photos).
+* `analogue_gain`: `float | None` (`1.0`–`16.0`) — Manual analog sensor gain.
+* `colour_gains`: `tuple[float, float] | None` (each `> 0`) — Manual red/blue gains; `[null, null]` means not set.
 * `awb_mode`: `str | None` (default: `"auto"`).
-* `brightness` / `contrast` / `saturation` / `sharpness`: `float | None` (normalized values).
+* `brightness` (`-1`–`1`) / `contrast` (`> 0`, `1.0` neutral) / `saturation` (`>= 0`) / `sharpness` (`>= 0`): `float | None`.
+* Removed (nothing used them; still tolerated if a client sends them): `show_preview`, `keep_running`, `autofocus_step`, `autofocus_roi`, `video_resolution`.
 
 #### `CloudConfig`
 Controls the optional remote Meshroom photogrammetry on RunPod GPU workers (`extra="forbid"`).
@@ -60,8 +60,7 @@ Controls the optional remote Meshroom photogrammetry on RunPod GPU workers (`ext
 
 #### `PrepareRequest`
 Payload for `POST /scanner/prepare`.
-* `enable_stream`: `bool` (default: `true`) — Whether to boot RTSP encoder and return stream links.
-* `bitrate`: `int` (default: `2000000`) — Stream bitrate in bps (`500,000 <= bitrate <= 10,000,000`).
+* `enable_stream`: `bool` (default: `true`) — Whether to start the MJPEG live preview and return its URLs. (There is no `bitrate`: the preview is MJPEG, not H.264.)
 * `illumination_brightness`: `float` (default: `1.0`) — LED brightness, enforced `0.0 < b <= 1.0` (`0` is refused: the scanner cannot scan in the dark).
 * `camera_config`: `DualCameraConfig` — Nested optical configuration block.
 
@@ -81,7 +80,7 @@ Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in th
   "status": "accepted",
   "message": "Live stream started. Rig homing and camera tuning in progress.",
   "state": "preparing",
-  "stream_urls": ["rtsp://<ip>:8554/cam0", "rtsp://<ip>:8554/cam1"]
+  "stream_urls": ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"]
 }
 ```
 
@@ -90,7 +89,7 @@ Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in th
 {
   "state": "running",
   "total_photos": 40,
-  "stream_urls": ["rtsp://<ip>:8554/cam0", "rtsp://<ip>:8554/cam1"],
+  "stream_urls": ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"],
   "phase": "scanning",
   "phase_message": "Ring 2: capturing",
   "level": 2,

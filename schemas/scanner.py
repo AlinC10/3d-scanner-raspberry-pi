@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Annotated, Literal
-from hardware.camera.config import AF_ROI, AF_STEP, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_VIDEO_RESOLUTION, DEFAULT_PHOTO_RESOLUTION, DEFAULT_QUALITY
+from hardware.camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY
 from hardware.motor import (
     END_DELAY_MIN, END_DELAY_MAX, TURNTABLE_END_DELAY_DEFAULT,
     MotorError, angle_to_steps, distance_to_steps, TURNTABLE_STEP_TYPE, Z_STEP_TYPE,
@@ -12,57 +12,83 @@ Z_DISTANCE_MAX_MM = 150.0
 
 
 class DualCameraConfig(BaseModel):
+    """
+    Camera settings of `POST /scanner/prepare` (all of them are used by the dual rpi.sync camera driver).
+
+    Unknown keys are tolerated and ignored, so a client that still sends a removed key (`show_preview`,
+    `keep_running`, `autofocus_*`, `video_resolution`, `preview_resolution`) keeps working.
+    """
     master_id: Annotated[Literal[0, 1], Field(description="Camera ID for the master camera.")] = 0
     slave_id: Annotated[Literal[0, 1], Field(description="Camera ID for the slave camera.")] = 1
 
     quality: Annotated[int, Field(ge=10, le=100, description="JPEG quality for captured photos.")] = DEFAULT_QUALITY
     photo_resolution: Annotated[tuple[int, int], Field(description="Resolution for still captures (W, H).")] = DEFAULT_PHOTO_RESOLUTION
-    video_resolution: Annotated[tuple[int, int], Field(description="Resolution for video streaming (W, H).")] = DEFAULT_VIDEO_RESOLUTION
-    preview_resolution: Annotated[tuple[int, int], Field(description="Resolution for the live preview (W, H).")] = DEFAULT_PREVIEW_RESOLUTION
+    preview_resolution: Annotated[tuple[int, int], Field(description=(
+        "Resolution (W, H) of the live MJPEG preview; both values even, 160x120 up to the photo resolution. "
+        "A larger preview costs CPU on the Pi."
+    ))] = DEFAULT_PREVIEW_RESOLUTION
 
     rotation: Annotated[
         Literal[0, 90, 180, 270] | tuple[Literal[0, 90, 180, 270], Literal[0, 90, 180, 270]] | list[Literal[0, 90, 180, 270]] | None,
-        Field(description="Rotation degrees for the cameras.")
+        Field(description=(
+            "Rotation in degrees of the saved photos: one value for both cameras or a (cam1, cam2) pair. "
+            "The live preview is not rotated."
+        ))
     ] = 0
 
-    focus: Annotated[int | str | tuple[int, int] | list[int] | None, Field(description="Focus position, or tuple/list for dual independent focus.")] = None
+    focus: Annotated[int | Literal["auto"] | tuple[int, int] | list[int] | None, Field(
+        description=(
+            "Focus position (0-1023) of both lenses, or a (cam1, cam2) pair. null keeps the saved position. "
+            "\"auto\" runs a sharpness sweep in front of the lit object (in the recalibration step of the "
+            "preparation) and keeps the best position of each lens locked for the scan."
+        )
+    )] = None
 
-    show_preview: Annotated[bool, Field(description="Whether to show the native camera preview window.")] = False
-
-    @field_validator("focus")
-    @classmethod
-    def _focus_must_be_numeric(cls, v):
-        # 'auto' is not implemented by the camera driver (it used to end in a 500 after the lights were on)
-        if isinstance(v, str):
-            raise ValueError("focus must be an integer position (0-1023) or a pair of them; 'auto' is not supported")
-        return v
     settle_time: Annotated[float, Field(ge=0.0, description="Time in seconds to wait for auto-exposure/auto-white-balance to settle.")] = 2.0
-    
-    exposure_time: Annotated[int | None, Field(description="Manual exposure time in microseconds.")] = None
-    analogue_gain: Annotated[float | None, Field(description="Manual analogue gain.")] = None
-    colour_gains: Annotated[tuple[float, float] | None, Field(description="Manual AWB gains (red, blue).")] = None
+
+    # Manual controls: null (or omitted) leaves the control to the camera. 0 is never a valid exposure or gain
+    # (it used to produce completely black photos), so it is rejected instead of being sent to the sensor.
+    exposure_time: Annotated[int | None, Field(gt=0, description="Manual exposure time in microseconds (> 0). Disables auto-exposure.")] = None
+    analogue_gain: Annotated[float | None, Field(ge=1.0, le=16.0, description="Manual analogue gain (1.0-16.0).")] = None
+    colour_gains: Annotated[
+        tuple[Annotated[float, Field(gt=0.0, le=32.0)], Annotated[float, Field(gt=0.0, le=32.0)]] | None,
+        Field(description="Manual AWB gains (red, blue), each > 0. Disables auto white balance.")
+    ] = None
     awb_mode: Annotated[str | None, Field(description="Auto white balance mode.")] = "auto"
-    
+
     brightness: Annotated[float | None, Field(ge=-1.0, le=1.0, description="Brightness adjustment.")] = None
-    contrast: Annotated[float | None, Field(description="Contrast adjustment.")] = None
-    saturation: Annotated[float | None, Field(description="Saturation adjustment.")] = None
-    sharpness: Annotated[float | None, Field(description="Sharpness adjustment.")] = None
-    
-    autofocus_step: Annotated[int, Field(description="Step size for contrast-based autofocus routines.")] = AF_STEP
-    autofocus_roi: Annotated[tuple[float, float, float, float], Field(description="Region of interest for autofocus (x, y, w, h).")] = AF_ROI
-    keep_running: Annotated[bool, Field(description="Keep the camera event loop running. (Required True for streams).")] = False
+    contrast: Annotated[float | None, Field(gt=0.0, le=32.0, description="Contrast (> 0, 1.0 = neutral). 0 would flatten the image.")] = None
+    saturation: Annotated[float | None, Field(ge=0.0, le=32.0, description="Saturation (0 = monochrome, 1.0 = neutral).")] = None
+    sharpness: Annotated[float | None, Field(ge=0.0, le=16.0, description="Sharpness (0 = off, 1.0 = neutral).")] = None
+
+    @field_validator("preview_resolution")
+    @classmethod
+    def _preview_size_is_sane(cls, v):
+        width, height = v
+        if width % 2 or height % 2 or not (160 <= width <= 4056) or not (120 <= height <= 3040):
+            raise ValueError("preview_resolution must be even numbers between 160x120 and 4056x3040")
+        return v
+
+    @model_validator(mode="after")
+    def _preview_not_larger_than_photo(self):
+        if self.preview_resolution[0] > self.photo_resolution[0] or self.preview_resolution[1] > self.photo_resolution[1]:
+            raise ValueError("preview_resolution cannot be larger than photo_resolution")
+        return self
+
+    @field_validator("colour_gains", "focus", mode="before")
+    @classmethod
+    def _all_null_pair_means_unset(cls, v):
+        # Some clients send an empty pair as [null, null]; that means "not set", like null itself.
+        # A half-filled pair ([1.5, null]) is still rejected by the type check.
+        if isinstance(v, (list, tuple)) and len(v) > 0 and all(item is None for item in v):
+            return None
+        return v
 
 
 class PrepareRequest(BaseModel):
     enable_stream: Annotated[bool, Field(
-        description="Whether to generate and return a livestream URL during preparation."
+        description="Whether to start the MJPEG live preview during preparation and return its URLs."
     )] = True
-    bitrate: Annotated[int, Field(
-        ge=500_000,
-        le=10_000_000,
-        description="The bitrate for the camera livestream in bps (e.g., 2000000 for 2 Mbps)."
-    )] = 2_000_000
-    
     illumination_brightness: Annotated[float, Field(
         gt=0.0,
         le=1.0,

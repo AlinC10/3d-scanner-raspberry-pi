@@ -91,14 +91,14 @@ To deliver an immediate live video feed to the frontend while accommodating 15â€
      - `"staggered"`: Instantiates `DualCamera` (software multi-threading with 0.15s dispatch stagger).
   4. Calls `dual_cameras.prepare_scan(..., keep_running=True)` to initialize the sensor pipeline (AE/AWB are **not** locked yet). The cancel flag is re-checked after the camera construction, after `prepare_scan` and after the stream start: a cancel that landed meanwhile closes the new cameras, switches the lights off and returns `None`.
   5. Boots live streaming:
-     - Generates RTSP stream endpoints via `generate_livestream(bitrate)` and stores URLs in `self.stream_urls`.
+     - Starts the MJPEG preview via `generate_livestream()` and stores the URLs in `self.stream_urls`. Its size is `preview_resolution` (passed to the sync driver as `stream_size`).
      - Powers native browser-friendly MJPEG streaming via `/scanner/stream/mjpeg` with zero idle CPU overhead.
   6. **Returns `stream_urls` immediately** to the caller.
 
 ### Phase 2: Asynchronous Homing & Auto-Tuning (`finish_preparation`)
 * **Execution**: Asynchronous background task (via `FastAPI.BackgroundTasks`).
 * **Actions**:
-  1. Safely strips out initialization kwargs (`master_id`, `slave_id`, `video_resolution`) to prevent downstream signature errors.
+  1. Safely strips out initialization kwargs (`master_id`, `slave_id`, `video_resolution`, `rotation`) to prevent downstream signature errors.
   2. Checks for cancellation (`_cancel_event`) **before the first command**, then moves the carriage down to the bottom endstop (`home_z_axis()`, at most `Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM` = 165 mm = 16500 steps). Incorporates a **0.5-second settling pause** before de-energizing the Z-axis coil (`disable()`); the pause is a mechanical settle, not a verified electrical protection.
   3. Checks for cancellation: `if self._cancel_event.is_set(): return`.
   4. Energizes Z explicitly (`z_axis_motor.enable()`, no reliance on the firmware's auto-enable) and raises the carriage by **+30.0 mm** to rest directly in front of the illuminated object, then releases the driver again.
@@ -107,7 +107,7 @@ To deliver an immediate live video feed to the frontend while accommodating 15â€
   7. **Locks the brightness API** (`self.lights.lock_brightness()`) so operators cannot accidentally dim the lights mid-scan via `/lights/brightness` or `/lights/toggle`.
   8. Powers on the illumination if not already on.
   9. Executes a **thermal stabilization loop** (`wait_for_light_stable()`) that monitors the optical drift of libcamera's auto-exposure metrics (`ExposureTime * AnalogueGain`). It waits for the LED strips to thermally plateau so exposure levels don't drift mid-scan.
-  10. **Re-calls `dual_cameras.prepare_scan(**kwargs, keep_running=True, lock_auto=True)`**: Because `picam2.started` is already `True`, stream reconfiguration is bypassed. The cameras settle auto-exposure and auto-white-balance on the fully warmed-up object and the driver locks them (and copies the values to camera 2). `lock_auto` is passed only in this call, and only to drivers that accept it (`DualCameraRPISync`); a driver that rejects the keyword falls back to an unlocked recalibration with a warning.
+  10. **Re-calls `dual_cameras.prepare_scan(**kwargs, keep_running=True, lock_auto=True)`**: Because `picam2.started` is already `True`, stream reconfiguration is bypassed. With `focus="auto"` the sync driver first runs its autofocus sweep here (in front of the lit object) and leaves each lens on its sharpest position; then the cameras settle auto-exposure and auto-white-balance on the fully warmed-up object and the driver locks them (and copies the values to camera 2). `lock_auto` is passed only in this call, and only to drivers that accept it (`DualCameraRPISync`); a driver that rejects the keyword falls back to an unlocked recalibration with a warning.
   11. Transitions state:
      ```python
      with self._lock:
@@ -171,11 +171,11 @@ Slow Wi-Fi or transient socket errors must neither stall the scanner nor lose im
 
 1. **One worker, no head-of-line blocking**: a file that fails waits for its backoff *without* holding the files behind it. After 8 failed attempts it is parked (not dropped) and retried every 60 s; a later success clears it. A missing or 0-byte file fails immediately and permanently (no retry). Each attempt is `r2.upload_file(path, object_name=key)` (never raises, `False` on failure).
 2. **Bookkeeping**: `_pending` (still owed), `_uploaded`, `_upload_failed` (a `set` of failed or parked paths; the boolean view is the `upload_failed` property). A worker of an older scan cannot touch the new scan's sets (generation counter).
-3. **Cloud key**: `_cloud_key(path)` = `"rig/" + path relative to input_images` (e.g. `rig/0/lvl_1_shot_0.jpg`), the layout the download code expects.
+3. **Cloud key**: `_cloud_key(path)` = `"rig/" + path relative to the photo root` (e.g. `rig/0/lvl_1_shot_0.jpg`), the layout the download code expects. The photo root is `input_images/rig/` (`INPUT_IMAGES_DIR`), so the local tree has the same `rig/<camera>/` layout Meshroom expects; only that folder is wiped at the start of a scan.
 4. **Drain deadline**: starts when the physical scan ends and restarts at every successful upload, so a slow but progressing uplink is never cut off while a dead one ends after 30 minutes. It replaces the former 45 s stall watchdog.
 5. **Verification** is authoritative (`r2.verify_keys`); the counters never decide on their own.
 
-### Manifest (`input_images/manifest.json`)
+### Manifest (`input_images/rig/manifest.json`)
 Written atomically (temp file + `os.replace`) after every photo pair and again after verification:
 ```json
 {"scan_id": "20260101T120000-ab12cd", "started_at": "2026-01-01T12:00:00+00:00",
@@ -256,8 +256,8 @@ Raised by `scan()` when photos are missing from the bucket after the drain; `.mi
 
 ### Lifecycle & Motion
 
-#### `setup_and_stream(enable_stream: bool = True, bitrate: int = 4_000_000, camera_mode: Optional[str] = None, **kwargs) -> list[str] | None`
-Runs the preflight, closes stale cameras, starts camera sensors using the resolved camera driver (`DualCameraRPISync`, `DualCameraXVS`, or `DualCamera`), boots the stream and returns stream URLs (`None` when a cancel landed meanwhile).
+#### `setup_and_stream(enable_stream: bool = True, camera_mode: Optional[str] = None, preflight: bool = True, **kwargs) -> list[str] | None`
+Runs the preflight (skipped with `preflight=False`, which the manual `/test/stream/start` and `/test/camera/snap` use: they need no cloud), closes stale cameras, starts camera sensors using the resolved camera driver (`DualCameraRPISync`, `DualCameraXVS`, or `DualCamera`), boots the stream and returns stream URLs (`None` when a cancel landed meanwhile).
 
 #### `finish_preparation(**kwargs) -> None`
 Background worker for homing down, +30mm offset, R2 bucket cleanup, thermal stabilization, and in-place camera calibration (with `lock_auto=True`).
@@ -266,7 +266,7 @@ Background worker for homing down, +30mm offset, R2 bucket cleanup, thermal stab
 Non-blocking, re-entrant (per thread) exclusive right to move the rig. Raises `ScannerBusyError` immediately when another thread holds it. Used by `move_z_up`/`move_z_down`, `home_z_axis`, `move_z_to_top` and the turntable rotation of a ring; external callers (the `/test` router) wrap their own moves in it.
 
 #### Module constants
-`Z_TRAVEL_MAX_MM = 150` (Z axis travel, from the specification) and `Z_HOMING_MARGIN_MM = 15`: homing and move-to-top are limited to their sum, 165 mm = **16500 steps** at 1/4 microstepping (100 steps/mm), instead of the former 50000.
+`Z_TRAVEL_MAX_MM` (the usable Z travel of the rod, set per rig: currently `475`) and `Z_HOMING_MARGIN_MM = 15`: homing and move-to-top are limited to their sum (490 mm = **49000 steps** at 1/4 microstepping, 100 steps/mm). The schema limit of a single move (`Z_DISTANCE_MAX_MM` in `schemas/scanner.py`) is separate.
 
 #### `home_z_axis(delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = True) -> None`
 Drives carriage downward in acceleration-controlled pulses until `down_endstop` triggers, for at most 16500 steps. The coils are released right away after the endstop STOP (the STOP already disabled the driver, so there is no extra settling pause on that path). With `acceleration=False` the move runs at the constant `delay` (`start_delay` / `ramp_percent` ignored). Raises `ScannerError` when the endstop was not reached (aborted or cancelled move, or the travel budget ran out) and `ScannerBusyError` if another motion is in progress; motor/serial errors are propagated, not swallowed.
@@ -289,11 +289,11 @@ Executes full physical scanning and parallel image upload sequence with independ
 * A climb that ends exactly on the top switch now takes the final top ring; a cancel that tears the hardware down under the scan thread ends the scan quietly instead of raising.
 * `move_z_up()` / `move_z_down()` and the `move_z_*_distance()` helpers accept `end_delay` as well (default `None`).
 
-#### `generate_livestream(bitrate: int = 4_000_000) -> list[str] | None`
-Generates RTSP stream endpoints using the active camera driver.
+#### `generate_livestream() -> list[str] | None`
+Starts the preview pipeline of the active camera driver and returns its URLs (`/test/stream/mjpeg?camera=1|2` for `DualCameraRPISync`).
 
 #### `stop_stream() -> None`
-Terminates RTSP/MJPEG streams and releases camera hardware locks.
+Terminates the preview stream and releases camera hardware locks.
 
 #### `emergency_stop() -> None`
 Immediately halts all motion via Arduino `0xFF` abort (sent twice to both motors before any `DISABLE`), cuts coil power, kills lights, closes the cameras and publishes `CANCELLED` (see above). Exception-safe.

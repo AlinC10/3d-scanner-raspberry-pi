@@ -330,6 +330,19 @@ class TestRouterMotionGuard(unittest.TestCase):
         self._assert_409_and_untouched(lambda: self.mod.test_home_bottom(0.0015, 0.004, 0.1))
         self._assert_409_and_untouched(lambda: self.mod.test_move_to_top(0.0015, 0.004, 0.1))
 
+    def test_stream_start_takes_no_bitrate_and_skips_the_cloud_preflight(self):
+        self.scanner.is_streaming = False
+        self.scanner.stream_urls = None
+        self.scanner.setup_and_stream.return_value = ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"]
+        self.mod.test_stream_start()
+        self.scanner.setup_and_stream.assert_called_once_with(enable_stream=True, preflight=False)
+
+    def test_camera_snap_skips_the_cloud_preflight(self):
+        self.scanner.dual_cameras = None
+        self.scanner.setup_and_stream.side_effect = lambda **kw: setattr(self.scanner, "dual_cameras", MagicMock())
+        self.mod.test_camera_snap()
+        self.scanner.setup_and_stream.assert_called_once_with(enable_stream=False, preflight=False)
+
     def test_busy_error_from_inside_the_motion_is_a_409_not_a_500(self):
         # e.g. the scanner method takes the guard itself and finds it taken
         busy = _ScannerBusyError("another motion is in progress")

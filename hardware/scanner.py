@@ -48,13 +48,19 @@ def _env_backoff(name: str, default: tuple) -> tuple:
     except (KeyError, ValueError):
         return default
 
-# Root of the photo tree: input_images/0/lvl_1_shot_0.jpg, ... and manifest.json. The cloud key is "rig/" + the path
-# relative to it (see Scanner._cloud_key), which is what the downstream download code expects.
-INPUT_IMAGES_DIR = str(Path(__file__).resolve().parent.parent / "input_images")
+# Root of the photo tree: input_images/rig/0/lvl_1_shot_0.jpg, ... and manifest.json: the same "rig/<camera>/<name>"
+# layout Meshroom expects (and the one the R2 download code writes). The cloud key is "rig/" + the path relative to
+# it (see Scanner._cloud_key). Only this folder is wiped at the start of a scan, never input_images/ itself.
+INPUT_IMAGES_DIR = str(Path(__file__).resolve().parent.parent / "input_images" / "rig")
 CLOUD_KEY_PREFIX = "rig/"
 MANIFEST_NAME = "manifest.json"
 # The manifest is uploaded under this key AFTER the verification (never inside the photo set), best effort.
 CLOUD_MANIFEST_KEY = "rig/_manifest.json"
+
+# A photo whose mean luma (0-255) is below this is black: a closed lens cap, dead lights or a manual exposure of 0.
+# The first photo pair of a scan is checked so a whole scan of black photos is never taken (SCAN_BLACK_FRAME_CHECK=0
+# disables the check).
+BLACK_FRAME_MEAN_MAX = _env_float("SCAN_BLACK_FRAME_MEAN_MAX", 3.0)
 
 # Upload policy (module-level so tests can shrink it; each one can be overridden by an environment variable).
 # Pause before attempt n+1 after attempt n failed (the last value repeats), +-UPLOAD_BACKOFF_JITTER of random spread.
@@ -627,6 +633,35 @@ class Scanner:
             except OSError as e:
                 raise ScannerError(f"Could not write the scan manifest {target}: {e}")
 
+    @staticmethod
+    def _mean_luma(path: str) -> Optional[float]:
+        """Mean luma (0-255) of a JPEG, read at 1/8 size; None when it cannot be judged (no OpenCV, unreadable)."""
+        try:
+            import cv2
+            import numpy as np
+            img = cv2.imread(str(path), cv2.IMREAD_REDUCED_GRAYSCALE_8)
+            if not isinstance(img, np.ndarray) or img.size == 0:
+                return None
+            return float(img.mean())
+        except Exception:
+            return None
+
+    def _require_not_black(self, paths, capture_info: Optional[dict]) -> None:
+        cams = []
+        if isinstance(capture_info, dict):
+            cams = list(capture_info.get("cameras") or [])
+        for index, path in enumerate(paths):
+            mean = self._mean_luma(path)
+            if mean is None or mean >= BLACK_FRAME_MEAN_MAX:
+                continue
+            cam = cams[index] if index < len(cams) and isinstance(cams[index], dict) else {}
+            raise ScannerError(
+                f"The photo of camera {index + 1} is black (mean brightness {mean:.1f}/255, camera reports "
+                f"exposure_time={cam.get('exposure_time')} us, analogue_gain={cam.get('analogue_gain')}). Check the "
+                "lens cap, that the lights are on, and that exposure_time / analogue_gain are not set to a "
+                "too small manual value in /scanner/prepare."
+            )
+
     def _register_photos(
         self,
         images_dir: str,
@@ -659,6 +694,10 @@ class Scanner:
             keys = [self._cloud_key(p, images_dir) for p in paths]
         except ValueError as e:
             raise ScannerError(f"A photo was saved outside the photo directory {images_dir}: {e}")
+
+        # The first pair of a scan must not be black: stop right here instead of after 160 black photos
+        if self.total_photos == 0 and os.environ.get("SCAN_BLACK_FRAME_CHECK", "1") != "0":
+            self._require_not_black(paths, capture_info)
 
         # The per-camera exposure controls are trusted only when they describe exactly this capture
         cams_info = []
@@ -941,24 +980,31 @@ class Scanner:
     def setup_and_stream(
         self,
         enable_stream: bool = True,
-        bitrate: int = 4_000_000,
         camera_mode: Optional[str] = None,
+        preflight: bool = True,
         **kwargs
     ) -> list[str] | None:
         """
         Phase 1: Initializes cameras, gets initial stream image, and starts livestream.
         Returns the stream_urls immediately so the frontend can connect.
+
+        :param preflight: run the scan preflight (R2, ToF, disk space) first. The manual /test endpoints pass False:
+            they only need the cameras and the lights, not the cloud.
         """
+        # The MJPEG preview has no bitrate; legacy callers may still pass one
+        kwargs.pop("bitrate", None)
+
         # Cheap state validation first (a /prepare in the wrong state must not pay for the cloud preflight)
         with self._lock:
             self._check_prepare_allowed()
 
         # Checked BEFORE any state change: a failure leaves the scanner IDLE and the router answers 400 with the text
-        try:
-            self.preflight()
-        except ScannerPreflightError as e:
-            self._set_phase(ScanPhase.ERROR, error=str(e))
-            raise
+        if preflight:
+            try:
+                self.preflight()
+            except ScannerPreflightError as e:
+                self._set_phase(ScanPhase.ERROR, error=str(e))
+                raise
 
         # Lock only for state validation and transition
         with self._lock:
@@ -1010,14 +1056,27 @@ class Scanner:
             video_resolution = kwargs.pop("video_resolution", DEFAULT_VIDEO_RESOLUTION)
             preview_resolution = kwargs.get("preview_resolution", DEFAULT_PREVIEW_RESOLUTION)
 
+            # The photo rotation belongs to the camera objects (constructor), not to prepare_scan(): one value for
+            # both cameras or a (cam1, cam2) pair
+            rotation = kwargs.pop("rotation", None)
+            if isinstance(rotation, (tuple, list)) and len(rotation) == 2:
+                rotation1, rotation2 = rotation
+            else:
+                rotation1 = rotation2 = rotation or 0
+
             camera_kwargs = {
                 "quality": quality,
                 "size": photo_resolution,
                 "video_size": video_resolution,
                 "preview_size": preview_resolution,
+                "rotation1": rotation1,
+                "rotation2": rotation2,
             }
 
             self._lock_auto_supported = (CameraClass is DualCameraRPISync)
+            if self._lock_auto_supported:
+                # The MJPEG preview of the sync driver is its lores stream: preview_resolution sizes it
+                camera_kwargs["stream_size"] = tuple(preview_resolution)
             self.dual_cameras = CameraClass(
                 camera_id1=cam1_id,
                 camera_id2=cam2_id,
@@ -1043,7 +1102,6 @@ class Scanner:
                 "photo_quality": quality,
                 "stream_quality": getattr(self.dual_cameras, "stream_quality", 80),
                 "enable_stream": enable_stream,
-                "bitrate": bitrate,
                 **{k: v for k, v in kwargs.items() if k not in ("photo_resolution", "preview_resolution", "quality")},
             }
             log.info("[Scanner] Initializing camera stream & scan configuration: %s", stream_camera_settings)
@@ -1056,7 +1114,7 @@ class Scanner:
                 return None
 
             if enable_stream:
-                self.stream_urls = self.generate_livestream(bitrate)
+                self.stream_urls = self.generate_livestream()
 
             if self._abort_prepare_if_cancelled():
                 return None
@@ -1167,6 +1225,7 @@ class Scanner:
             camera_kwargs.pop("master_id", None)
             camera_kwargs.pop("slave_id", None)
             camera_kwargs.pop("video_resolution", None)
+            camera_kwargs.pop("rotation", None)
             camera_kwargs.pop("camera_mode", None)
             camera_kwargs.pop("mode", None)
 
@@ -1271,14 +1330,14 @@ class Scanner:
         finally:
             self._tls.automated = False
 
-    def generate_livestream(self, bitrate: int = 4_000_000):
+    def generate_livestream(self):
         """Starts or retrieves livestream URLs."""
         if self.state not in (ScannerState.PREPARING, ScannerState.PREPARED) or self.dual_cameras is None:
             return None
 
         if not self.is_streaming:
             try:
-                self.stream_urls = self.dual_cameras.start_stream(bitrate=bitrate)
+                self.stream_urls = self.dual_cameras.start_stream()
                 return self.stream_urls
             except Exception as e:
                 self.cleanup()
@@ -1286,7 +1345,7 @@ class Scanner:
         else:
             if not self.stream_urls:
                 try:
-                    self.stream_urls = self.dual_cameras.start_stream(bitrate=bitrate)
+                    self.stream_urls = self.dual_cameras.start_stream()
                 except Exception:
                     pass
             return self.stream_urls

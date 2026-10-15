@@ -33,8 +33,8 @@ Interactive OpenAPI docs are accessible at: `http://<pi-ip>:8000/docs#/Hardware%
 | **Homing** | `POST` | `/test/motor/move-to-top` | Move carriage up until the top limit switch triggers (0.5s settling delay) |
 | **Motor Movement** | `POST` | `/test/motor/z-move` | Move Z-axis by distance in millimeters with 0.5s coil de-energization settling delay |
 | **Motor Movement** | `POST` | `/test/turntable/rotate` | Rotate turntable by degrees with 0.5s coil de-energization settling delay |
-| **Camera & Video** | `POST` | `/test/stream/start` | Launch RTSP live stream and return stream URLs |
-| **Camera & Video** | `POST` | `/test/stream/stop` | Stop RTSP/MJPEG streams and release camera devices |
+| **Camera & Video** | `POST` | `/test/stream/start` | Start the MJPEG live preview (no cloud needed) and return its URLs |
+| **Camera & Video** | `POST` | `/test/stream/stop` | Stop the live preview and release camera devices |
 | **Camera & Video** | `GET` | `/test/stream/status` | Read streaming status and active stream URLs |
 | **Camera & Video** | `GET` | `/test/stream/mjpeg` | Direct multipart MJPEG stream for browser `<img>` tags (`?camera=1\|2`) with on-demand encoding |
 | **Camera & Video** | `POST` | `/test/stream/active` | Instantaneous zero-latency active preview camera switch (`?camera_id=1\|2`) |
@@ -271,22 +271,15 @@ Rotates the turntable platter by a specific angle.
 ## 5. Camera & Livestream Testing
 
 ### `POST /test/stream/start`
-Initializes the dual camera array and starts the H.264 RTSP livestream without moving any motors.
-
-* **Request Body** (optional):
-  ```json
-  {
-    "bitrate": 4000000
-  }
-  ```
+Initializes the dual camera array and the lights and starts the MJPEG live preview without moving any motors. It needs no request body (there is no bitrate) and, unlike `POST /scanner/prepare`, it does **not** touch Cloudflare R2, the ToF sensor or the disk-space check, so it works without internet.
 
 * **Response (`200 OK`)**:
   ```json
   {
     "status": "success",
     "stream_urls": [
-      "rtsp://localhost:8554/cam0",
-      "rtsp://localhost:8554/cam1"
+      "/test/stream/mjpeg?camera=1",
+      "/test/stream/mjpeg?camera=2"
     ],
     "is_streaming": true
   }
@@ -294,15 +287,13 @@ Initializes the dual camera array and starts the H.264 RTSP livestream without m
 
 * **Example `curl`**:
   ```bash
-  curl -X POST http://localhost:8000/test/stream/start \
-       -H "Content-Type: application/json" \
-       -d '{"bitrate": 4000000}'
+  curl -X POST http://localhost:8000/test/stream/start
   ```
 
 ---
 
 ### `POST /test/stream/stop`
-Stops the RTSP/MJPEG live stream encoders and releases camera hardware locks.
+Stops the live preview and releases the cameras.
 
 * **Response (`200 OK`)**:
   ```json
@@ -321,15 +312,15 @@ Stops the RTSP/MJPEG live stream encoders and releases camera hardware locks.
 ---
 
 ### `GET /test/stream/status`
-Returns whether the stream is active and its RTSP URLs.
+Returns whether the stream is active and its preview URLs.
 
 * **Response (`200 OK`)**:
   ```json
   {
     "is_streaming": true,
     "stream_urls": [
-      "rtsp://localhost:8554/cam0",
-      "rtsp://localhost:8554/cam1"
+      "/test/stream/mjpeg?camera=1",
+      "/test/stream/mjpeg?camera=2"
     ]
   }
   ```
@@ -448,7 +439,7 @@ Takes a single synchronized test capture from both cameras. If cameras are not c
 Powers down all hardware cleanly:
 - Cuts torque on both stepper motors (`release_torque=True`).
 - Powers off the lighting relay.
-- Terminates RTSP live stream and closes camera handles.
+- Terminates the live preview and closes camera handles.
 - Resets hardware state to `IDLE`.
 
 * **Response (`200 OK`)**:
@@ -488,6 +479,6 @@ When first bringing up or troubleshooting the physical rig:
 4. **Verify Z-Axis Homing**:
    - Call `POST /test/motor/home-bottom` -> carriage should move downward until clicking the bottom switch, then stop immediately.
 5. **Verify Camera Stream**:
-   - Call `POST /test/stream/start` -> open `rtsp://<pi-ip>:8554/cam0` in VLC media player to verify video feed and focus.
+   - Call `POST /test/stream/start` -> open `http://<pi-ip>:8000/test/stream/mjpeg?camera=1` in a browser to verify the video feed and focus; `GET /test/stream/sync-status` shows the `cam1_controls` / `cam2_controls` (exposure time and gain each sensor is really using: a black picture shows a tiny exposure there).
 6. **Verify Clean Shutdown**:
    - Call `POST /test/cleanup` -> lights turn off, video stream terminates, motors release.

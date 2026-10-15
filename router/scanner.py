@@ -181,7 +181,6 @@ def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
         
         urls = scanner.setup_and_stream(
             enable_stream=req.enable_stream,
-            bitrate=req.bitrate,
             **req.camera_config.model_dump()
         )
         
