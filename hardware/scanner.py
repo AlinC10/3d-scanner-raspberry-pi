@@ -14,7 +14,7 @@ from .dual_camera import DualCamera
 from .dual_camera_xvs import DualCameraXVS
 from .dual_camera_rpi_sync import DualCameraRPISync
 from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
-from .motor import Motor, TURNTABLE_END_DELAY_DEFAULT
+from .motor import Motor, TURNTABLE_END_DELAY_DEFAULT, TURNTABLE_STEP_TYPE, Z_STEP_TYPE
 from .lights import DimmableLight
 from .tof import ToFSensor
 import cloud.cloudflare_r2 as r2
@@ -58,8 +58,8 @@ T8_THREADED_ROD_STEP = 8 # mm
 class Scanner:
     def __init__(self, xvs: Optional[bool] = None, camera_mode: Optional[str] = None):
         self.tof = ToFSensor()
-        self.turntable_motor = Motor(motor_id=0, dir_pin=7, step_pin=6, en_pin=8, step_type="1/16")
-        self.z_axis_motor = Motor(motor_id=1, dir_pin=4, step_pin=5, en_pin=3, step_type="1/4")
+        self.turntable_motor = Motor(motor_id=0, dir_pin=7, step_pin=6, en_pin=8, step_type=TURNTABLE_STEP_TYPE)
+        self.z_axis_motor = Motor(motor_id=1, dir_pin=4, step_pin=5, en_pin=3, step_type=Z_STEP_TYPE)
 
         self.up_endstop = Endstop(pin=22, pull_up=True, bounce_time=0.02)
         self.down_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
@@ -142,15 +142,20 @@ class Scanner:
             stop_event, thread = watcher
             stop_event.set()
             thread.join(timeout=0.5)
-        self._z_moving.clear()
+        with self._z_stop_lock:
+            self._z_moving.clear()
 
     def _stop_z_once(self) -> None:
-        """Sends the (universal) STOP at most once per Z move, however many sources notice the endstop."""
+        """
+        Sends the (universal) STOP at most once per Z move, however many sources notice the endstop, and never after
+        the move has ended: the check and the send share a lock with `_end_z_motion`, so a late callback cannot
+        reach an idle Arduino (which would cut the torque of every motor).
+        """
         with self._z_stop_lock:
-            if self._z_stop_sent:
+            if self._z_stop_sent or not self._z_moving.is_set():
                 return
             self._z_stop_sent = True
-        self.z_axis_motor.stop()
+            self.z_axis_motor.stop()
 
     def _start_endstop_watch(self, endstop, label: str):
         """
@@ -611,6 +616,9 @@ class Scanner:
                 if self._cancel_event.is_set():
                     return
                 raise ScannerError("The Z-axis move to the scan start position (+30 mm) was aborted.")
+            # The lead screw holds the carriage: do not leave the Z driver energized (1.8 A) through the light
+            # stabilization and the wait for /scanner/start (the firmware energizes it by itself for every move).
+            self.z_axis_motor.disable(interrupt=self._cancel_event)
             if self._cancel_event.is_set(): return
 
             # Clean up the cloud bucket before capturing new assets

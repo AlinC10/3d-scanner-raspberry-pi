@@ -247,7 +247,7 @@ def test_z_move(req: ZMoveRequest):
     scanner.z_axis_motor.enable()
     try:
         if req.direction == "up":
-            scanner.move_z_up_distance(
+            moved = scanner.move_z_up_distance(
                 distance=req.distance_mm,
                 delay=req.delay,
                 acceleration=req.acceleration,
@@ -257,7 +257,7 @@ def test_z_move(req: ZMoveRequest):
                 end_delay=req.end_delay
             )
         else:
-            scanner.move_z_down_distance(
+            moved = scanner.move_z_down_distance(
                 distance=req.distance_mm,
                 delay=req.delay,
                 acceleration=req.acceleration,
@@ -266,6 +266,9 @@ def test_z_move(req: ZMoveRequest):
                 decel_percent=req.decel_percent,
                 end_delay=req.end_delay
             )
+
+        if not moved:
+            raise RuntimeError("the movement was aborted before it completed")
 
         return {
             "status": "success",
@@ -290,7 +293,7 @@ def test_turntable_rotate(req: TurntableRotateRequest):
     _require_motors_free()
     scanner.turntable_motor.enable()
     try:
-        scanner.turntable_motor.rotate_angle(
+        completed = scanner.turntable_motor.rotate_angle(
             clockwise=req.clockwise,
             angle=req.angle,
             delay=req.delay,
@@ -300,6 +303,9 @@ def test_turntable_rotate(req: TurntableRotateRequest):
             decel_percent=req.decel_percent,
             end_delay=req.end_delay
         )
+        if not completed:
+            raise RuntimeError("the rotation was aborted before it completed")
+
         return {
             "status": "success",
             "angle": req.angle,

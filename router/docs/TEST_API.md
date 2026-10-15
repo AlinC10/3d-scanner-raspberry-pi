@@ -4,6 +4,9 @@ This module provides isolated HTTP endpoints to test, calibrate, and verify indi
 
 Interactive OpenAPI docs are accessible at: `http://<pi-ip>:8000/docs#/Hardware%20Diagnostics%20%26%20Tests`
 
+> [!NOTE]
+> `/test/turntable/rotate` and `/test/motor/z-move` answer `422` when the angle / distance is not a whole number of steps (`0.1125°` multiples on the turntable, `0.01 mm` multiples on Z) and `500` when the move was aborted before it completed (for example by `POST /scanner/cancel`); they no longer report `success` for an aborted move.
+
 > [!WARNING]
 > **Busy guard**: the endpoints that move or (de)energize the motors (`/test/motor/*`, `/test/turntable/rotate`, `/test/cleanup`) answer `409 Conflict` unless the scanner is `idle`, `completed`, `cancelled` or `error`. During `preparing`, `prepared` and `running` use `POST /scanner/cancel` first. Read-only endpoints (endstops, ToF, status) are always available.
 

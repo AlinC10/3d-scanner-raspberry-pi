@@ -9,6 +9,10 @@ log = logging.getLogger(__name__)
 
 T8_THREADED_ROD_STEP = 8  # mm
 
+# Microstepping configured on the TB6600 drivers (DIP switches); the request schemas validate against these.
+TURNTABLE_STEP_TYPE = "1/16"
+Z_STEP_TYPE = "1/4"
+
 # Slow-stop tail of the deceleration ramp (seconds between the last step pulses).
 END_DELAY_MIN = 0.005                # 5 ms  -> 200 microsteps/s
 END_DELAY_MAX = 0.030                # 30 ms -> 33 microsteps/s
@@ -54,6 +58,36 @@ def _ramp_phase_seconds(steps: int, delay_a_us: int, delay_b_us: int) -> float:
     v_a = 1_000_000.0 / delay_a_us
     v_b = 1_000_000.0 / delay_b_us
     return 2.0 * steps / (v_a + v_b)
+
+def angle_to_steps(angle: int | float, step_type: str, step_angle: float = 1.8) -> int:
+    """
+    Converts a rotation angle (degrees) into a whole number of steps for the given microstepping mode.
+
+    :raises MotorError: when the angle is not an exact multiple of one (micro)step.
+    """
+    if "/" in step_type:
+        num, den = step_type.split("/")
+        num, den = int(num), int(den)
+    elif step_type == "Half":
+        num, den = 1, 2
+    else:
+        num, den = 1, 1
+
+    steps_float = angle / (step_angle * num / den)
+
+    # Allow a tiny margin for float math precision
+    if abs(steps_float - round(steps_float)) > 1e-4:
+        raise MotorError(
+            f"Cannot rotate exactly {angle}° using '{step_type}' step type. "
+            f"This requires {steps_float:.2f} steps, which is not a whole integer."
+        )
+    return round(steps_float)
+
+
+def distance_to_steps(distance: float, step_type: str) -> int:
+    """Converts a linear distance (mm) on the T8 threaded rod into whole steps (see `angle_to_steps`)."""
+    return angle_to_steps((distance / T8_THREADED_ROD_STEP) * 360.0, step_type)
+
 
 class Motor:
     """
@@ -164,33 +198,11 @@ class Motor:
         :type step_type: Optional[str]
         :return: The exact number of integer steps required.
         :rtype: int
+        :raises MotorError: when the angle is not a whole number of steps.
         """
         if step_type is None:
             step_type = self.step_type
-
-        # Determine multiplier based on step_type
-        if "/" in step_type:
-            num, den = step_type.split("/")
-            num, den = int(num), int(den)
-        elif step_type == "Half":
-            num, den = 1, 2
-        else:
-            num, den = 1, 1
-
-        step_angle = self.nema17_step_angle * num / den
-
-        # Calculate exactly how many steps this requires
-        steps_float = angle / step_angle
-
-        # Check if the required steps is a whole number (allowing a tiny margin for float math precision)
-        if abs(steps_float - round(steps_float)) > 1e-4:
-            raise MotorError(
-                f"Cannot rotate exactly {angle}° using '{step_type}' step type."
-                f"This requires {steps_float:.2f} steps, which is not a whole integer. "
-            )
-
-        steps = round(steps_float)
-        return steps
+        return angle_to_steps(angle, step_type, self.nema17_step_angle)
 
     def distance_to_step_conversion(self, distance: float = 100.0, step_type: Optional[str] = None) -> int:
         """
@@ -219,7 +231,7 @@ class Motor:
             ramp_percent: float = 0.2,
             decel_percent: Optional[float] = None,
             cancel_event: Optional[threading.Event] = None,
-            end_delay: Optional[float] = None) -> None:
+            end_delay: Optional[float] = None) -> bool:
         """
         Rotates the motor by a specific angle. Verifies if the requested angle
         is perfectly divisible by the given step_type. If not, raises an error.
@@ -255,7 +267,7 @@ class Motor:
 
         steps = self.angle_to_steps_conversion(angle, step_type)
         if steps > 0:
-            self.rotate(
+            return self.rotate(
                 clockwise=clockwise,
                 steps=steps,
                 delay=delay,
@@ -269,6 +281,7 @@ class Motor:
                 cancel_event=cancel_event,
                 end_delay=end_delay
             )
+        return True
 
     def rotate_distance(
             self,
@@ -283,7 +296,7 @@ class Motor:
             ramp_percent: float = 0.2,
             decel_percent: Optional[float] = None,
             cancel_event: Optional[threading.Event] = None,
-            end_delay: Optional[float] = None) -> None:
+            end_delay: Optional[float] = None) -> bool:
         """
         Rotates the motor to move the carriage by a specific linear distance.
 
@@ -318,7 +331,7 @@ class Motor:
 
         steps = self.distance_to_step_conversion(distance, step_type)
         if steps > 0:
-            self.rotate(
+            return self.rotate(
                 clockwise=clockwise,
                 steps=steps,
                 delay=delay,
@@ -332,6 +345,7 @@ class Motor:
                 cancel_event=cancel_event,
                 end_delay=end_delay
             )
+        return True
 
     def rotate(
             self,

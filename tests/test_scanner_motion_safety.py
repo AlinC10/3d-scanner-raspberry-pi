@@ -352,5 +352,36 @@ class TestLowSeverityFixes(unittest.TestCase):
         self.assertNotEqual(self.s.state, ScannerState.PROCESSING)
 
 
+class TestFoundBugs(unittest.TestCase):
+    def setUp(self):
+        self.s = make_scanner()
+
+    def test_z_driver_is_released_after_the_start_position_move(self):
+        self.s.state = ScannerState.PREPARING
+        self.s.lights.brightness = 1.0
+        self.s.lights.is_on = True
+        self.s.wait_for_light_stable = lambda **kwargs: True
+        self.s.down_endstop.is_active = True  # homing succeeds immediately
+        self.s.finish_preparation()
+        self.assertEqual(self.s.state, ScannerState.PREPARED)
+        calls = [c[0] for c in self.s.z_axis_motor.mock_calls]
+        last_move = max(i for i, name in enumerate(calls) if name == "rotate")
+        self.assertIn("disable", calls[last_move + 1:])  # released after the +30 mm move
+
+    def test_late_endstop_callback_after_the_move_is_ignored(self):
+        self.s._begin_z_motion()
+        self.s._end_z_motion(None)
+        self.s._on_top_endstop_hit()
+        self.s._stop_z_once()
+        self.s.z_axis_motor.stop.assert_not_called()
+
+    def test_stop_is_still_sent_during_the_move(self):
+        self.s._begin_z_motion()
+        self.s._stop_z_once()
+        self.s._stop_z_once()
+        self.s.z_axis_motor.stop.assert_called_once()
+        self.s._end_z_motion(None)
+
+
 if __name__ == "__main__":
     unittest.main()
