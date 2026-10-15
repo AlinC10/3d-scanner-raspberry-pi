@@ -313,13 +313,113 @@ class _RouterCase(unittest.TestCase):
             self.mod._orchestrate_pipeline(req)
 
 
-class TestFocusValidation(unittest.TestCase):
-    def test_focus_auto_is_rejected_and_numbers_are_accepted(self):
+class TestNullPairs(unittest.TestCase):
+    def test_all_null_pairs_mean_unset_and_half_filled_pairs_are_rejected(self):
         code = (
             "import json\n"
             "from schemas.scanner import DualCameraConfig as C\n"
             "out = {}\n"
-            "for name, v in (('auto', 'auto'), ('int', 500), ('pair', [100, 200]), ('none', None)):\n"
+            "def ok(**kw):\n"
+            "    try:\n"
+            "        return C(**kw)\n"
+            "    except Exception:\n"
+            "        return None\n"
+            "a = ok(colour_gains=[None, None], focus=[None, None])\n"
+            "out['null_pairs_ok'] = a is not None and a.colour_gains is None and a.focus is None\n"
+            "out['half_filled_rejected'] = ok(colour_gains=[1.5, None]) is None\n"
+            "b = ok(colour_gains=[1.5, 2.0])\n"
+            "out['numbers_kept'] = b is not None and tuple(b.colour_gains) == (1.5, 2.0)\n"
+            "print(json.dumps(out))\n"
+        )
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr[-1500:])
+        r = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertTrue(r["null_pairs_ok"])
+        self.assertTrue(r["half_filled_rejected"])
+        self.assertTrue(r["numbers_kept"])
+
+
+class TestCameraConfigContract(unittest.TestCase):
+    """DualCameraConfig only carries settings the dual rpi.sync driver really uses."""
+
+    @classmethod
+    def setUpClass(cls):
+        code = (
+            "import json\n"
+            "from schemas.scanner import DualCameraConfig as C, PrepareRequest as P\n"
+            "def ok(**kw):\n"
+            "    try:\n"
+            "        C(**kw); return True\n"
+            "    except Exception:\n"
+            "        return False\n"
+            "out = {\n"
+            "  'defaults': ok(),\n"
+            "  'exposure_zero': ok(exposure_time=0),\n"
+            "  'exposure_ok': ok(exposure_time=8000),\n"
+            "  'gain_zero': ok(analogue_gain=0),\n"
+            "  'gain_ok': ok(analogue_gain=1.5),\n"
+            "  'gains_zero': ok(colour_gains=[0, 0]),\n"
+            "  'gains_ok': ok(colour_gains=[1.8, 1.4]),\n"
+            "  'contrast_zero': ok(contrast=0),\n"
+            "  'saturation_zero': ok(saturation=0),\n"
+            "  'removed_keys_tolerated': ok(show_preview=True, keep_running=True, autofocus_step=10,\n"
+            "      autofocus_roi=[0, 0, 1, 1], video_resolution=[1920, 1080]),\n"
+            "  'focus_auto': ok(focus='auto'),\n"
+            "  'focus_word': ok(focus='near'),\n"
+            "  'preview_ok': ok(preview_resolution=[640, 480]),\n"
+            "  'preview_odd': ok(preview_resolution=[641, 480]),\n"
+            "  'preview_tiny': ok(preview_resolution=[80, 60]),\n"
+            "  'preview_bigger_than_photo': ok(photo_resolution=[1920, 1080], preview_resolution=[2000, 1080]),\n"
+            "  'fields': sorted(C.model_fields),\n"
+            "}\n"
+            "p = P(camera_config={})\n"
+            "out['prepare_fields'] = sorted(P.model_fields)\n"
+            "out['prepare_ignores_bitrate'] = P(bitrate=1, camera_config={}).enable_stream is True\n"
+            "print(json.dumps(out))\n"
+        )
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT, timeout=60)
+        if done.returncode != 0:
+            raise RuntimeError(done.stderr[-2000:])
+        cls.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_zero_manual_exposure_and_gain_are_rejected(self):
+        self.assertFalse(self.r["exposure_zero"])
+        self.assertFalse(self.r["gain_zero"])
+        self.assertFalse(self.r["gains_zero"])
+        self.assertFalse(self.r["contrast_zero"])
+
+    def test_valid_manual_values_and_neutral_zero_values_are_accepted(self):
+        for key in ("defaults", "exposure_ok", "gain_ok", "gains_ok", "saturation_zero"):
+            self.assertTrue(self.r[key], key)
+
+    def test_removed_keys_are_tolerated_but_not_part_of_the_schema(self):
+        self.assertTrue(self.r["removed_keys_tolerated"])
+        for key in ("show_preview", "keep_running", "autofocus_step", "autofocus_roi", "video_resolution"):
+            self.assertNotIn(key, self.r["fields"])
+
+    def test_focus_auto_is_accepted_other_words_are_not(self):
+        self.assertTrue(self.r["focus_auto"])
+        self.assertFalse(self.r["focus_word"])
+
+    def test_preview_resolution_is_validated(self):
+        self.assertIn("preview_resolution", self.r["fields"])
+        self.assertTrue(self.r["preview_ok"])
+        self.assertFalse(self.r["preview_odd"])
+        self.assertFalse(self.r["preview_tiny"])
+        self.assertFalse(self.r["preview_bigger_than_photo"])
+
+    def test_prepare_request_has_no_bitrate(self):
+        self.assertNotIn("bitrate", self.r["prepare_fields"])
+        self.assertTrue(self.r["prepare_ignores_bitrate"])
+
+
+class TestFocusValidation(unittest.TestCase):
+    def test_focus_auto_and_numbers_are_accepted_other_words_are_rejected(self):
+        code = (
+            "import json\n"
+            "from schemas.scanner import DualCameraConfig as C\n"
+            "out = {}\n"
+            "for name, v in (('auto', 'auto'), ('word', 'near'), ('int', 500), ('pair', [100, 200]), ('none', None)):\n"
             "    try:\n"
             "        C(focus=v); out[name] = True\n"
             "    except Exception:\n"
@@ -329,7 +429,8 @@ class TestFocusValidation(unittest.TestCase):
         done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=ROOT, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr[-1500:])
         r = json.loads(done.stdout.strip().splitlines()[-1])
-        self.assertFalse(r["auto"])
+        self.assertTrue(r["auto"])
+        self.assertFalse(r["word"])
         self.assertTrue(r["int"] and r["pair"] and r["none"])
 
 

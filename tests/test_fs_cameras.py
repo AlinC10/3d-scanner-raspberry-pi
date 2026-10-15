@@ -432,6 +432,68 @@ class TestPrepareScanLock(RealModeCase):
         self.assertEqual(drv.cam1.focuser.position, 120)
 
 
+class TestAutofocus(RealModeCase):
+    """focus='auto': a sweep over the running pipeline in the in-position call; the best position stays locked."""
+
+    PEAK = 640
+
+    def setUp(self):
+        super().setUp()
+        self.drv = None
+        outer = self
+
+        def sharpness(frame, roi):
+            # Sharpest when cam1's lens is at PEAK (both lenses visit the same positions in these tests)
+            return -abs(outer.drv.cam1.focuser.position - outer.PEAK)
+
+        p = patch.object(FakeCam, "_sharpness", create=True, new=staticmethod(sharpness))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def driver(self):
+        self.drv = self.new_driver()
+        return self.drv
+
+    def test_auto_in_the_lock_call_sweeps_and_leaves_the_best_position(self):
+        drv = self.driver()
+        infos = drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0)
+        # coarse step 30 -> 630, fine pass (step 6) -> 642 is the closest to the peak
+        self.assertEqual(drv.autofocus_positions, [642, 642])
+        self.assertEqual(drv.cam1.focuser.position, 642)
+        self.assertEqual(drv.cam2.focuser.position, 642)
+        self.assertTrue(infos[0]["autofocus"] and infos[1]["autofocus"])
+        self.assertEqual(infos[0]["focus"], 642)
+
+    def test_auto_in_the_first_call_only_restores_the_saved_position(self):
+        drv = self.driver()
+        infos = drv.prepare_scan(focus="auto")
+        self.assertIsNone(drv.autofocus_positions)
+        self.assertEqual(drv.cam1.focuser.restored, 1)
+        self.assertFalse(infos[0]["autofocus"])
+
+    def test_focus_stays_locked_after_the_sweep(self):
+        drv = self.driver()
+        drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0)
+        drv.prepare_scan()                      # a later call without focus must not move the lens
+        self.assertEqual(drv.cam1.focuser.position, 642)
+
+    def test_sweep_needs_the_stream(self):
+        drv = self.driver()
+        with self.assertRaises(RuntimeError):
+            drv.focus_sweep_autofocus()
+
+    def test_unknown_focus_word_is_refused(self):
+        drv = self.driver()
+        with self.assertRaises(ValueError):
+            drv.prepare_scan(focus="near")
+
+    def test_sweep_frame_collection_is_switched_off_afterwards(self):
+        drv = self.driver()
+        drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0)
+        self.assertEqual(drv._af_active, [False, False])
+        self.assertEqual(drv._af_frame, [None, None])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Contract 7: lifecycle
 # ─────────────────────────────────────────────────────────────────────────────

@@ -477,20 +477,25 @@ class TestTravelLimit(unittest.TestCase):
     def setUp(self):
         self.s = make_scanner()
 
+    @staticmethod
+    def _budget_mm():
+        return scanner_module.Z_TRAVEL_MAX_MM + scanner_module.Z_HOMING_MARGIN_MM
+
     def test_constants(self):
-        self.assertEqual(scanner_module.Z_TRAVEL_MAX_MM, 150)
+        # The real travel of the rod is set per rig; only the shape of the budget is fixed here
+        self.assertGreater(scanner_module.Z_TRAVEL_MAX_MM, 0)
         self.assertEqual(scanner_module.Z_HOMING_MARGIN_MM, 15)
 
-    def test_homing_budget_is_16500_steps(self):
+    def test_homing_budget_is_travel_plus_margin(self):
         with self.assertRaises(ScannerError):  # switch never reached within the budget
             self.s.home_z_axis()
-        self.assertEqual(self.s.z_axis_motor.rotate.call_args.kwargs["steps"], 16500)
-        self.s.z_axis_motor.distance_to_step_conversion.assert_called_with(distance=165)
+        self.assertEqual(self.s.z_axis_motor.rotate.call_args.kwargs["steps"], self._budget_mm() * 100)
+        self.s.z_axis_motor.distance_to_step_conversion.assert_called_with(distance=self._budget_mm())
 
-    def test_move_to_top_budget_is_16500_steps(self):
+    def test_move_to_top_budget_is_travel_plus_margin(self):
         with self.assertRaises(ScannerError):
             self.s.move_z_to_top()
-        self.assertEqual(self.s.z_axis_motor.rotate.call_args.kwargs["steps"], 16500)
+        self.assertEqual(self.s.z_axis_motor.rotate.call_args.kwargs["steps"], self._budget_mm() * 100)
 
     def test_acceleration_is_on_by_default_for_homing_and_move_to_top(self):
         for call in (self.s.home_z_axis, self.s.move_z_to_top):
@@ -510,7 +515,7 @@ class TestTravelLimit(unittest.TestCase):
             self.assertFalse(kw["acceleration"])
             self.assertIsNone(kw["start_delay"])
             self.assertEqual(kw["delay"], 0.001)
-            self.assertEqual(kw["steps"], 16500)
+            self.assertEqual(kw["steps"], self._budget_mm() * 100)
 
     def test_homing_failure_still_releases_the_torque(self):
         with self.assertRaises(ScannerError):

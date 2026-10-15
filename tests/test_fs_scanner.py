@@ -686,6 +686,41 @@ class TestLocalIntegrity(ScannerTestCase):
         self.assertIn("no frame received", str(ctx.exception))
         self.assertIn("level 1", str(ctx.exception))
 
+    def test_black_first_photo_stops_the_scan_with_a_clear_message(self):
+        self.s._mean_luma = lambda path: 0.4
+        with self.assertRaises(ScannerError) as ctx:
+            self.s.scan()
+        self.assertIn("black", str(ctx.exception))
+        self.assertIn("lens cap", str(ctx.exception))
+        self.assertEqual(self.s.total_photos, 0)
+        self.assertEqual(self.s.state, ScannerState.ERROR)
+        self.assertEqual(self.r2.calls, [])      # nothing black was uploaded
+
+    def test_only_the_first_pair_is_checked(self):
+        calls = []
+
+        def luma(path):
+            calls.append(path)
+            return 80.0
+
+        self.s._mean_luma = luma
+        self.verdicts = {1: True, 2: False}
+        self.s.scan()
+        self.assertEqual(len(calls), 2)          # one pair, not every photo
+
+    def test_black_frame_check_can_be_disabled(self):
+        self.s._mean_luma = lambda path: 0.0
+        self.verdicts = {1: False}
+        with patch.dict(os.environ, {"SCAN_BLACK_FRAME_CHECK": "0"}):
+            self.s.scan()
+        self.assertGreater(self.s.total_photos, 0)
+
+    def test_unreadable_photo_is_not_called_black(self):
+        self.s._mean_luma = lambda path: None
+        self.verdicts = {1: False}
+        self.s.scan()
+        self.assertGreater(self.s.total_photos, 0)
+
     def test_photo_outside_the_photo_tree_is_rejected(self):
         with self.assertRaises(ScannerError):
             self.s._register_photos(self.s.images_dir, ["/etc/hostname"], 1, 0)
@@ -897,6 +932,13 @@ class TestPreflight(ScannerTestCase):
         self.assertEqual(self.r2.preflight_calls, 0)
         self.assertEqual(self.s.state, ScannerState.RUNNING)
 
+    def test_manual_test_endpoints_can_skip_the_preflight(self):
+        self.r2.preflight_error = "cloud is down"
+        self.s.tof.available = False
+        self.s.setup_and_stream(enable_stream=False, preflight=False)
+        self.assertEqual(self.r2.preflight_calls, 0)
+        self.assertEqual(self.s.state, ScannerState.PREPARING)
+
     def test_preflight_can_be_called_on_its_own(self):
         self.s.preflight()
         self.r2.preflight_error = "x"
@@ -1059,6 +1101,55 @@ class TestLifecycle(ScannerTestCase):
         self.assertIn("Cloud sanitization failed", self.s.error)
         self.assertIn("Errors in delete_objects", self.s.error)
         self.assertEqual(cams.prepare_calls, [])
+
+    def test_bitrate_is_ignored_and_the_stream_starts_without_one(self):
+        started = []
+
+        class Cams(RecordingCameras):
+            def start_stream(self, *args, **kwargs):
+                started.append((args, kwargs))
+                return ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"]
+
+        with patch.object(scanner_module, "DualCameraRPISync", Cams):
+            urls = self.s.setup_and_stream(enable_stream=True, camera_mode="rpi_sync", bitrate=9_000_000)
+        self.assertEqual(urls, ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"])
+        self.assertEqual(started, [((), {})])
+        self.assertNotIn("bitrate", self.s.dual_cameras.prepare_calls[0])
+
+    def test_rotation_goes_to_the_camera_constructor_not_to_prepare_scan(self):
+        with patch.object(scanner_module, "DualCameraRPISync", RecordingCameras):
+            self.s.setup_and_stream(enable_stream=False, camera_mode="rpi_sync", rotation=[90, 270])
+        cams = self.s.dual_cameras
+        self.assertEqual(cams.init_kwargs["rotation1"], 90)
+        self.assertEqual(cams.init_kwargs["rotation2"], 270)
+        self.assertNotIn("rotation", cams.prepare_calls[0])
+
+    def test_single_rotation_value_applies_to_both_cameras(self):
+        with patch.object(scanner_module, "DualCameraRPISync", RecordingCameras):
+            self.s.setup_and_stream(enable_stream=False, camera_mode="rpi_sync", rotation=180)
+        self.assertEqual(self.s.dual_cameras.init_kwargs["rotation1"], 180)
+        self.assertEqual(self.s.dual_cameras.init_kwargs["rotation2"], 180)
+
+    def test_preview_resolution_sizes_the_stream_of_the_sync_driver(self):
+        with patch.object(scanner_module, "DualCameraRPISync", RecordingCameras):
+            self.s.setup_and_stream(enable_stream=False, camera_mode="rpi_sync", preview_resolution=(640, 480))
+        self.assertEqual(self.s.dual_cameras.init_kwargs["stream_size"], (640, 480))
+
+    def test_focus_auto_reaches_both_prepare_calls_and_only_the_second_locks(self):
+        with patch.object(scanner_module, "DualCameraRPISync", RecordingCameras):
+            self.s.setup_and_stream(enable_stream=False, camera_mode="rpi_sync", focus="auto")
+            cams = self.s.dual_cameras
+            # the router hands the same camera_config to finish_preparation
+            self.s.down_endstop.is_active = True
+            self.s.wait_for_light_stable = lambda **kwargs: True
+            self.s.finish_preparation(focus="auto")
+        self.assertEqual([c["focus"] for c in cams.prepare_calls], ["auto", "auto"])
+        self.assertEqual([c["lock_auto"] for c in cams.prepare_calls], [False, True])
+
+    def test_photo_root_is_the_rig_folder(self):
+        root = os.path.normpath(scanner_module.INPUT_IMAGES_DIR)
+        self.assertEqual(os.path.basename(root), "rig")
+        self.assertEqual(os.path.basename(os.path.dirname(root)), "input_images")
 
     def test_failed_exposure_lock_is_an_error(self):
         cams = RecordingCameras()

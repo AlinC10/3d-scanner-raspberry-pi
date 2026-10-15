@@ -81,8 +81,9 @@ Prepares the scanner for framing and calibration.
    - Validates that state is in `[IDLE, COMPLETED, CANCELLED, ERROR]`.
    - Transitions state to `PREPARING`.
    - Powers ON the chamber lights.
-   - Initializes the dual cameras and boots the H.264 RTSP video encoder.
-   - **Immediately returns HTTP 202** with RTSP stream URLs so the frontend video player can display the live feed right away.
+   - Runs the preflight (Cloudflare R2 read/write/delete, ToF sensor, free disk space); a failure is a `400` and nothing is touched.
+   - Initializes the dual cameras and starts the MJPEG live preview (there is no video encoder and no bitrate).
+   - **Immediately returns HTTP 202** with the MJPEG preview URLs (`/test/stream/mjpeg?camera=1|2`), usable directly as `<img src>`.
 2. **Background Execution**:
    - Drives the carriage down until the bottom limit switch triggers (`home_z_axis`).
    - Climbs **+30mm** above home to rest directly in front of the illuminated turntable object.
@@ -94,18 +95,15 @@ Prepares the scanner for framing and calibration.
 ```json
 {
   "enable_stream": true,
-  "bitrate": 2000000,
   "illumination_brightness": 1.0,
   "camera_config": {
     "master_id": 0,
     "slave_id": 1,
     "quality": 95,
     "photo_resolution": [4056, 3040],
-    "video_resolution": [1920, 1080],
-    "preview_resolution": [1280, 720],
+    "preview_resolution": [960, 720],
     "rotation": 0,
     "focus": null,
-    "show_preview": false,
     "settle_time": 2.0,
     "exposure_time": null,
     "analogue_gain": null,
@@ -114,12 +112,19 @@ Prepares the scanner for framing and calibration.
     "brightness": null,
     "contrast": null,
     "saturation": null,
-    "sharpness": null,
-    "autofocus_step": 30,
-    "keep_running": false
+    "sharpness": null
   }
 }
 ```
+
+Notes on `camera_config`:
+* Leave a manual control `null` (or omit it) to let the camera decide. `[null, null]` for `colour_gains` / `focus` also means "not set".
+* `exposure_time` must be `> 0` (microseconds), `analogue_gain` `1.0`-`16.0`, `colour_gains` each `> 0`, `contrast` `> 0`: **a `0` is rejected with `422`** (a manual exposure of `0` used to give completely black photos).
+* `rotation` (`0/90/180/270`, one value or a `[cam1, cam2]` pair) rotates the saved photos; the live preview is not rotated.
+* `preview_resolution` is the size of the live MJPEG preview (even values, `160x120` up to `photo_resolution`; a larger preview costs CPU).
+* `focus` is a VCM position `0`-`1023` (or a `[cam1, cam2]` pair); `null` restores the saved position (what a plain `/test/stream/start` does too). **`"auto"`** runs a sharpness sweep of both lenses in the recalibration step (carriage in position, object lit): coarse sweep, then a fine pass around each best position. The best position of each lens is left in place and saved, and nothing moves it for the rest of the scan (the focus is locked). The first call of `/prepare` (the framing stream) only restores the saved position, so the stream is usable from the start.
+* How to let the camera decide everything: send `"camera_config": {}`, or leave `exposure_time`, `analogue_gain`, `colour_gains`, `brightness`, `contrast`, `saturation`, `sharpness` as `null`. AE/AWB then run automatically during the stream and are locked once, in the recalibration step, before the first photo.
+* The keys `show_preview`, `keep_running`, `autofocus_step`, `autofocus_roi`, `video_resolution` and the top-level `bitrate` were removed (nothing used them); a client that still sends them is tolerated and they are ignored.
 
 ### Response (`202 Accepted` - `PrepareResponse`)
 ```json
@@ -128,8 +133,8 @@ Prepares the scanner for framing and calibration.
   "message": "Live stream started. Rig homing and camera tuning in progress.",
   "state": "preparing",
   "stream_urls": [
-    "rtsp://192.168.1.100:8554/cam0",
-    "rtsp://192.168.1.100:8554/cam1"
+    "/test/stream/mjpeg?camera=1",
+    "/test/stream/mjpeg?camera=2"
   ]
 }
 ```
@@ -146,7 +151,6 @@ curl -X POST http://localhost:8000/scanner/prepare \
      -H "Content-Type: application/json" \
      -d '{
        "enable_stream": true,
-       "bitrate": 2000000,
        "illumination_brightness": 1.0,
        "camera_config": {
          "master_id": 0,
@@ -328,7 +332,7 @@ curl -X POST http://localhost:8000/scanner/cancel
 
 ## 4. Get Status (`GET /scanner/status`)
 
-Polling endpoint used by the frontend to track the active state, the phase, photo counters, the failure reason, and RTSP stream links.
+Polling endpoint used by the frontend to track the active state, the phase, photo counters, the failure reason, and the MJPEG preview links.
 
 ### Recommended Polling Interval
 * **During Preparation / Running / Processing**: Poll every **1.0 to 2.0 seconds**.
@@ -340,8 +344,8 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
   "state": "running",
   "total_photos": 40,
   "stream_urls": [
-    "rtsp://192.168.1.100:8554/cam0",
-    "rtsp://192.168.1.100:8554/cam1"
+    "/test/stream/mjpeg?camera=1",
+    "/test/stream/mjpeg?camera=2"
   ],
   "phase": "scanning",
   "phase_message": "Ring 2: capturing",
@@ -534,11 +538,9 @@ async function prepareScanner() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       enable_stream: true,
-      bitrate: 4000000,
       camera_config: {
         quality: 95,
-        photo_resolution: [4056, 3040],
-        preview_resolution: [960, 720]
+        photo_resolution: [4056, 3040]
       }
     })
   });
@@ -548,9 +550,9 @@ async function prepareScanner() {
   const imgElement = document.getElementById("live-stream") as HTMLImageElement;
   imgElement.src = "http://<pi-ip>:8000/scanner/stream/mjpeg?camera=1";
 
-  // Option B: Connect an H.264 video player to the RTSP stream URL if available
+  // Option B: use the URLs returned by the server (the same MJPEG endpoints)
   if (data.stream_urls) {
-    console.log("RTSP URLs available:", data.stream_urls);
+    console.log("Preview URLs:", data.stream_urls);
   }
 
   // Poll until scanner reaches PREPARED state
