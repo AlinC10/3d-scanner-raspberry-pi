@@ -194,6 +194,10 @@ class Scanner:
         # cut the other motor as well.
         self._z_stop_sent = False
         self._z_stop_lock = threading.Lock()
+        # Direction of the Z move in flight ("up" / "down"; None between moves): an endstop edge only stops a move
+        # that travels towards that switch. A late or bouncing edge of the switch the carriage is leaving must not
+        # abort the next move (it did: the +30 mm climb right after homing).
+        self._z_direction: Optional[str] = None
 
         # Motion guard (see motion_guard()): owner thread + nesting depth, both protected by the mutex.
         self._motion_mutex = threading.Lock()
@@ -280,6 +284,9 @@ class Scanner:
         if not self._z_moving.is_set():
             log.warning("[Scanner] TOP limit switch pressed while the Z-axis is not moving; ignored.")
             return
+        if self._z_direction == "down":
+            log.info("[Scanner] TOP limit switch edge ignored: the carriage is moving down, away from it.")
+            return
         log.warning("[Scanner] TOP limit switch triggered mid-motion!")
         self._stop_z_once()
 
@@ -287,6 +294,9 @@ class Scanner:
         """Invoked when the physical bottom home limit switch is pressed."""
         if not self._z_moving.is_set():
             log.warning("[Scanner] BOTTOM limit switch pressed while the Z-axis is not moving; ignored.")
+            return
+        if self._z_direction == "up":
+            log.info("[Scanner] BOTTOM limit switch edge ignored: the carriage is moving up, away from it.")
             return
         log.info("[Scanner] BOTTOM limit switch triggered.")
         self._stop_z_once()
@@ -350,6 +360,7 @@ class Scanner:
         # joined must not send the universal STOP to an Arduino that is already idle.
         with self._z_stop_lock:
             self._z_moving.clear()
+            self._z_direction = None
         if watcher is not None:
             stop_event, thread = watcher
             stop_event.set()
@@ -751,6 +762,7 @@ class Scanner:
         """
         with self.motion_guard():
             # Flag first, then check the endstop: a press between the two would otherwise be ignored by the callback.
+            self._z_direction = "up"       # before the flag: a stale edge of the other switch is then ignored
             if not self._begin_z_motion():
                 return False
             watcher = None
@@ -785,6 +797,7 @@ class Scanner:
         """
         with self.motion_guard():
             # Flag first, then check the endstop: a press between the two would otherwise be ignored by the callback.
+            self._z_direction = "down"     # before the flag: a stale edge of the other switch is then ignored
             if not self._begin_z_motion():
                 return False
             watcher = None
