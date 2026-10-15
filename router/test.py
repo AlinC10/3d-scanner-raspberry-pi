@@ -11,6 +11,9 @@ from hardware.endstop import TopEndstopTriggered, BottomEndstopTriggered
 from hardware.scanner import ScannerError
 from hardware.lights import LightLockedError
 
+from hardware.motor import STEP_DELAY_MIN, STEP_DELAY_MAX
+from hardware.scanner import ScannerBusyError
+
 log = logging.getLogger(__name__)
 
 router = APIRouter(
@@ -29,6 +32,14 @@ def _require_motors_free() -> None:
             status_code=409,
             detail=f"Scanner is busy (state: {scanner.state}). Cancel it with POST /scanner/cancel first."
         )
+
+
+def _motion_busy() -> HTTPException:
+    """409 for a motion request that arrives while another motion (Z move, rotation, homing) is still running."""
+    return HTTPException(
+        status_code=409,
+        detail="Another motion is in progress. Wait for it to finish or stop it with POST /scanner/cancel."
+    )
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -93,16 +104,28 @@ def get_endstops_status():
 def get_tof_distance():
     """
     Reads the Time-of-Flight (VL53L1X) laser distance sensor.
-    Returns the distance to the subject in mm.
+    Always answers 200:
+      status: "success" for a valid reading, "invalid" otherwise.
+      distance_mm: the distance in mm, or null when the reading is invalid.
+      valid: True when distance_mm is a real measurement.
+      available: False when the sensor failed to initialize (not connected, library missing).
+    An invalid reading (no target, timeout, I2C error) is not "no object": the empty backdrop reads valid.
     """
-    try:
-        distance = scanner.tof.get_distance_mm()
-        return {
-            "status": "success",
-            "distance_mm": distance
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ToF Sensor Error: {str(e)}")
+    tof = scanner.tof
+    available = bool(getattr(tof, "available", False))
+    distance = None
+    if available:
+        try:
+            distance = tof.read_distance_mm()
+        except Exception as e:
+            log.error(f"ToF test read failed: {e}")
+    valid = distance is not None
+    return {
+        "status": "success" if valid else "invalid",
+        "distance_mm": distance,
+        "valid": valid,
+        "available": available,
+    }
 
 
 # ── 2. Lighting & Relays ─────────────────────────────────────────────────────
@@ -166,11 +189,15 @@ def test_motor_enable(target: MotorTarget = MotorTarget.ALL):
     Useful to verify wiring and check if the motor locks up.
     """
     _require_motors_free()
-    if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
-        scanner.turntable_motor.enable()
-    if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
-        scanner.z_axis_motor.enable()
-        
+    try:
+        with scanner.motion_guard():
+            if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
+                scanner.turntable_motor.enable()
+            if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
+                scanner.z_axis_motor.enable()
+    except ScannerBusyError:
+        raise _motion_busy()
+
     return {"status": "success", "target": target, "state": "enabled"}
 
 @router.post("/motor/disable")
@@ -179,11 +206,15 @@ def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
     Manually releases motor torque (holding torque OFF / free wheel).
     """
     _require_motors_free()
-    if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
-        scanner.turntable_motor.disable()
-    if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
-        scanner.z_axis_motor.disable()
-        
+    try:
+        with scanner.motion_guard():
+            if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
+                scanner.turntable_motor.disable()
+            if target in (MotorTarget.Z_AXIS, MotorTarget.ALL):
+                scanner.z_axis_motor.disable()
+    except ScannerBusyError:
+        raise _motion_busy()
+
     return {"status": "success", "target": target, "state": "disabled"}
 
 
@@ -191,9 +222,9 @@ def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
 
 @router.post("/motor/home-bottom")
 def test_home_bottom(
-    delay: float = Query(0.0015, description="Cruise step delay in seconds"),
-    start_delay: float = Query(0.004, description="Starting ramp delay"),
-    ramp_percent: float = Query(0.1, description="Percentage of movement used for acceleration")
+    delay: float = Query(0.0015, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Cruise step delay in seconds"),
+    start_delay: float = Query(0.004, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Starting ramp delay"),
+    ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration")
 ):
     """
     Moves the Z-axis carriage DOWN until the bottom (home) limit switch is triggered.
@@ -201,22 +232,28 @@ def test_home_bottom(
     """
     _require_motors_free()
     try:
-        test_motor_enable(MotorTarget.Z_AXIS)
-        scanner.home_z_axis(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
+        with scanner.motion_guard():
+            test_motor_enable(MotorTarget.Z_AXIS)
+            scanner.home_z_axis(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
         return {
             "status": "success",
             "message": "Carriage successfully homed to bottom endstop.",
             "bottom_endstop": bool(scanner.down_endstop.is_active)
         }
+    except ScannerBusyError:
+        raise _motion_busy()
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Homing failed: {str(e)}")
+        text = str(e)
+        raise HTTPException(status_code=500, detail=text if text.startswith("Homing failed") else f"Homing failed: {text}")
 
 
 @router.post("/motor/move-to-top")
 def test_move_to_top(
-    delay: float = Query(0.0015, description="Cruise step delay in seconds"),
-    start_delay: float = Query(0.004, description="Starting ramp delay"),
-    ramp_percent: float = Query(0.1, description="Percentage of movement used for acceleration")
+    delay: float = Query(0.0015, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Cruise step delay in seconds"),
+    start_delay: float = Query(0.004, ge=STEP_DELAY_MIN, le=STEP_DELAY_MAX, description="Starting ramp delay"),
+    ramp_percent: float = Query(0.1, ge=0.0, le=1.0, description="Percentage of movement used for acceleration")
 ):
     """
     Moves the Z-axis carriage UP until the top limit switch is triggered.
@@ -224,13 +261,18 @@ def test_move_to_top(
     """
     _require_motors_free()
     try:
-        test_motor_enable(MotorTarget.Z_AXIS)
-        scanner.move_z_to_top(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
+        with scanner.motion_guard():
+            test_motor_enable(MotorTarget.Z_AXIS)
+            scanner.move_z_to_top(delay=delay, start_delay=start_delay, ramp_percent=ramp_percent)
         return {
             "status": "success",
             "message": "Carriage successfully reached top endstop.",
             "top_endstop": bool(scanner.up_endstop.is_active)
         }
+    except ScannerBusyError:
+        raise _motion_busy()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Move to top failed: {str(e)}")
 
@@ -244,28 +286,32 @@ def test_z_move(req: ZMoveRequest):
     Automatically blocked if the target limit switch is active.
     """
     _require_motors_free()
-    scanner.z_axis_motor.enable()
     try:
-        if req.direction == "up":
-            moved = scanner.move_z_up_distance(
-                distance=req.distance_mm,
-                delay=req.delay,
-                acceleration=req.acceleration,
-                start_delay=req.start_delay,
-                ramp_percent=req.ramp_percent,
-                decel_percent=req.decel_percent,
-                end_delay=req.end_delay
-            )
-        else:
-            moved = scanner.move_z_down_distance(
-                distance=req.distance_mm,
-                delay=req.delay,
-                acceleration=req.acceleration,
-                start_delay=req.start_delay,
-                ramp_percent=req.ramp_percent,
-                decel_percent=req.decel_percent,
-                end_delay=req.end_delay
-            )
+        with scanner.motion_guard():
+            scanner.z_axis_motor.enable()
+            try:
+                if req.direction == "up":
+                    moved = scanner.move_z_up_distance(
+                        distance=req.distance_mm,
+                        delay=req.delay,
+                        acceleration=req.acceleration,
+                        start_delay=req.start_delay,
+                        ramp_percent=req.ramp_percent,
+                        decel_percent=req.decel_percent,
+                        end_delay=req.end_delay
+                    )
+                else:
+                    moved = scanner.move_z_down_distance(
+                        distance=req.distance_mm,
+                        delay=req.delay,
+                        acceleration=req.acceleration,
+                        start_delay=req.start_delay,
+                        ramp_percent=req.ramp_percent,
+                        decel_percent=req.decel_percent,
+                        end_delay=req.end_delay
+                    )
+            finally:
+                scanner.z_axis_motor.disable()
 
         if not moved:
             raise RuntimeError("the movement was aborted before it completed")
@@ -275,14 +321,16 @@ def test_z_move(req: ZMoveRequest):
             "direction": req.direction,
             "distance_mm": req.distance_mm
         }
+    except ScannerBusyError:
+        raise _motion_busy()
+    except HTTPException:
+        raise
     except TopEndstopTriggered:
         raise HTTPException(status_code=400, detail="Cannot move UP: Top limit switch reached!")
     except BottomEndstopTriggered:
         raise HTTPException(status_code=400, detail="Cannot move DOWN: Bottom limit switch reached!")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Z-axis movement error: {str(e)}")
-    finally:
-        scanner.z_axis_motor.disable()
 
 
 @router.post("/turntable/rotate")
@@ -291,18 +339,23 @@ def test_turntable_rotate(req: TurntableRotateRequest):
     Rotates the turntable by a specific angle in degrees (e.g. 18°).
     """
     _require_motors_free()
-    scanner.turntable_motor.enable()
     try:
-        completed = scanner.turntable_motor.rotate_angle(
-            clockwise=req.clockwise,
-            angle=req.angle,
-            delay=req.delay,
-            acceleration=req.acceleration,
-            start_delay=req.start_delay,
-            ramp_percent=req.ramp_percent,
-            decel_percent=req.decel_percent,
-            end_delay=req.end_delay
-        )
+        with scanner.motion_guard():
+            scanner.turntable_motor.enable()
+            try:
+                completed = scanner.turntable_motor.rotate_angle(
+                    clockwise=req.clockwise,
+                    angle=req.angle,
+                    delay=req.delay,
+                    acceleration=req.acceleration,
+                    start_delay=req.start_delay,
+                    ramp_percent=req.ramp_percent,
+                    decel_percent=req.decel_percent,
+                    end_delay=req.end_delay
+                )
+            finally:
+                scanner.turntable_motor.disable()
+
         if not completed:
             raise RuntimeError("the rotation was aborted before it completed")
 
@@ -311,10 +364,12 @@ def test_turntable_rotate(req: TurntableRotateRequest):
             "angle": req.angle,
             "clockwise": req.clockwise
         }
+    except ScannerBusyError:
+        raise _motion_busy()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Turntable rotation error: {str(e)}")
-    finally:
-        scanner.turntable_motor.disable()
 
 
 # ── 6. Livestream & Camera Testing ───────────────────────────────────────────

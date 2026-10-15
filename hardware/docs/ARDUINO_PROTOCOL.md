@@ -39,8 +39,8 @@ The firmware is highly modularized, utilizing three primary internal libraries:
 ### `Motor` Class (`lib/Motor/`)
 Acts as the hardware abstraction layer for the TB6600 stepper drivers.
 * **Pin Management**: Encapsulates the `pulsePin`, `dirPin`, and `enPin` for a specific motor instance.
-* **Power Management**: Selectively toggles the EN (Enable) pin via `enable()` and `disable()` to apply holding torque only when necessary, preventing driver chips from overheating when idle.
-* **Microsecond Execution**: The `rotate()` method is a blocking `for`-loop that manually toggles the STEP pin using microsecond-precise delays to achieve perfectly smooth rotation.
+* **Power Management**: Selectively toggles the EN (Enable) pin via `enable()` and `disable()` to apply holding torque only when necessary, preventing driver chips from overheating when idle. EN is active LOW (LOW = driver energized, HIGH = driver off). `pinSetup()` latches EN HIGH *before* switching the pin to `OUTPUT`, so a configured motor is de-energized from the moment `CONFIG` returns, and `disable()` always writes the pin (it never trusts the cached `enableStatus`), so `DISABLE` and `0xFF` are never no-ops.
+* **Microsecond Execution**: `rotate()` and `rotateRamp()` are blocking loops that emit STEP pulses against an absolute `micros()` deadline (`stepAt()` / `waitUntil()`), polling for `0xFF` the whole time they wait. The step period floor is 60 us.
 
 ### `CommandHandler` Class (`lib/CommandHandler/`)
 The serial orchestrator responsible for reading the UART buffer and routing commands.
@@ -73,12 +73,9 @@ In desktop C++, passing complex types by reference (`const &`) is preferred. How
 * **Rule**: Primitives $\le 2$ bytes (`uint8_t`, `int8_t`, `bool`, `uint16_t`) are always passed by value in this codebase.
 
 ### Hardware Safeguards: Optocouplers & Integer Underflow
-1. **Optocoupler Saturation**: The TB6600 driver's internal optocoupler requires a minimum `10µs` HIGH pulse width for reliable edge detection. This `TB6600_REQ_MICROS_DELAY` is hardcoded into the stepper loop.
-2. **Unsigned Underflow Protection**: If a requested pulse delay is less than 10µs (e.g., `5µs`), subtracting `10` from `5` on an unsigned 32-bit integer would underflow to `4,294,967,291 µs`, locking the board for ~71 minutes! We use a ternary clamp to protect against this:
-   ```cpp
-   const uint32_t lowDelay = (delayMicros > TB6600_REQ_MICROS_DELAY) ? (delayMicros - TB6600_REQ_MICROS_DELAY) : 1;
-   ```
-3. **16-Bit Timer Constraints**: Arduino's native `delayMicroseconds()` on a 16MHz AVR is limited to $\le 16383\,\mu\text{s}$ due to 16-bit timer overflow limits. We created a custom `safeDelayMicroseconds()` helper that seamlessly falls back to `delay(ms)` when exceeding 16ms, allowing ultra-slow rotational profiles without timer corruption.
+1. **Optocoupler Saturation**: The TB6600 driver's internal optocoupler requires a minimum HIGH pulse width for reliable edge detection. The firmware holds STEP HIGH for `50µs` (`delayMicroseconds(50)` in `stepAt()`).
+2. **Period floor / unsigned underflow**: The step period is never computed by subtracting the pulse width from the requested delay. `stepAt()` simply schedules the next step `max(period, 60µs)` after the previous one, so a tiny or zero requested delay cannot underflow an unsigned 32-bit value.
+3. **No long blocking delays**: Steps are scheduled with absolute `micros()` deadlines and a polling busy-wait (wrap-safe signed comparison), so periods above 16ms (the `delayMicroseconds()` limit on a 16MHz AVR) need no `delay(ms)` fallback and `0xFF` is still seen within ~1ms.
 
 ---
 
@@ -93,9 +90,9 @@ When the Raspberry Pi opens the serial port, the Arduino Uno undergoes a DTR har
 
 Once the firmware boots and `setup()` finishes, it emits the ready banner:
 ```text
-0\n
+READY\n
 ```
-The Python `ArduinoBridge` strictly waits for this `0` before dispatching any instructions, ensuring commands are never swallowed by the bootloader.
+The Python `ArduinoBridge` waits for this line (older firmware printed `0\n`; both are accepted) before dispatching any instructions, ensuring commands are never swallowed by the bootloader. A `READY` line in the middle of a command means the board rebooted and the command was lost.
 
 ---
 
@@ -106,9 +103,9 @@ Commands are sent as ASCII strings, separated by spaces, and terminated by a new
 | Opcode (Hex) | Opcode (Dec) | ASCII Alias | Payload Format | Expected Response | Description |
 | :---: | :---: | :--- | :--- | :---: | :--- |
 | `0x01` | `1` | `PING` | `1\n` or `PING\n` | `0\n` | Health check & connection handshake. |
-| `0x02` | `2` | `CONFIG` | `2 <id> <step> <dir> <en>\n` | `0\n` or error | Configures `pinMode(OUTPUT)` for motor `<id>`. Motors start disabled. |
+| `0x02` | `2` | `CONFIG` | `2 <id> <step> <dir> <en>\n` | `0\n` or error | Configures `pinMode(OUTPUT)` for motor `<id>`. EN is driven HIGH (driver off) before it becomes an output, so the motor is released as soon as `CONFIG` returns (see 6.3). |
 | `0x03` | `3` | `ENABLE` | `3 <id>\n` | `0\n` or error | Drives EN pin LOW (energizes coils to apply holding torque). |
-| `0x04` | `4` | `DISABLE` | `4 <id>\n` | `0\n` or error | Drives EN pin HIGH (cuts coil current to cool motor & driver). |
+| `0x04` | `4` | `DISABLE` | `4 <id>\n` | `0\n` or error | Drives EN pin HIGH (cuts coil current to cool motor & driver). Always writes the pin, also if the motor is already disabled; idempotent. |
 | `0x05` | `5` | `ROTATE` | `5 <id> <steps> <dir> <us>\n` | `0\n` or `4\n` | Executes blocking stepping loop. `dir`: 1=CW, 0=CCW. |
 | `0x06` | `6` | `STOP` | `6 <id>\n` | `0\n` or error | In-band software stop for specific motor `<id>`. Releases torque. |
 | `0x10` | `16` | `ACCEL_ROTATE` | `16 <id> <steps> <dir> <target_us> <start_us> <accel> <decel> [<end_us>]\n` | `0\n` or `4\n` | Constant-acceleration speed-ramp move. Optional `<end_us>` = slow-stop tail (see 6.1). |
@@ -126,8 +123,19 @@ Commands are sent as ASCII strings, separated by spaces, and terminated by a new
   * Acceleration: `v_a = 1/start_us` -> `v_b = 1/target_us`.
   * Deceleration: `v_a = 1/target_us` -> `v_b = 1/end_us`.
 * Steps are scheduled against an absolute `micros()` deadline, so the cost of computing the next period is hidden inside the wait and does not stretch the ramp.
+* Each ramp step costs a `sqrtf` plus a float divide (roughly 200-400 us on the ATmega328P, an estimate that has not been measured). Below a ~400 us step period this can exceed the period and make ramp steps run late; the firmware does not guard against it. The Python side enforces `STEP_DELAY_MIN = 0.0001 s`, and scans should use >= 0.0005 s.
 * The firmware waits for the last step period to elapse before replying, so the rotor has settled on the final step when the Pi receives `0\n`.
 * Old firmware ignores the extra argument and old hosts simply omit it, so the two sides can be upgraded independently.
+
+### 6.2 Boot banner
+
+After a reset the firmware prints `READY\n` once (older firmware printed `0\n`; the host handshake accepts both). It is deliberately not a numeric status, so the host can tell a reboot in the middle of a command from the `0` (OK) answer of that command. While no command is pending the host simply discards it.
+
+### 6.3 EN pin boot state
+
+* The EN pin is active LOW: LOW = driver energized (holding torque), HIGH = driver off (shaft free).
+* After `CONFIG` the EN pin is HIGH and `isEnabled()` is `false`; the motor is free. Before this fix the pin came up LOW (AVR `pinMode(OUTPUT)` drives the PORT register, which is 0 after reset) while the firmware believed it was disabled, so `DISABLE` and `0xFF` were no-ops until the first `ENABLE` or move. **Re-flash is required** for the fix to take effect.
+* `ROTATE` / `ACCEL_ROTATE` enable the motor automatically (EN LOW); `DISABLE`, `STOP` and `0xFF` drive EN HIGH again.
 
 ---
 
@@ -139,11 +147,24 @@ To solve this, we use an **Out-of-Band Universal Abort Byte**: `0xFF` (`255`).
 > **Human Developer Alias:** For developers debugging via a serial terminal (like PlatformIO Monitor or PuTTY) where typing raw binary `0xFF` is impossible, typing `!` (ASCII 33) provides the exact same universal abort functionality.
 
 * The Raspberry Pi injects `0xFF` onto the serial line *without* a newline. 
-* Inside `Motor::rotate()`, between every single microsecond step, the C++ code runs `Serial.peek()`.
-* If it detects `0xFF` or `!`, it instantly aborts the stepping loop (latency $\le 1.0\text{ ms}$). `Motor::rotateRamp()` also polls while waiting between steps, so the latency stays $\le 1\text{ ms}$ even during the slow tail (step periods up to 30 ms).
+* Inside `Motor::rotate()` and `Motor::rotateRamp()` the C++ code runs `Serial.peek()` continuously, both before each step and while waiting for the next step deadline.
+* If it detects `0xFF` or `!`, it instantly aborts the stepping loop (latency $\le 1.0\text{ ms}$), even with step periods up to 30 ms (slow tail, slow constant-speed Z moves).
 * **Scope Differences:**
   * **Mid-Motion (`Motor::rotate`)**: The active, rotating motor cuts its own power (`this->disable()`), clears the serial buffer, and returns `STATUS_ERR_ABORTED` (`4\n`). (In this rig, only one motor moves at a time, so disabling the active one makes the whole system safe).
-  * **Idle (`CommandHandler::update`)**: If the byte is received while idle, the global orchestrator loops over all configured motors and disables them all, cutting total system torque.
+  * **Idle (`CommandHandler::update`)**: If the byte is received while idle, the global orchestrator loops over all configured motors and drives EN HIGH on every one of them (unconditionally, independent of the cached enable state), cutting total system torque. No reply is sent for a `0xFF` received while idle (the protocol is unchanged).
+
+---
+
+## 7.1 Host-side test
+
+`hardware/arduino_control/test/host/` contains a PlatformIO-independent C++ test that compiles `Motor.cpp` and `CommandHandler.cpp` against a fake `Arduino.h` (simulated pins, clock and serial):
+
+```bash
+cd hardware/arduino_control/test/host
+./run.sh
+```
+
+It checks the EN boot state, `DISABLE`/`0xFF` behaviour at idle and mid-move, prompt abort inside a 30 ms step wait, immediate first pulse and that `<end_us>` reaches the last step period. It cannot validate real CPU timing (e.g. the `sqrtf` cost at very short periods); that needs a hardware test.
 
 ---
 

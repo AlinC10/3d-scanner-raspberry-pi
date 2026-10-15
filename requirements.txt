@@ -221,3 +221,9 @@ zstandard
 pyserial>=3.5
 Adafruit-Blinka
 adafruit-circuitpython-vl53l1x
+
+# Runtime packages the rig needs on the Raspberry Pi (PERI-8, CLOUD-13).
+# Versions are NOT pinned in this file: on the Pi run `pip freeze | grep -i -E "rpi-hardware-pwm|vl53l1x|blinka"`
+# and pin the exact versions that were verified on the rig.
+# The ToF sensor is a VL53L1X (adafruit-circuitpython-vl53l1x above); nothing imports vl53l0x.
+rpi-hardware-pwm

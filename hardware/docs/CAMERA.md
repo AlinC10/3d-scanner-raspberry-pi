@@ -51,6 +51,11 @@ Digital zoom or Region of Interest (ROI) cropping alters the effective focal len
 ### 4. EXIF Serial Number Injection
 To prevent Meshroom's Bundle Adjustment node from averaging out subtle manufacturing differences between the two physical lenses (e.g. slight focal length or optical center variations), `camera.py` injects unique EXIF serial numbers (`cam0` and `cam1`). This causes Meshroom to automatically calibrate them as separate optical intrinsic groups.
 
+### 4b. Controls, Focus and Release Semantics
+* **`apply_settings` only touches what is passed.** `brightness`/`contrast`/`saturation`/`sharpness` no longer re-enable AE, so a locked exposure stays locked. `exposure_time` or `analogue_gain` disable AE (a gain-only call locks the exposure at the latest known metadata value; if none is known yet AE is left as is and may override the gain). `awb_mode` presets keep AWB enabled; manual `colour_gains` disable it.
+* **Focus after a reboot/power cycle.** The VCM is unpowered (at 0) whenever the camera is stopped, while the cached position comes from `focus_state_bus*.json`. The first position write after every camera start is therefore always sent to the hardware, and an I2C failure raises (`FocuserWriteError`, a `RuntimeError`) instead of silently committing the position. See [FOCUSER.md](../camera/docs/FOCUSER.md).
+* **`close()` releases the camera**: stops recording/preview/stream, `Picamera2.close()` (so the next `Picamera2(id)` does not report "device busy") and the focuser bus. It is idempotent and each step is guarded.
+
 ### 5. Photogrammetry Sensor Defaults
 To optimize raw capture fidelity for AliceVision Meshroom, `prepare_scan()` automatically enforces two optical defaults:
 * **`AeMeteringMode: CentreWeighted`**: Unlike standard matrix metering which averages dark empty backgrounds and severely overexposes centrally placed objects, center-weighted metering calculates exposure strictly from the central region where the object sits.

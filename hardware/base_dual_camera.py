@@ -15,6 +15,10 @@ from hardware.camera.config import (
 log = logging.getLogger(__name__)
 
 
+class CaptureError(RuntimeError):
+    """A still capture did not produce a usable image pair (missing frame, empty file, closed driver)."""
+
+
 class BaseDualCamera(ABC):
     """
     Abstract Base Class providing common lifecycle, controls, and helpers
@@ -56,6 +60,10 @@ class BaseDualCamera(ABC):
         self.cam1: Optional[ArducamIMX477] = None
         self.cam2: Optional[ArducamIMX477] = None
         self.cameras: List[ArducamIMX477] = []
+        # Set after each successful capture_photo (drivers that support it):
+        # {"paths": [p1, p2], "cameras": [{exposure_time, analogue_gain,
+        # colour_gains, sensor_timestamp, width, height}, {...}]}
+        self.last_capture_info: Optional[dict] = None
 
     # ── Backward-Compatibility Properties ──────────────────────
     @property

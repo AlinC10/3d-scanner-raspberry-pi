@@ -26,7 +26,7 @@ If Python sends configuration strings during this window, they are permanently l
 To prevent this, `_connect()` initiates an **Event-Driven Handshake**:
 1. It opens the port.
 2. It blocks and polls the serial buffer for up to 3 seconds.
-3. It waits for the C++ firmware's `setup()` function to emit the `0\n` (`STATUS_OK`) ready banner.
+3. It waits for the C++ firmware's `setup()` function to emit the `READY\n` boot banner (older firmware printed `0\n`; the handshake accepts both).
 4. Once received, communication is guaranteed to be safe.
 
 ---
@@ -47,11 +47,17 @@ Because multiple threads (e.g., the web API, a background scanning loop, and saf
 ## 4. Timeouts & The Out-of-Band Abort
 
 ### Dynamic Timeouts
-A standard web API expects responses within milliseconds. However, physical hardware moves at real-world speeds. A command to home the Z-axis (25,000 steps) might literally take 30 to 45 seconds to physically complete.
+A standard web API expects responses within milliseconds. However, physical hardware moves at real-world speeds. A command to home the Z-axis (up to 16,500 steps) might literally take 25 to 45 seconds to physically complete.
 
 Because the `ROTATE` command is synchronous (the Arduino will not return `0\n` until the final step is taken), the `send_command()` timeout is **dynamically adjusted** based on the kinematics:
-$$ \text{Timeout} = (\text{steps} \times \text{delay\_seconds}) \times 1.5 + 3.0\text{s} $$
+$$ \text{Timeout} = \text{duration} \times 1.5 + 3.0\text{s} + 2 \times \max(\text{start\_us}, \text{end\_us}) / 10^6 $$
+where `duration` is the exact time of the constant-acceleration phases (mean of the end speeds) plus the cruise steps. The last term covers the full final step period, which the mean-speed integral understates when the move ends on a long step (a `start_delay` of 50 ms, or a slow-stop `end_delay`). The firmware ramp was simulated step by step in `tests/test_ws_b_motor_bridge.py` and the timeout is asserted to be at least 1.2x the simulated duration over a grid of steps, delays and ramp percentages.
 This ensures Python correctly blocks for the duration of the movement without falsely triggering a serial `TimeoutException`.
+
+### Step-delay limits (`hardware/motor.py`)
+
+`Motor.rotate` raises `ValueError` (before anything is sent) when `delay` or `start_delay` is outside `[STEP_DELAY_MIN, STEP_DELAY_MAX]` = `[0.0001 s, 0.05 s]` (10 000 to 20 steps/s). `end_delay` keeps its own clamp to `[END_DELAY_MIN, END_DELAY_MAX]`, but a value `<= 0` is rejected. The STEP pulse is 50 us and the firmware enforces a period of at least 60 us, so a faster delay brings nothing.
+With a speed ramp and `delay < 0.0004 s` the per-step `sqrtf` can make the step timing slip on the AVR: a single warning is logged (the move is not rejected). Prefer `acceleration=False` or `delay >= 0.0005` there.
 
 ### Response Resynchronisation
 
@@ -60,7 +66,11 @@ This ensures Python correctly blocks for the duration of the movement without fa
 * The input buffer is flushed before every write, so a late reply of an earlier timed-out move (or the `0` boot banner of an Arduino that reset on its own) cannot be taken for the answer to the next command.
 * Only numeric status lines are accepted; anything else is logged and skipped.
 * On a timeout the bridge sends `0xFF` (the move may still be running), swallows the late `4`, flushes the buffer and returns `''`.
+* On a timeout of a *non-move* command (`ENABLE`, `DISABLE`, `CONFIG`, ...) no `0xFF` is sent: nothing can be running, and a stop sent to an idle Arduino would cut the torque of every motor.
+* The firmware boot banner is `READY` (not a numeric status). A `READY` line in the middle of a transaction means the board rebooted and the command was lost: it is reported as `4` (aborted) and bumps `connection_epoch`.
+* An answer `3` (`ERR_NOT_CONFIGURED`) means the board reset without dropping the USB link and forgot the motor pins. The stored `CONFIG` commands are replayed and the command is retried once (the refused command did nothing, so the retry is safe).
 * `connection_epoch` is incremented on every (re)connection. A reconnect resets the Arduino (all drivers disabled), and `Motor.is_enabled` uses the epoch to drop stale "energized" state.
+* `stop_epoch` is incremented on every universal stop (`send_stop()`, and the `0xFF` of the timeout resync above). A `0xFF` received while the Arduino is idle disables **all** drivers, not only the one of the `Motor` that asked for it. `Motor.is_enabled` is therefore False when either `connection_epoch` or `stop_epoch` changed since the motor was last known energized (`enable()` or a successful `rotate()`, which re-arm it). The epoch is read *before* the command is sent, so a stop that lands during a move which still reports `0` also invalidates it. `Motor` reads it with `getattr(bridge, "stop_epoch", 0)`, so bridge stand-ins without the attribute keep working.
 
 ### Out-of-Band Emergency Stop (`0xFF`)
 If the system is executing a 30-second rotation and an endstop limit switch is struck, Python must abort the rotation instantly. But because Thread A is holding the `_response_lock` waiting for the 30-second move to finish, a normal `STOP` command would be blocked.
@@ -71,6 +81,12 @@ To solve this, `send_stop()` is designated as an out-of-band bypass:
 3. It directly injects the raw `0xFF` byte onto the wire.
 4. The Arduino firmware intercepts `0xFF` between steps, halts, cuts torque, and replies `4\n` (`STATUS_ERR_ABORTED`).
 5. Thread A (which was blocking) receives the `4\n`, realizes the move was aborted, releases the `_response_lock`, and exits cleanly.
+
+`send_stop(repeat=1, gap_s=0.02)` writes the `0xFF` byte `repeat` times with `gap_s` seconds between two bytes (none after the last one), all under `_write_lock` and without waiting for any reply. `repeat=2` is used by the scanner's emergency stop: the second byte catches a move that was queued right behind the aborted one, without first waiting for a blocking `DISABLE`. `repeat < 1` is treated as 1. `stop_epoch` is incremented once per call (not per byte). `Motor.stop(release_torque=False, repeat=1)` forwards `repeat`, marks the motor disabled and, thanks to `stop_epoch`, every other `Motor` on the bridge reports `is_enabled == False` as well.
+
+### `Motor.disable()` result
+
+`Motor.disable()` returns `bool`. If the reply to `DISABLE` is not `0` (error status or timeout `''`), the command is sent **once more**. `True` means the Arduino confirmed it and `is_enabled` is False. After two failures it logs a warning, returns `False` and never raises (the cleanup paths depend on that); `is_enabled` is left as it was, so a driver that was energized keeps being reported as energized, and `Motor.disable_unconfirmed` is set until a later `enable()`, successful `rotate()` or confirmed `disable()`.
 
 ---
 
@@ -116,7 +132,7 @@ All synchronous commands routed through `send_command()` will return exactly one
 | :--- | :--- | :--- | :--- |
 | **`get_instance()`** | `port=None`, `baudrate=115200` | `ArduinoBridge` | Thread-safe singleton constructor / accessor. |
 | **`send_command()`** | `cmd: str`, `timeout=30.0` | `str` | Sends newline-terminated command under `_response_lock`. |
-| **`send_stop()`** | None | None | Out-of-band inject of `0xFF` (bypasses `_response_lock`). |
+| **`send_stop()`** | `repeat=1`, `gap_s=0.02` | None | Out-of-band inject of `0xFF` `repeat` times (bypasses `_response_lock`); increments `stop_epoch`. |
 | **`close()`** | None | None | Sends `0xFF` to cut torque and closes serial port. |
 
 ---

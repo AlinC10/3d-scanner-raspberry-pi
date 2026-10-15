@@ -59,6 +59,11 @@ On Raspberry Pi 4 and 5 compute modules, the CSI camera's I2C buses (`i2c-10` an
 1. The constructor opens the I2C bus handle (`smbus2.SMBus(bus)`) and loads the last-saved focus state from disk, but **defers** the `0x02` power-on write.
 2. The `_ensure_init()` method wraps the power-on write in a `try/except OSError` block, logging a debug notice if the camera is not yet streaming.
 3. When `picamera2` boots, the first call to `set_position()` or `restore_state()` safely completes the initialization.
+4. `invalidate()` (called by the camera classes on every camera stop) clears both the "hardware valid" flag and the init flag, so the next move re-runs the power-on write and is always sent to the hardware.
+
+### Errors
+* No smbus2 / no I2C bus: `FocuserUnavailable(RuntimeError)` is raised from the constructor (the library never calls `sys.exit()`).
+* I2C write failure (after one retry): `FocuserWriteError(FocuserUnavailable)` is raised from `set_position()`/`step()`/`reset()`; the position and the JSON state are **not** committed.
 
 ---
 
@@ -76,14 +81,17 @@ In `set_position()`, large jumps are broken down into a sequence of microsteps:
 * **Settle Time**: A post-movement pause (`VCM_MOVE_DELAY_S = 0.05s`) allows mechanical oscillation to completely dampen before any shutter opens.
 
 ```python
-# From hardware/camera/focuser.py
-direction = 1 if target > self._position else -1
-for p in range(self._position, target, direction * 20):
-    self._write_raw(p)
+# From hardware/camera/focuser.py (simplified)
+start = self._position if self._hw_valid else VCM_MIN_POS   # unpowered VCM sits at 0
+direction = 1 if target > start else -1
+for p in range(start, target, direction * 20):
+    self._write_checked(p)          # one retry, failure -> FocuserWriteError
     time.sleep(0.002)
 
-self._write_raw(target)
-self._position = target
+self._write_checked(target)
+self._position = target             # committed only after a successful write
+self._hw_valid = True
+self._save_state()
 ```
 
 ---
@@ -101,9 +109,10 @@ To prevent optical desynchronization:
    ```json
    {"position": 420}
    ```
-2. When the camera is rebooted or re-initialized, `restore_state()` is called:
-   * Reads the saved target position.
-   * Smoothly ramps the physical lens from `0` back to the saved target without needing a new autofocus sweep!
+2. When the camera is rebooted or re-initialized, the first `set_position()` / `restore_state()` is **forced** to the hardware even though the cached position equals the target (the cache says 450, the lens is at 0):
+   * `hw_valid` is `False` after process start and after every camera stop (`invalidate()`).
+   * The lens is smoothly ramped from `0` to the saved target without needing a new autofocus sweep.
+3. The JSON is written atomically and only after the hardware write succeeded.
 
 ---
 
@@ -129,7 +138,8 @@ Focuser(bus: int = VCM_I2C_BUS, addr: int = VCM_I2C_ADDR)
 #### `set_position(pos: int, settle: bool = True) -> None`
 Drives the lens to an absolute position (`0` = $\infty$, `1023` = macro) using the smooth ramp algorithm.
 * Clamps input between `VCM_MIN_POS` (0) and `VCM_MAX_POS` (1023).
-* Automatically updates the JSON state file.
+* Updates the JSON state file only after a successful hardware write (one retry, then `FocuserWriteError`).
+* The first move after a camera start is always written to the hardware.
 * If `settle=True`, waits for optical settling time.
 
 #### `step(delta: int) -> None`
@@ -140,11 +150,14 @@ Relative focus adjustment.
 #### `reset() -> None`
 Drives the lens smoothly to position `0` (infinity).
 
-#### `restore_state() -> None`
-Re-applies the last saved position from the JSON state cache. Called automatically after camera sensor boot.
+#### `restore_state() -> bool`
+Re-applies the last saved position when the hardware state is unknown. Returns `False` (logged) when the write fails.
+
+#### `invalidate() -> None` (alias `mark_unpowered()`)
+Marks the VCM as unpowered/unknown so the next write is forced. Called by the camera on every stop.
 
 #### `close() -> None`
-Closes the `smbus2.SMBus` file descriptor.
+Closes the `smbus2.SMBus` file descriptor. Idempotent.
 
 ---
 

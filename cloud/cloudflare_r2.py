@@ -1,21 +1,51 @@
 import logging
 import os
 import shutil
+import uuid
 import zipfile
 
 import boto3
-from botocore.exceptions import ClientError
+from boto3.exceptions import S3UploadFailedError
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from botocore.config import Config
 
-R2_CONFIG = Config(
-    connect_timeout=5,  # Fail fast if unable to open socket
-    read_timeout=15,  # Fail if transfer stalls
-    retries={'max_attempts': 1}  # Disable internal blind retries; our worker controls backoff
-)
+
+class R2Error(Exception):
+    """Raised for R2 problems the caller must react to (failed deletes, failed listing, failed preflight)."""
+
+
+def _build_r2_config() -> Config:
+    """
+    Build the botocore Config used for the R2 client.
+
+    boto3 >= 1.36 sends CRC checksums by default, which R2 can reject (CLOUD-16); the "when_required" options
+    turn that off. They do not exist on older botocore, which raises TypeError, so fall back to the options it knows.
+    """
+    base = dict(
+        connect_timeout=10,  # Fail fast if unable to open socket
+        read_timeout=60,  # Fail if transfer stalls (a full-resolution JPEG can take a while on a slow uplink)
+        retries={'max_attempts': 1},  # Disable internal blind retries; our worker controls backoff
+    )
+    attempts = (
+        dict(base, region_name="auto",
+             request_checksum_calculation="when_required",
+             response_checksum_validation="when_required"),
+        dict(base, region_name="auto"),
+        base,
+    )
+    for options in attempts[:-1]:
+        try:
+            return Config(**options)
+        except TypeError:
+            continue
+    return Config(**attempts[-1])
+
+
+R2_CONFIG = _build_r2_config()
 
 s3 = boto3.client(
     service_name="s3",
@@ -67,6 +97,9 @@ def file_exists_and_is_new(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BU
             return False
         logging.error("[R2] head_object error for %s: %s", object_name, e)
         return False
+    except BotoCoreError as e:
+        logging.error("[R2] head_object error for %s: %s", object_name, e)
+        return False
 
 
 def delete_file(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
@@ -82,45 +115,130 @@ def delete_file(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bo
     # Delete the file
     try:
         s3.delete_object(Bucket=bucket, Key=object_name)
-    except ClientError as e:
+    except (ClientError, BotoCoreError) as e:
         logging.error(e)
         return False
     return True
 
 
-def delete_all_files_from_bucket(bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> None:
+# delete_objects accepts at most 1000 keys per request
+_DELETE_CHUNK = 1000
+
+
+def list_keys(prefix: str = "", bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> set[str]:
     """
-    Delete all files from R2 bucket.
+    List every object key in the bucket (paginated, so more than 1000 objects are handled).
+    :param prefix: Only keys starting with this prefix are returned ("" = all keys)
+    :type prefix: str
+    :param bucket: Bucket to list
+    :type bucket: str
+    :return: Set of object keys
+    :rtype: set[str]
+    :raises R2Error: if the listing fails
+    """
+    keys: set[str] = set()
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                keys.add(obj['Key'])
+    except (ClientError, BotoCoreError) as e:
+        raise R2Error(f"Could not list bucket '{bucket}': {e}") from e
+    return keys
+
+
+def verify_keys(expected, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> list[str]:
+    """
+    Compare the expected keys with what is really in the bucket (one paginated listing).
+    :param expected: Iterable of object keys that must be present
+    :param bucket: Bucket to check
+    :type bucket: str
+    :return: Sorted list of expected keys that are missing from the bucket (empty = everything is there)
+    :rtype: list[str]
+    :raises R2Error: if the listing fails
+    """
+    present = list_keys(bucket=bucket)
+    return sorted(set(expected) - present)
+
+
+def delete_all_files_from_bucket(bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> int:
+    """
+    Delete all files from R2 bucket (paginated listing, delete_objects in chunks of 1000).
     :param bucket: Bucket to delete from
     :type bucket: str
-    :return: None
-    :rtype: None
+    :return: Number of objects deleted
+    :rtype: int
+    :raises R2Error: if listing or deleting fails, or if R2 reports per-key errors (the message lists the keys)
     """
-    response = s3.list_objects_v2(Bucket=bucket)
+    keys = sorted(list_keys(bucket=bucket))
+    if not keys:
+        logging.info("[R2] No files found in bucket '%s'.", bucket)
+        return 0
 
-    if 'Contents' in response:
-        # 2. Build a list of files to delete
-        objects_to_delete = [
-            {'Key': obj['Key']}
-            for obj in response['Contents']
-        ]
-
-        # 3. Delete them all in one batch operation (Free operation!)
-        if objects_to_delete:
-            s3.delete_objects(
+    deleted = 0
+    failed: list[str] = []
+    for start in range(0, len(keys), _DELETE_CHUNK):
+        chunk = keys[start:start + _DELETE_CHUNK]
+        try:
+            response = s3.delete_objects(
                 Bucket=bucket,
-                Delete={'Objects': objects_to_delete}
+                Delete={'Objects': [{'Key': key} for key in chunk], 'Quiet': True}
             )
-            print(f"Cleaned up {len(objects_to_delete)} old files. Bucket is ready for the next scan!")
+        except (ClientError, BotoCoreError) as e:
+            raise R2Error(f"Could not delete objects from bucket '{bucket}': {e}") from e
+        errors = response.get('Errors') or []
+        failed.extend(err.get('Key', '?') for err in errors)
+        deleted += len(chunk) - len(errors)
 
-        return
+    if failed:
+        raise R2Error(
+            f"Failed to delete {len(failed)} object(s) from bucket '{bucket}': " + ", ".join(sorted(failed))
+        )
+    logging.info("[R2] Cleaned up %d old files in bucket '%s'.", deleted, bucket)
+    return deleted
 
-    print("No files found in the bucket.")
+
+def preflight(bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> None:
+    """
+    Verify that uploads to R2 will work before a scan starts.
+
+    Checks the R2_* environment variables, then does a small write + head + delete round trip on a throw-away key.
+    This exercises the credentials, the bucket permissions and the checksum behaviour (CLOUD-16).
+    :param bucket: Bucket to probe
+    :type bucket: str
+    :return: None
+    :raises R2Error: with a human readable message when anything is wrong
+    """
+    missing = [
+        name for name in ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+        if not os.environ.get(name, "").strip()
+    ]
+    if missing:
+        raise R2Error("Cloudflare R2 is not configured, missing environment variable(s): " + ", ".join(missing))
+
+    key = f"_preflight/{uuid.uuid4().hex}.txt"
+    written = False
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=b"preflight")
+        written = True
+        s3.head_object(Bucket=bucket, Key=key)
+    except (ClientError, BotoCoreError, OSError) as e:
+        raise R2Error(
+            f"R2 write test failed on bucket '{bucket}' (check credentials, bucket name and permissions): {e}"
+        ) from e
+    finally:
+        if written:
+            try:
+                s3.delete_object(Bucket=bucket, Key=key)
+            except (ClientError, BotoCoreError, OSError) as e:
+                raise R2Error(
+                    f"R2 delete test failed on bucket '{bucket}' (probe object '{key}' may be left behind): {e}"
+                ) from e
 
 
 def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_name: str | None = None) -> bool:
     """
-    Upload a file to an S3 bucket
+    Upload a file to an S3 bucket. Never raises: every failure is logged and reported as False.
     :param file_name: File to upload
     :type file_name: str
     :param bucket: Bucket to upload to
@@ -135,11 +253,24 @@ def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_
     if object_name is None:
         object_name = os.path.basename(file_name)
 
+    # Do not touch the network for a file that is missing or empty (a 0-byte photo is a failed capture)
+    try:
+        size = os.path.getsize(file_name) if os.path.isfile(file_name) else None
+    except OSError as e:
+        logging.error("[R2] Cannot stat %s: %s", file_name, e)
+        return False
+    if size is None:
+        logging.error("[R2] Not uploading %s: file does not exist", file_name)
+        return False
+    if size == 0:
+        logging.error("[R2] Not uploading %s: file is empty (0 bytes)", file_name)
+        return False
+
     # Upload the file
     try:
         s3.upload_file(file_name, bucket, object_name)
-    except ClientError as e:
-        logging.error(e)
+    except (ClientError, BotoCoreError, S3UploadFailedError, OSError) as e:
+        logging.error("[R2] Upload of %s as %s failed: %s", file_name, object_name, e)
         return False
     return True
 

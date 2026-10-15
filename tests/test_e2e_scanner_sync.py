@@ -28,8 +28,19 @@ from hardware.scanner import Scanner, ScannerState
 from hardware.dual_camera_rpi_sync import DualCameraRPISync
 
 
+
+def _write_fake_jpeg(path, img=None, params=None):
+    """cv2 is a MagicMock under tests/__init__: give imwrite the one side effect capture_photo now verifies (a file with bytes)."""
+    with open(path, "wb") as f:
+        f.write(b"\xff\xd8fake-jpeg\xff\xd9")
+    return True
+
+
 class TestE2EScannerRPISync(unittest.TestCase):
     def setUp(self):
+        patcher = patch("hardware.dual_camera_rpi_sync.cv2.imwrite", side_effect=_write_fake_jpeg)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tmp_dir = tempfile.mkdtemp()
         self.scanner = Scanner(camera_mode="rpi_sync")
 

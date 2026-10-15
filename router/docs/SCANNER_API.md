@@ -1,6 +1,6 @@
 # Scanner Core API Documentation (`/scanner`)
 
-The Scanner router (`../scanner.py`) orchestrates the end-to-end photogrammetry pipeline: camera stream initialization, mechanical positioning, 360° capture synchronization, cloud GPU 3D reconstruction, and mesh retrieval.
+The Scanner router (`../scanner.py`) orchestrates the end-to-end photogrammetry pipeline: camera stream initialization, mechanical positioning, 360° capture synchronization, photo upload to Cloudflare R2 with verification, and (optionally, per request) cloud GPU 3D reconstruction and mesh retrieval.
 
 Interactive OpenAPI documentation is accessible at: `http://<pi-ip>:8000/docs#/Scanner`
 
@@ -38,7 +38,8 @@ stateDiagram-v2
         FinalizeUpload --> [*]
     }
 
-    RUNNING --> PROCESSING: Photos uploaded to R2
+    RUNNING --> COMPLETED: Photos verified in R2 (cloud.launch_runpod = false, default)
+    RUNNING --> PROCESSING: Photos verified in R2 (cloud.launch_runpod = true)
     PROCESSING --> DOWNLOADING: RunPod photogrammetry completes
     DOWNLOADING --> COMPLETED: 3D output.zip extracted
 
@@ -49,7 +50,7 @@ stateDiagram-v2
     DOWNLOADING --> CANCELLED: POST /scanner/cancel
 
     PREPARING --> ERROR: Mechanical / Cloud failure
-    RUNNING --> ERROR: Upload stall / Motor error
+    RUNNING --> ERROR: Photos missing in R2 / Upload stall / Motor error
     PROCESSING --> ERROR: RunPod OOM / timeout
     DOWNLOADING --> ERROR: R2 download failure
 ```
@@ -61,9 +62,9 @@ stateDiagram-v2
 | Method | Path | Status Code | Description |
 |---|---|---|---|
 | `POST` | `/scanner/prepare` | `202 Accepted` | Starts live stream immediately, homes carriage, and auto-tunes cameras in background |
-| `POST` | `/scanner/start` | `202 Accepted` | Launches the physical scan, cloud Meshroom pod, and asset download pipeline |
+| `POST` | `/scanner/start` | `202 Accepted` | Launches the physical scan and the verified upload to R2; the RunPod pipeline only when `cloud.launch_runpod` is `true` |
 | `POST` | `/scanner/cancel` | `200 OK` | Emergency stop: cuts motor power, kills lights, closes streams, terminates cloud pods |
-| `GET` | `/scanner/status` | `200 OK` | Polls current state, total captured photos, and active stream URLs |
+| `GET` | `/scanner/status` | `200 OK` | Polls current state, phase, photo counters (captured / uploaded / missing), failure reason, and active stream URLs |
 | `GET` | `/scanner/stream/mjpeg` | `200 OK` | Direct multipart MJPEG stream for browser `<img>` tags (`?camera=1\|2`) with on-demand encoding |
 | `POST` | `/scanner/stream/active` | `200 OK` | Instantaneous zero-latency active preview camera switch (`?camera_id=1\|2`) |
 | `POST` | `/scanner/stream/quality` | `200 OK` | Dynamically updates live stream JPEG compression quality (`1..100`, default 80) |
@@ -134,7 +135,9 @@ Prepares the scanner for framing and calibration.
 ```
 
 ### Error Responses
-* `400 Bad Request`: If scanner is currently in an invalid state (e.g. `RUNNING` or `PROCESSING`).
+* `400 Bad Request`: If scanner is currently in an invalid state (e.g. `RUNNING` or `PROCESSING`), or the scanner refuses to prepare with a message (preflight refusal). The state is checked **before** anything is touched, so a refused `/prepare` does not change the LED brightness.
+* `409 Conflict`: A temporary refusal: an emergency stop is still tearing the previous run down, or another motion (manual `/test` move, homing) is in progress. Retry shortly.
+* `422 Unprocessable Entity`: Invalid body, e.g. `illumination_brightness` is `0` (the range is `0 < b <= 1.0`: the scanner cannot scan in the dark) or a request key is unknown.
 * `500 Internal Server Error`: Hardware initialization failure.
 
 ### Example `curl`
@@ -156,7 +159,7 @@ curl -X POST http://localhost:8000/scanner/prepare \
 
 ## 2. Start Scan (`POST /scanner/start`)
 
-Starts the automated scanning and cloud 3D generation workflow.
+Starts the automated scanning workflow: physical scan, photo upload to R2 and verification of the uploaded set. The cloud 3D generation (RunPod) is **optional** and off by default (`cloud.launch_runpod`).
 
 ### Pre-conditions
 * Scanner state **must** be `PREPARED` (obtained by polling `GET /scanner/status` after calling `/prepare`).
@@ -171,17 +174,22 @@ Starts the automated scanning and cloud 3D generation workflow.
      * Pushes captured images into a background upload queue (uploads stream to Cloudflare R2 in parallel).
      * Climbs Z-axis by `z_move_mm` (default `100.0mm`) per elevation ring until the top limit switch triggers.
      * Stalled-upload watchdog guarantees all photos are securely stored in R2.
-   * **Stage 2 (Cloud Meshroom Photogrammetry - `PROCESSING`)**:
+     * When the scan ends, the uploads are verified against the list of expected keys in the R2 bucket. Missing photos end the run in `error` (see below) and stay on disk.
+   * **Stage 1b (Completion without RunPod - `COMPLETED`)** (`cloud.launch_runpod = false`, the default):
+     * The state becomes `COMPLETED` as soon as the photos are verified in R2. `cloud.runpod` is not imported or called, so a missing RunPod key or package does not matter. Download the photos from the bucket for Meshroom.
+   * **Stage 2 (Cloud Meshroom Photogrammetry - `PROCESSING`)** (only when `cloud.launch_runpod = true`):
      * Transitions state to `PROCESSING`.
      * Launches a cloud GPU pod on RunPod (e.g., RTX 4090 / RTX 5090).
      * Runs Meshroom pipeline: Feature Extraction (SIFT), Structure-from-Motion (SfM), DepthMap, Meshing, Texturing.
      * Automatically handles out-of-memory GPU fallbacks.
-   * **Stage 3 (Asset Download - `DOWNLOADING`)**:
+   * **Stage 3 (Asset Download - `DOWNLOADING`)** (only with RunPod):
      * Transitions state to `DOWNLOADING`.
      * Downloads `output.zip` containing the completed `.obj`, `.mtl`, and texture files from Cloudflare R2.
      * Extracts files to the local output directory.
-   * **Stage 4 (Completion - `COMPLETED`)**:
+   * **Stage 4 (Completion - `COMPLETED`)** (only with RunPod):
      * Transitions state to `COMPLETED`.
+
+> A `CANCELLED` state is never overwritten: a cancel that arrives while the pipeline is finishing keeps the run `cancelled`.
 
 ### Request Body (`StartRequest`)
 ```json
@@ -190,7 +198,6 @@ Starts the automated scanning and cloud 3D generation workflow.
   "mechanical": {
     "turntable": {
       "angle": 18.0,
-      "clockwise": true,
       "delay": 0.0010,
       "acceleration": true,
       "ramp_percent": 0.2,
@@ -200,7 +207,6 @@ Starts the automated scanning and cloud 3D generation workflow.
     },
     "z_axis": {
       "distance_mm": 100.0,
-      "direction": "up",
       "delay": 0.0010,
       "acceleration": false,
       "ramp_percent": 0.2,
@@ -210,6 +216,7 @@ Starts the automated scanning and cloud 3D generation workflow.
     }
   },
   "cloud": {
+    "launch_runpod": false,
     "resolution_mp": 12.0,
     "mode": "rig",
     "depthmap_downscale": 2,
@@ -220,24 +227,31 @@ Starts the automated scanning and cloud 3D generation workflow.
 
 #### Mechanical & Motor Configuration Parameters
 
+> A scan always rotates the platter in one fixed direction and only climbs, so the request has no `turntable.clockwise` and no `z_axis.direction`. A client that still sends them is not rejected: the fields are ignored. The manual test endpoints (`/test/turntable/rotate`, `/test/motor/z-move`) keep `clockwise` and `direction`.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `turntable.angle` | `float` | `18.0` | Turntable rotation angle per slice in degrees (must yield integer microsteps). |
-| `turntable.clockwise` | `bool` | `true` | Turntable rotation direction. |
-| `z_axis.distance_mm` | `float` | `100.0` | Vertical travel distance in millimeters between rotational slices. |
-| `z_axis.direction` | `string` | `"up"` | Direction of Z-axis carriage travel. |
-| `turntable.delay` | `float` | `0.0010` | Cruise pulse delay in seconds (target maximum angular speed). |
+| `turntable.angle` | `float` | `18.0` | Turntable rotation angle per slice in degrees. At most `180`, a whole number of microsteps (multiples of `0.1125°`) **and** it must divide a full revolution in whole steps (`3200 % steps == 0`, e.g. `18`, `22.5`, `11.25`; `33.75` is rejected) so a ring of photos closes exactly at 360°. |
+| `z_axis.distance_mm` | `float` | `100.0` | Vertical travel distance in millimeters between rotational slices (`> 0`, at most `150`, the Z travel). |
+| `turntable.delay` | `float` | `0.0010` | Cruise pulse delay in seconds (target maximum angular speed), range `0.0001`–`0.05`. Recommended for scans: `>= 0.0005`. |
 | `turntable.acceleration` | `bool` | `true` | Enables trapezoidal velocity ramping to prevent heavy object slippage. |
 | `turntable.ramp_percent` | `float` | `0.2` | Fraction of total steps for acceleration ramp (`0.0` to `1.0`). |
 | `turntable.decel_percent` | `float \| null` | `null` | Separate deceleration fraction. If `null`, mirrors `ramp_percent`. |
-| `turntable.start_delay` | `float \| null` | `null` | Initial launch delay in seconds. Defaults to `3 * delay` (light objects) or `5x–8x` for heavy items. |
+| `turntable.start_delay` | `float \| null` | `null` | Initial launch delay in seconds, range `0.0001`–`0.05`. Defaults to `3 * delay` (light objects) or `5x–8x` for heavy items. |
 | `turntable.end_delay` | `float \| null` | `0.015` | Step delay in seconds at the end of each deceleration (slow stop), range `0.005`–`0.030`; `null` disables it. Out-of-range values are rejected (`422`). |
-| `z_axis.delay` | `float` | `0.0010` | Cruise pulse delay in seconds for vertical lead screw elevator. |
+| `z_axis.delay` | `float` | `0.0010` | Cruise pulse delay in seconds for vertical lead screw elevator, range `0.0001`–`0.05`. |
 | `z_axis.acceleration` | `bool` | `false` | Disabled by default on Z-axis to prevent lead screw shuddering. |
 | `z_axis.ramp_percent` | `float` | `0.2` | Fraction of steps for acceleration if `z_axis.acceleration` is enabled. |
 | `z_axis.decel_percent` | `float \| null` | `null` | Optional separate deceleration fraction for Z-axis. |
-| `z_axis.start_delay` | `float \| null` | `null` | Starting launch delay for Z-axis if acceleration is enabled. |
+| `z_axis.start_delay` | `float \| null` | `null` | Starting launch delay for Z-axis if acceleration is enabled, range `0.0001`–`0.05`. |
 | `z_axis.end_delay` | `float \| null` | `null` | Optional slow-stop step delay for the Z-axis, range `0.005`–`0.030`; `null` (default) disables it. |
+| `cloud.launch_runpod` | `bool` | `false` | `false`: the scan stops (`completed`) once the photos are verified in R2. `true`: the RunPod pipeline runs afterwards. With `true`, `/start` answers `400` when `RUNPOD_API_KEY` or the image name is missing/placeholder. |
+| `cloud.resolution_mp` | `float` | `12.0` | Capture resolution in megapixels, `0 < mp <= 13.0` (12.0 nominal, 12.33 real sensor value). |
+| `cloud.mode` | `string` | `"rig"` | `single`, `rig` or `two-sides`. |
+| `cloud.depthmap_downscale` | `int` | `2` | Meshroom DepthMap downscale (`>= 1`). |
+| `cloud.max_input_points` | `int` | `10000000` | Meshroom meshing input point cap (`>= 1000`). |
+
+> **Unknown keys are rejected (`422`).** `StartRequest`, `mechanical`, `turntable`, `z_axis` and `cloud` use `extra="forbid"`: a misspelled or misplaced key (e.g. `mechanical.angle` instead of `mechanical.turntable.angle`) no longer silently falls back to the default. Only the legacy `turntable.clockwise` and `z_axis.direction` are still accepted (and ignored). The `camera_config` block of `/prepare` still tolerates extra keys.
 
 ### Response (`202 Accepted` - `StartResponse`)
 ```json
@@ -248,8 +262,8 @@ Starts the automated scanning and cloud 3D generation workflow.
 ```
 
 ### Error Responses
-* `400 Bad Request`: If scanner state is not `PREPARED`.
-* `422 Unprocessable Entity`: `turntable.angle` is not a whole number of microsteps (multiples of `0.1125°` at 1/16) or `z_axis.distance_mm` is not a whole number of steps (multiples of `0.01 mm` at 1/4). Validated up front, so a bad value no longer fails the scan after `prepare`.
+* `400 Bad Request`: If scanner state is not `PREPARED`, or `cloud.launch_runpod` is `true` and RunPod is not configured (`RUNPOD_API_KEY` missing, placeholder image name). Refused before the physical scan starts.
+* `422 Unprocessable Entity`: an unknown key anywhere in the body (e.g. `mechanical.angle`, `mechanical.z_move_mm`); `cloud.resolution_mp` is `0` or above `13.0`; `turntable.angle` is not a whole number of microsteps (multiples of `0.1125°` at 1/16), is above `180`, or does not divide a full revolution in whole steps (`3200 % steps != 0`, e.g. `33.75` or `360`); `z_axis.distance_mm` is above `150` or not a whole number of steps (multiples of `0.01 mm` at 1/4); `delay` / `start_delay` is outside `0.0001`–`0.05` s. Validated up front, so a bad value no longer fails the scan after `prepare`. (The manual `POST /test/turntable/rotate` still accepts up to `360°`, see `TEST_API.md`.)
 * `409 Conflict`: A previous `POST /scanner/start` was already accepted and its pipeline has not finished yet (prevents two simultaneous scans from a double click).
   ```json
   {"detail": "Cannot start scan from state idle. Must be PREPARED."}
@@ -262,9 +276,8 @@ curl -X POST http://localhost:8000/scanner/start \
      -d '{
        "job_id": "scan-sample-01",
        "mechanical": {
-         "angle": 18.0,
-         "z_move_mm": 50.0,
          "turntable": {
+           "angle": 18.0,
            "delay": 0.0010,
            "acceleration": true,
            "ramp_percent": 0.4,
@@ -272,11 +285,13 @@ curl -X POST http://localhost:8000/scanner/start \
            "start_delay": 0.0060
          },
          "z_axis": {
+           "distance_mm": 50.0,
            "delay": 0.0010,
            "acceleration": false
          }
        },
        "cloud": {
+         "launch_runpod": false,
          "mode": "rig",
          "depthmap_downscale": 2
        }
@@ -313,7 +328,7 @@ curl -X POST http://localhost:8000/scanner/cancel
 
 ## 4. Get Status (`GET /scanner/status`)
 
-Polling endpoint used by the frontend to track active state, photo count, and RTSP stream links.
+Polling endpoint used by the frontend to track the active state, the phase, photo counters, the failure reason, and RTSP stream links.
 
 ### Recommended Polling Interval
 * **During Preparation / Running / Processing**: Poll every **1.0 to 2.0 seconds**.
@@ -327,9 +342,35 @@ Polling endpoint used by the frontend to track active state, photo count, and RT
   "stream_urls": [
     "rtsp://192.168.1.100:8554/cam0",
     "rtsp://192.168.1.100:8554/cam1"
-  ]
+  ],
+  "phase": "scanning",
+  "phase_message": "Ring 2: capturing",
+  "level": 2,
+  "photos_captured": 24,
+  "photos_uploaded": 22,
+  "missing": [],
+  "error": null,
+  "tof_warnings": []
 }
 ```
+
+| Field | Type | Description |
+|---|---|---|
+| `state` | `string` | State machine state (table below). |
+| `total_photos` | `int` | Photos captured so far (kept for backward compatibility). |
+| `phase` | `string \| null` | Finer progress inside a state, e.g. `preparing`, `scanning`, `uploading`, `verifying`, `done`. `null` when the scanner does not report it. |
+| `phase_message` | `string \| null` | Human readable detail of the phase. |
+| `level` | `int` | Current ring (`0` = first). |
+| `photos_captured` | `int` | Photos taken by the cameras. |
+| `photos_uploaded` | `int` | Photos confirmed uploaded to R2. |
+| `missing` | `string[]` | R2 keys not found at the final verification (at most 50 are returned). Non-empty only with `state: "error"`. |
+| `error` | `string \| null` | Why the run ended in `error`. |
+| `tof_warnings` | `string[]` | Time-of-flight sensor warnings (e.g. invalid readings) raised during the scan. |
+
+All new fields have safe defaults (`null`, `0`, `[]`), so a client written for the old response keeps working.
+
+### Error mapping
+When `scan()` finishes the physical scan but the verification finds photos missing from the bucket, the pipeline ends in `state: "error"` with `missing` and `error` filled (the photos stay on disk). Any other failure ends in `error` too, except a cancel: `cancelled` is never overwritten.
 
 ### State Meaning Table
 | `state` | Description | Typical Duration |
@@ -338,11 +379,11 @@ Polling endpoint used by the frontend to track active state, photo count, and RT
 | `preparing` | Cameras streaming, carriage homing, cloud sanitizing | 15–30 seconds |
 | `prepared` | Carriage in position, AE/AWB locked, ready to scan | Until `/start` |
 | `running` | Turntable rotating, taking photos, uploading to R2 | 2–5 minutes |
-| `processing` | RunPod GPU photogrammetry pipeline executing | 3–10 minutes |
-| `downloading` | Downloading completed 3D model from R2 | 10–30 seconds |
-| `completed` | 3D model ready in output folder | Finished |
+| `processing` | Finalising after the scan; with `cloud.launch_runpod = true` the RunPod GPU pipeline is executing | seconds (3–10 minutes with RunPod) |
+| `downloading` | Downloading completed 3D model from R2 (RunPod only) | 10–30 seconds |
+| `completed` | Photos verified in R2 (default) or, with RunPod, 3D model ready in output folder | Finished |
 | `cancelled` | Aborted by user via `/cancel` | Finished |
-| `error` | Hardware or cloud failure occurred | Finished |
+| `error` | Hardware, upload verification (`missing` photos) or cloud failure occurred; see `error` | Finished |
 
 ### Example `curl`
 ```bash
@@ -534,19 +575,19 @@ async function startScan(jobId: string) {
     body: JSON.stringify({
       job_id: jobId,
       mechanical: {
-        angle: 18.0,
-        z_move_mm: 80.0,
         turntable: {
+          angle: 18.0,
           delay: 0.0010,
           acceleration: true,
           ramp_percent: 0.2
         },
         z_axis: {
+          distance_mm: 80.0,
           delay: 0.0010,
           acceleration: false
         }
       },
-      cloud: { mode: "rig", depthmap_downscale: 2 }
+      cloud: { launch_runpod: false, mode: "rig", depthmap_downscale: 2 }
     })
   });
 
@@ -560,11 +601,12 @@ async function pollUntilState(targetState: string) {
     const res = await fetch("http://<pi-ip>:8000/scanner/status");
     const status = await res.json();
     
-    console.log(`Current state: ${status.state}, Photos: ${status.total_photos}`);
-    
+    console.log(`Current state: ${status.state} (${status.phase ?? "-"}), photos: ${status.photos_uploaded}/${status.photos_captured}`);
+
     if (status.state === targetState) return status;
     if (status.state === "error" || status.state === "cancelled") {
-      throw new Error(`Scan ended with state: ${status.state}`);
+      const why = status.error ?? `${status.missing.length} photo(s) missing`;
+      throw new Error(`Scan ended with state: ${status.state} (${why})`);
     }
     
     await new Promise(r => setTimeout(r, 1500));

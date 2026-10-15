@@ -14,7 +14,13 @@ The class saves its last known position to a JSON file in the `config/` director
 
 ## Properties
 
-* **`position`** (int): Retrieves the currently tracked focus position (0 to 1023).
+* **`position`** (int): Retrieves the last committed focus position (0 to 1023).
+* **`hw_valid`** (bool): `True` only while the VCM is known to physically be at `position`. It is `False` after process start, after `invalidate()` and after a failed write.
+
+## Errors
+
+* **`FocuserUnavailable(RuntimeError)`**: smbus2 missing or the I2C bus cannot be opened (previously `sys.exit()`).
+* **`FocuserWriteError(FocuserUnavailable)`**: an I2C write failed (after one retry). The position and the state file are not updated.
 
 ## Core Methods
 
@@ -24,7 +30,8 @@ Initializes the VCM controller for a specific I2C bus and address. Loads the pre
 ### `set_position(self, pos: int, settle: bool = True)`
 Moves the VCM to the absolute position between `VCM_MIN_POS` (0, infinity) and `VCM_MAX_POS` (1023, macro).
 * Implements a **smooth ramp** algorithm. Instead of sending a single large jump command which causes physical snapping and mechanical shock, it increments the movement in microsteps of 20 units with a 2ms delay.
-* Automatically saves the new position to the state JSON.
+* The first call after a camera start (`hw_valid` False) is always written to the hardware (ramping from 0, the power-on position) even if the cached position equals the target.
+* The position and the state JSON are committed only after the final write succeeded; a failed write is retried once and then raises `FocuserWriteError`.
 * If `settle` is `True`, adds a brief 60ms delay at the end to allow the lens to stop vibrating before a photo is taken.
 
 ### `step(self, delta: int)`
@@ -33,5 +40,11 @@ Moves the VCM by a relative step. A positive delta moves focus nearer (macro), w
 ### `reset(self)`
 Resets the focus strictly to position 0 (infinity).
 
-### `restore_state(self)`
-Forces the hardware to physically move to the `position` tracked in the state file. This is generally called automatically by the camera class just after the camera begins streaming, ensuring the physical lens location matches the software's understanding of it.
+### `restore_state(self) -> bool`
+Forces the hardware to physically move to the `position` tracked in the state file when the hardware state is unknown (`hw_valid` False). Returns `False` (and logs) instead of raising when the write fails.
+
+### `invalidate(self)` (alias `mark_unpowered`)
+Marks the VCM as unpowered/unknown. The camera classes call it whenever a camera stops; the next `set_position()` is forced and re-runs the VCM power-on write.
+
+### `close(self)`
+Closes the I2C bus. Idempotent.
