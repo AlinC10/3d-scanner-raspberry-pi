@@ -72,7 +72,7 @@ MIN_FREE_DISK_MB = _env_float("SCAN_MIN_FREE_DISK_MB", 2048.0)
 # The attribute exposed in /status keeps only the first entries of the missing list; the manifest keeps all of them.
 MISSING_STATUS_CAP = 50
 
-TOF_BACKGROUND_DISTANCE_MM = 535
+TOF_BACKGROUND_DISTANCE_MM = 320
 # An object is detected only when the reading is closer than the backdrop by more than this
 # margin, so ToF noise on the empty backdrop does not count as an object. Calibrate on the rig.
 TOF_CLEARANCE_MARGIN_MM = 25
