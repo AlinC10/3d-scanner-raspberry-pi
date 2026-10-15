@@ -492,6 +492,26 @@ class TestTravelLimit(unittest.TestCase):
             self.s.move_z_to_top()
         self.assertEqual(self.s.z_axis_motor.rotate.call_args.kwargs["steps"], 16500)
 
+    def test_acceleration_is_on_by_default_for_homing_and_move_to_top(self):
+        for call in (self.s.home_z_axis, self.s.move_z_to_top):
+            self.s.z_axis_motor.rotate.reset_mock()
+            with self.assertRaises(ScannerError):
+                call()
+            kw = self.s.z_axis_motor.rotate.call_args.kwargs
+            self.assertTrue(kw["acceleration"])
+            self.assertEqual(kw["start_delay"], 0.004)
+
+    def test_acceleration_can_be_switched_off_for_homing_and_move_to_top(self):
+        for call in (self.s.home_z_axis, self.s.move_z_to_top):
+            self.s.z_axis_motor.rotate.reset_mock()
+            with self.assertRaises(ScannerError):
+                call(delay=0.001, acceleration=False)
+            kw = self.s.z_axis_motor.rotate.call_args.kwargs
+            self.assertFalse(kw["acceleration"])
+            self.assertIsNone(kw["start_delay"])
+            self.assertEqual(kw["delay"], 0.001)
+            self.assertEqual(kw["steps"], 16500)
+
     def test_homing_failure_still_releases_the_torque(self):
         with self.assertRaises(ScannerError):
             self.s.home_z_axis()

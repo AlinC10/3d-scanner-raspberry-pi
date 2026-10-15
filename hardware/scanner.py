@@ -787,11 +787,13 @@ class Scanner:
         steps = self.z_axis_motor.distance_to_step_conversion(distance=distance, step_type=step_type)
         return self.move_z_down(steps=steps, step_type=step_type, **kwargs)
 
-    def home_z_axis(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1):
+    def home_z_axis(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = True):
         """
         The z-axis motor will rotate until it reaches the bottom (home) endstop.
 
         The travel is limited to Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM (16500 steps at 1/4 microstepping).
+        With ``acceleration=False`` the carriage runs at the constant ``delay`` (``start_delay`` and ``ramp_percent``
+        are ignored), like the manual z-move.
 
         :raises ScannerBusyError: if another motion is in progress (nothing is sent).
         :raises ScannerError: if the bottom endstop was not reached (move aborted or cancelled, serial error, or the
@@ -806,8 +808,8 @@ class Scanner:
                 self.move_z_down(
                     steps=self.z_axis_motor.distance_to_step_conversion(distance=Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM),
                     delay=delay,
-                    acceleration=True,
-                    start_delay=start_delay,
+                    acceleration=acceleration,
+                    start_delay=start_delay if acceleration else None,
                     ramp_percent=ramp_percent
                 )
             except BottomEndstopTriggered:
@@ -821,11 +823,13 @@ class Scanner:
                 return
             raise ScannerError("Homing failed: the bottom endstop was not reached.")
 
-    def move_z_to_top(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1):
+    def move_z_to_top(self, delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = True):
         """
         The z-axis motor will rotate UP until it reaches the top endstop.
 
         The travel is limited to Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM (16500 steps at 1/4 microstepping).
+        With ``acceleration=False`` the carriage runs at the constant ``delay`` (``start_delay`` and ``ramp_percent``
+        are ignored), like the manual z-move.
 
         :raises ScannerBusyError: if another motion is in progress (nothing is sent).
         :raises ScannerError: if the top endstop was not reached (move aborted or cancelled, serial error, or the
@@ -840,8 +844,8 @@ class Scanner:
                 self.move_z_up(
                     steps=self.z_axis_motor.distance_to_step_conversion(distance=Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM),
                     delay=delay,
-                    acceleration=True,
-                    start_delay=start_delay,
+                    acceleration=acceleration,
+                    start_delay=start_delay if acceleration else None,
                     ramp_percent=ramp_percent
                 )
             except TopEndstopTriggered:

@@ -128,6 +128,7 @@ until the bottom limit switch is active, then releases the torque after the 0.5s
   * `delay` (float, default `0.0015`, range `0.0001`-`0.05`): Cruise step delay in seconds.
   * `start_delay` (float, default `0.004`, range `0.0001`-`0.05`): Starting delay of the ramp.
   * `ramp_percent` (float, default `0.1`, range `0.0`-`1.0`): Fraction of the move used for acceleration.
+  * `acceleration` (bool, default `true`): `false` runs the whole move at the constant `delay` (no ramp, like `z-move`); `start_delay` and `ramp_percent` are then ignored.
 
 * **Response (`200 OK`)**:
   ```json

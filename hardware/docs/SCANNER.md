@@ -268,10 +268,10 @@ Non-blocking, re-entrant (per thread) exclusive right to move the rig. Raises `S
 #### Module constants
 `Z_TRAVEL_MAX_MM = 150` (Z axis travel, from the specification) and `Z_HOMING_MARGIN_MM = 15`: homing and move-to-top are limited to their sum, 165 mm = **16500 steps** at 1/4 microstepping (100 steps/mm), instead of the former 50000.
 
-#### `home_z_axis(delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1) -> None`
-Drives carriage downward in acceleration-controlled pulses until `down_endstop` triggers, for at most 16500 steps. The coils are released right away after the endstop STOP (the STOP already disabled the driver, so there is no extra settling pause on that path). Raises `ScannerError` when the endstop was not reached (aborted or cancelled move, or the travel budget ran out) and `ScannerBusyError` if another motion is in progress; motor/serial errors are propagated, not swallowed.
+#### `home_z_axis(delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = True) -> None`
+Drives carriage downward in acceleration-controlled pulses until `down_endstop` triggers, for at most 16500 steps. The coils are released right away after the endstop STOP (the STOP already disabled the driver, so there is no extra settling pause on that path). With `acceleration=False` the move runs at the constant `delay` (`start_delay` / `ramp_percent` ignored). Raises `ScannerError` when the endstop was not reached (aborted or cancelled move, or the travel budget ran out) and `ScannerBusyError` if another motion is in progress; motor/serial errors are propagated, not swallowed.
 
-#### `move_z_to_top(delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1) -> None`
+#### `move_z_to_top(delay: float = 0.0015, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = True) -> None`
 Drives carriage upward until `up_endstop` triggers (same 16500-step budget), after which the coils are released (no extra settling pause on this path: the endstop STOP already disabled the driver). Raises `ScannerError` when the endstop was not reached.
 
 #### `move_z_up_distance(distance: float = 100.0, delay: float = 0.002, ...) -> bool`
