@@ -7,8 +7,14 @@ Interactive OpenAPI docs are accessible at: `http://<pi-ip>:8000/docs#/Hardware%
 > [!NOTE]
 > `/test/turntable/rotate` and `/test/motor/z-move` answer `422` when the angle / distance is not a whole number of steps (`0.1125°` multiples on the turntable, `0.01 mm` multiples on Z) and `500` when the move was aborted before it completed (for example by `POST /scanner/cancel`); they no longer report `success` for an aborted move.
 
+> [!NOTE]
+> **Limits** (all rejected with `422`): `delay` and `start_delay` must be within `0.0001`-`0.05` s (also for the `home-bottom` / `move-to-top` query parameters, where `ramp_percent` must be `0.0`-`1.0`); `z-move` `distance_mm` is at most `150` (the Z travel). Below `delay = 0.0004` s the Arduino may not keep the step period during ramps: for manual tests prefer `acceleration=false` there.
+
 > [!WARNING]
-> **Busy guard**: the endpoints that move or (de)energize the motors (`/test/motor/*`, `/test/turntable/rotate`, `/test/cleanup`) answer `409 Conflict` unless the scanner is `idle`, `completed`, `cancelled` or `error`. During `preparing`, `prepared` and `running` use `POST /scanner/cancel` first. Read-only endpoints (endstops, ToF, status) are always available.
+> **Overlapping motions**: `/test/motor/z-move`, `/test/turntable/rotate`, `/test/motor/home-bottom` and `/test/motor/move-to-top` run inside the scanner motion guard. A second motion request that arrives while another motion is running is answered `409 Conflict` ("Another motion is in progress...") and its motor is not touched; wait for the running move to finish or stop it with `POST /scanner/cancel`.
+
+> [!WARNING]
+> **Busy guard**: the endpoints that move or (de)energize the motors (`/test/motor/*`, `/test/turntable/rotate`, `/test/cleanup`) answer `409 Conflict` unless the scanner is `idle`, `completed`, `cancelled` or `error`. During `preparing`, `prepared`, `running`, `processing` and `downloading` use `POST /scanner/cancel` first. Read-only endpoints (endstops, ToF, status) are always available.
 
 ---
 
@@ -115,13 +121,13 @@ Energizes / releases the coils manually, to verify wiring and check if a motor l
 ---
 
 ### `POST /test/motor/home-bottom`
-Moves the carriage downward (a single move of up to 50000 steps with an acceleration ramp) until the bottom limit switch
-is active, then releases the torque after the 0.5s settling pause.
+Moves the carriage downward (a single move limited to the Z travel plus a 15 mm margin, 165 mm, with an acceleration ramp)
+until the bottom limit switch is active, then releases the torque after the 0.5s settling pause.
 
 * **Query Parameters** (all optional):
-  * `delay` (float, default `0.0015`): Cruise step delay in seconds.
-  * `start_delay` (float, default `0.004`): Starting delay of the ramp.
-  * `ramp_percent` (float, default `0.1`): Fraction of the move used for acceleration.
+  * `delay` (float, default `0.0015`, range `0.0001`-`0.05`): Cruise step delay in seconds.
+  * `start_delay` (float, default `0.004`, range `0.0001`-`0.05`): Starting delay of the ramp.
+  * `ramp_percent` (float, default `0.1`, range `0.0`-`1.0`): Fraction of the move used for acceleration.
 
 * **Response (`200 OK`)**:
   ```json
@@ -132,7 +138,8 @@ is active, then releases the torque after the 0.5s settling pause.
   }
   ```
 * **Error (`500`)**: `Homing failed: ...` when the switch was not reached (aborted move, serial error, travel limit).
-* **Error (`409 Conflict`)**: Scanner busy.
+* **Error (`422`)**: A query parameter is outside the ranges above.
+* **Error (`409 Conflict`)**: Scanner busy (`preparing` / `prepared` / `running`), or another motion is in progress.
 
 * **Example `curl`**:
   ```bash
@@ -167,7 +174,7 @@ Moves the carriage upward until the top limit switch is active. Same query param
 Moves the Z-axis carriage by a specified distance in millimeters. Automatically halted if an endstop is reached.
 
 > [!NOTE]
-> **Coil Settling Protection**: Upon completion (or abort), a mandatory **0.5-second settling pause** (`time.sleep(0.5)`) is enforced in the `finally:` block before calling `disable()`. Cutting coil current immediately while the lead screw or rotor is decelerating induces inductive back-EMF flyback spikes that can brown out the 5V logic rail and reset the Arduino (`OSError: [Errno 5] Input/output error`).
+> **Coil Settling Protection**: Upon completion (or abort), a mandatory **0.5-second settling pause** (`time.sleep(0.5)`) is enforced in the `finally:` block before calling `disable()`. The coils keep holding the lead screw / rotor while it settles; cutting the current immediately would let it drift past the target. (A protective effect against supply dips that reset the Arduino is an unverified hypothesis.)
 
 * **Request Body**:
   ```json
@@ -178,10 +185,12 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
     "acceleration": false
   }
   ```
-  * `distance_mm` (float, default `10.0`, range `0.1`–`200.0`): Travel distance.
+  * `distance_mm` (float, default `100.0`, `> 0` and `<= 150.0`, whole steps: multiples of `0.01` mm): Travel distance. The Z travel is 150 mm.
   * `direction` (`"up"` | `"down"`, default `"up"`).
-  * `delay` (float, default `0.0010`): Step pulse delay.
+  * `delay` (float, default `0.0010`, range `0.0001`–`0.05`): Step pulse delay.
   * `acceleration` (bool, default `false`): Speed ramp (constant acceleration).
+  * `start_delay` (float, optional, default `null`, range `0.0001`–`0.05`): Starting delay of the ramp (only used with `acceleration`).
+  * `ramp_percent` (float, default `0.2`, range `0.0`–`1.0`), `decel_percent` (float, optional, default `null` = `ramp_percent`).
   * `end_delay` (float, optional, default `null`, range `0.005`–`0.030`): Step delay in seconds at the end of the deceleration for a slow stop. `null` disables it; ignored when `acceleration` is `false`.
 
 * **Response (`200 OK`)**:
@@ -201,6 +210,9 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
   }
   ```
 
+* **Error Response (`409 Conflict`)**: A prepare/scan owns the rig, or another motion is already in progress.
+* **Error Response (`422`)**: `distance_mm` above `150` or not a whole number of steps; `delay` / `start_delay` out of range.
+
 * **Example `curl`**:
   ```bash
   curl -X POST http://localhost:8000/test/motor/z-move \
@@ -214,7 +226,7 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
 Rotates the turntable platter by a specific angle.
 
 > [!NOTE]
-> **Coil Settling Protection**: Like the Z-axis, rotation enforces a **0.5-second settling pause** (`time.sleep(0.5)`) in the `finally:` block before calling `disable()`. This eliminates inertia-induced angular overshoot and dampens inductive current spikes before torque is released.
+> **Coil Settling Protection**: Like the Z-axis, rotation enforces a **0.5-second settling pause** (`time.sleep(0.5)`) in the `finally:` block before calling `disable()`. While the coils keep holding, the platter stops before the torque is released, which avoids inertia-induced angular overshoot.
 
 * **Request Body**:
   ```json
@@ -227,11 +239,12 @@ Rotates the turntable platter by a specific angle.
     "end_delay": 0.015
   }
   ```
-  * `angle` (float, default `18.0`, range `0.1`–`360.0`).
+  * `angle` (float, default `18.0`, `> 0` and `<= 360.0`, whole steps: multiples of `0.1125°`). Unlike the scan configuration (`turntable.angle` of `POST /scanner/start`: at most `180` and must divide `360°` in whole steps), the manual test accepts a full turn.
   * `clockwise` (bool, default `true`).
-  * `delay` (float, default `0.0010`).
+  * `delay` (float, default `0.0010`, range `0.0001`–`0.05`).
   * `acceleration` (bool, default `true`).
-  * `ramp_percent` (float, default `0.2`).
+  * `start_delay` (float, optional, default `null`, range `0.0001`–`0.05`).
+  * `ramp_percent` (float, default `0.2`, range `0.0`–`1.0`).
   * `end_delay` (float, default `0.015`, range `0.005`–`0.030`, `null` = off): Step delay in seconds at the very end of the deceleration. The turntable decelerates down to this slow step rate, so the platter (on a bearing) does not keep rotating after the last step, even with a heavy object. Values outside the range are rejected with `422`. Ignored when `acceleration` is `false`.
 
 * **Response (`200 OK`)**:
@@ -242,6 +255,8 @@ Rotates the turntable platter by a specific angle.
     "clockwise": true
   }
   ```
+* **Error Response (`409 Conflict`)**: A prepare/scan owns the rig, or another motion is already in progress.
+* **Error Response (`422`)**: `angle` above `360` or not a whole number of steps; `delay` / `start_delay` out of range.
 
 * **Example `curl`**:
   ```bash
@@ -445,6 +460,10 @@ Powers down all hardware cleanly:
     "lights_on": false
   }
   ```
+
+* **Error (`409 Conflict`)**: The scanner is `preparing`, `prepared` or `running`. The `detail` says
+  `Scanner is busy (state: ...). Cancel it with POST /scanner/cancel first.` Use `POST /scanner/cancel` as the quick stop
+  while a prepare/scan is active; `/test/cleanup` is for idle / finished states only.
 
 * **Example `curl`**:
   ```bash

@@ -44,6 +44,8 @@ class ArduinoBridge:
     """
     _instance: Optional["ArduinoBridge"] = None
     _singleton_lock = threading.Lock()
+    # Class-level default so that instances created without __init__ (tests) still have the counter.
+    stop_epoch = 0
 
     def __init__(self, port: Optional[str] = None, baudrate: int = 115200):
         """
@@ -61,6 +63,9 @@ class ArduinoBridge:
         # Incremented on every (re)connection: opening the port resets the Arduino, so every motor driver is
         # disabled again and any state cached by the callers (Motor.is_enabled) is stale.
         self.connection_epoch = 0
+        # Incremented on every universal stop (send_stop): a 0xFF received while the Arduino is idle disables ALL
+        # drivers, so the "energized" state cached by every Motor sharing this bridge is stale after it.
+        self.stop_epoch = 0
         
         # We use a two-lock architecture to allow emergency stops to preempt active commands.
         
@@ -270,6 +275,8 @@ class ArduinoBridge:
         try:
             if was_move:
                 with self._write_lock:
+                    # If the move had just finished, this 0xFF reaches an idle Arduino and disables every driver
+                    self.stop_epoch += 1
                     self.serial.write(bytes([ArduinoCommand.EMERGENCY_STOP.value]))
                     self.serial.flush()
                 self.serial.timeout = 0.5
@@ -278,7 +285,7 @@ class ArduinoBridge:
         except Exception as e:
             log.warning(f"[ArduinoBridge] Resync after timeout failed: {e}")
 
-    def send_stop(self):
+    def send_stop(self, repeat: int = 1, gap_s: float = 0.02):
         """
         Out-of-band immediate universal EMERGENCY STOP.
         
@@ -290,15 +297,29 @@ class ArduinoBridge:
         The C++ firmware checks for `0xFF` in between every single microsecond step. When it sees it,
         the Arduino aborts the rotation, releases coil torque, and replies '4' (ERR_ABORTED). 
         Thread A then wakes up, receives '4', and the system halts cleanly.
+
+        A `0xFF` that arrives while the Arduino is idle disables ALL motors (and gets no reply), so every call
+        increments `stop_epoch`; `Motor.is_enabled` compares it to know that its cached state is stale.
+
+        :param repeat: How many 0xFF bytes to write (at least 1). Repeats go out back to back, without waiting for
+                       any reply, so the second byte catches a move that starts right after the first abort.
+        :param gap_s: Pause in seconds between two consecutive bytes (not after the last one).
         """
+        repeat = max(1, int(repeat))
         with self._write_lock:
+            self.stop_epoch += 1
             if self.serial and self.serial.is_open:
-                try:
-                    self.serial.write(bytes([ArduinoCommand.EMERGENCY_STOP.value])) # 0xFF
-                    self.serial.flush()
-                except serial.SerialException as e:
-                    log.error(f"[ArduinoBridge] Serial connection lost during send_stop: {e}")
-        log.warning("[ArduinoBridge] Out-of-band universal EMERGENCY_STOP (0xFF) sent (cuts power to both motors)")
+                for i in range(repeat):
+                    try:
+                        self.serial.write(bytes([ArduinoCommand.EMERGENCY_STOP.value])) # 0xFF
+                        self.serial.flush()
+                    except serial.SerialException as e:
+                        log.error(f"[ArduinoBridge] Serial connection lost during send_stop: {e}")
+                        break
+                    if i < repeat - 1 and gap_s > 0:
+                        time.sleep(gap_s)
+        log.warning("[ArduinoBridge] Out-of-band universal EMERGENCY_STOP (0xFF) sent x%d (cuts power to both motors)",
+                    repeat)
 
     def close(self):
         """

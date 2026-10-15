@@ -34,7 +34,20 @@ from hardware.dual_camera_rpi_sync import (
 from hardware.base_dual_camera import BaseDualCamera
 
 
+
+def _write_fake_jpeg(path, img=None, params=None):
+    """cv2 is a MagicMock under tests/__init__: give imwrite the one side effect capture_photo now verifies (a file with bytes)."""
+    with open(path, "wb") as f:
+        f.write(b"\xff\xd8fake-jpeg\xff\xd9")
+    return True
+
+
 class TestDualCameraRPISync(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("hardware.dual_camera_rpi_sync.cv2.imwrite", side_effect=_write_fake_jpeg)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_clamp_framerate(self):
         # 12 MP mode (4056x3040)
         self.assertEqual(clamp_framerate((4056, 3040), 30), 10)

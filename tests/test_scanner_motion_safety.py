@@ -1,5 +1,8 @@
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -39,9 +42,28 @@ from hardware.scanner import Scanner, ScannerError, ScannerState  # noqa: E402
 TopEndstopTriggered = scanner_module.TopEndstopTriggered
 BottomEndstopTriggered = scanner_module.BottomEndstopTriggered
 
+# hardware.motor is a MagicMock here: give the scanner the real whole-step conversion (1/16 microstepping, 0.1125 deg)
+scanner_module.angle_to_steps = lambda angle, step_type=None, step_angle=1.8: round(angle / 0.1125)
+
+
+def _photo_set(images_dir, level=1, shot=0, content=b"jpeg"):
+    """Writes the two files of one capture (camera sub-directories 0/ and 1/) and returns their paths."""
+    paths = []
+    for cam in (0, 1):
+        cam_dir = os.path.join(images_dir, str(cam))
+        os.makedirs(cam_dir, exist_ok=True)
+        path = os.path.join(cam_dir, f"lvl_{level}_shot_{shot}.jpg")
+        with open(path, "wb") as f:
+            f.write(content)
+        paths.append(path)
+    return paths
+
 
 def make_scanner():
     s = Scanner(camera_mode="staggered")
+    # Every scanner gets its own photo directory: scan() writes the manifest and the photos there
+    s.images_dir = tempfile.mkdtemp(prefix="scanner_test_images_")
+    atexit.register(shutil.rmtree, s.images_dir, True)
     s.turntable_motor = MagicMock()
     s.z_axis_motor = MagicMock()
     s.up_endstop = MagicMock(is_active=False)
@@ -49,7 +71,23 @@ def make_scanner():
     s.tof = MagicMock()
     s.lights = MagicMock()
     s.dual_cameras = MagicMock()
-    s.dual_cameras.capture_photo.return_value = []
+    # A capture writes two real, non-empty files like the drivers do
+    shots = {}
+
+    def capture(output_prefix="dual_photo", output_dir=".", **kwargs):
+        shots[output_prefix] = shots.get(output_prefix, 0) + 1
+        paths = []
+        for cam in (0, 1):
+            cam_dir = os.path.join(output_dir, str(cam))
+            os.makedirs(cam_dir, exist_ok=True)
+            path = os.path.join(cam_dir, f"{output_prefix}.jpg")
+            with open(path, "wb") as f:
+                f.write(b"jpeg")
+            paths.append(path)
+        return paths
+
+    s.dual_cameras.capture_photo.side_effect = capture
+    s.dual_cameras.last_capture_info = None
     # Real conversions: 1/4 microstepping, 100 steps per mm
     s.z_axis_motor.distance_to_step_conversion.side_effect = lambda distance, step_type=None: round(distance * 100)
     s.turntable_motor.angle_to_steps_conversion.side_effect = lambda angle, step_type=None: round(angle / 0.1125)
@@ -89,6 +127,21 @@ class TestEndstopCallbacks(unittest.TestCase):
         with self.assertRaises(TopEndstopTriggered):
             self.s.move_z_up(steps=10)
         self.assertFalse(self.s._z_moving.is_set())
+
+
+def photo_slice(scanner, detected=False):
+    """A stand-in for _capture_turntable_slice that "takes" one photo set, like a real ring does."""
+    counter = {"n": 0}
+
+    def _slice(**kwargs):
+        counter["n"] += 1
+        scanner._register_photos(
+            kwargs["images_dir"], _photo_set(kwargs["images_dir"], level=scanner._level, shot=counter["n"]),
+            scanner._level, counter["n"],
+        )
+        return detected
+
+    return _slice
 
 
 class TestRotationResultIsChecked(unittest.TestCase):
@@ -182,7 +235,7 @@ class TestHoming(unittest.TestCase):
         self.s.z_axis_motor.disable.assert_called()
 
     def test_homing_fails_when_endstop_not_reached(self):
-        self.s.z_axis_motor.rotate.return_value = True  # 50000 steps done, switch never pressed
+        self.s.z_axis_motor.rotate.return_value = True  # full travel budget done, switch never pressed
         with self.assertRaises(ScannerError):
             self.s.home_z_axis()
         self.s.z_axis_motor.disable.assert_called()  # torque is still released
@@ -273,7 +326,7 @@ class TestLowSeverityFixes(unittest.TestCase):
 
     # 11
     def test_climb_ending_on_top_switch_still_takes_the_final_ring(self):
-        slices = MagicMock(return_value=True)
+        slices = MagicMock(side_effect=photo_slice(self.s, True))
         self.s._capture_turntable_slice = slices
 
         def rotate(**kwargs):
@@ -287,13 +340,13 @@ class TestLowSeverityFixes(unittest.TestCase):
 
     # 13
     def test_end_delay_is_dropped_when_the_turntable_does_not_accelerate(self):
-        slices = MagicMock(return_value=False)
+        slices = MagicMock(side_effect=photo_slice(self.s, False))
         self.s._capture_turntable_slice = slices
         self.s.scan(turntable_acceleration=False)
         self.assertIsNone(slices.call_args.kwargs["turntable_end_delay"])
 
     def test_end_delay_is_kept_when_the_turntable_accelerates(self):
-        slices = MagicMock(return_value=False)
+        slices = MagicMock(side_effect=photo_slice(self.s, False))
         self.s._capture_turntable_slice = slices
         self.s.scan(turntable_acceleration=True, turntable_end_delay=0.02)
         self.assertEqual(slices.call_args.kwargs["turntable_end_delay"], 0.02)
@@ -324,12 +377,12 @@ class TestLowSeverityFixes(unittest.TestCase):
 
     # 15
     def test_finish_state_is_applied_after_a_normal_scan(self):
-        self.s._capture_turntable_slice = lambda **kwargs: False
+        self.s._capture_turntable_slice = photo_slice(self.s, False)
         self.s.scan(finish_state=ScannerState.PROCESSING)
         self.assertEqual(self.s.state, ScannerState.PROCESSING)
 
     def test_default_finish_state_is_idle(self):
-        self.s._capture_turntable_slice = lambda **kwargs: False
+        self.s._capture_turntable_slice = photo_slice(self.s, False)
         self.s.scan()
         self.assertEqual(self.s.state, ScannerState.IDLE)
 
@@ -367,6 +420,16 @@ class TestFoundBugs(unittest.TestCase):
         calls = [c[0] for c in self.s.z_axis_motor.mock_calls]
         last_move = max(i for i, name in enumerate(calls) if name == "rotate")
         self.assertIn("disable", calls[last_move + 1:])  # released after the +30 mm move
+
+    def test_z_driver_is_released_when_the_start_position_move_aborts(self):
+        self.s.state = ScannerState.PREPARING
+        self.s.down_endstop.is_active = True  # homing succeeds immediately
+        self.s.z_axis_motor.rotate.return_value = False  # the +30 mm move is aborted
+        self.s.finish_preparation()
+        self.assertEqual(self.s.state, ScannerState.ERROR)
+        calls = [c[0] for c in self.s.z_axis_motor.mock_calls]
+        last_move = max(i for i, name in enumerate(calls) if name == "rotate")
+        self.assertIn("disable", calls[last_move + 1:])
 
     def test_late_endstop_callback_after_the_move_is_ignored(self):
         self.s._begin_z_motion()

@@ -25,13 +25,13 @@ Rotates the camera image by 90° increments.
 * **Returns**: The new rotation angle.
 
 ### `apply_settings(self, ...)`
-Applies image controls (brightness, contrast, saturation, sharpness, analogue gain, exposure time, AWB mode) to the active camera instance. If exposure/gain are manually set, it disables the respective auto-features.
+Applies image controls (brightness, contrast, saturation, sharpness, analogue gain, exposure time, AWB mode, `colour_gains`) to the active camera instance. Only the passed controls are written: manual exposure/gain disable AE (gain-only locks the exposure at the latest metadata value when one is known), manual `colour_gains` disable AWB, AWB presets keep AWB enabled, and brightness/contrast/... never re-enable AE.
 
 ### `lock_auto_features(self, settle_time: float = 2.0) -> dict`
 Allows Auto Exposure (AE) and Auto White Balance (AWB) to settle, calculates the best current settings from the metadata, and locks those exact values onto the camera for subsequent shots. Returns the locked configuration dictionary.
 
 ### `prepare_scan(self, ...)`
-Prepares and locks the camera for a repeatable 3D scanning sequence. Automatically applies photogrammetry optical defaults (`AeMeteringMode=CentreWeighted` to prevent background overexposure, and `NoiseReductionMode=Off` to preserve raw micro-textures for Meshroom). Handles adjusting motorized focus, settling and locking AE/AWB, and persisting camera controls.
+Prepares and locks the camera for a repeatable 3D scanning sequence. Automatically applies photogrammetry optical defaults (`AeMeteringMode=CentreWeighted` to prevent background overexposure, and `NoiseReductionMode=Off` to preserve raw micro-textures for Meshroom). Handles adjusting motorized focus (the lens is physically driven even when the cached position equals the requested one, see [FOCUSER.md](FOCUSER.md)), settling and locking AE/AWB, and persisting camera controls. The camera is stopped (and the VCM marked unpowered) when `keep_running` is false.
 
 ### `capture_photo(self, output=None, resolution=None, quality=None, raw=False, show_preview=False, preview_duration=2.0) -> str`
 Captures a JPEG still (and optionally a DNG raw file if `raw=True`). Handles any required post-capture processing (like software rotation and resizing via OpenCV) to ensure images perfectly match the requested configuration.
@@ -62,7 +62,7 @@ Opens a live OpenCV preview window allowing the user to view the camera feed and
 ## Lifecycle Management
 
 ### `close(self)`
-Safely stops the `picamera2` instance and closes the I2C bus connection to the VCM driver.
+Stops recording/preview/the sensor, closes the `Picamera2` handle (releasing the CSI device for the next `Picamera2(id)`) and closes the I2C bus connection to the VCM driver. Each step is guarded and the bus is closed in a `finally`; calling `close()` again is a no-op.
 
 ### Context Management (`__enter__`, `__exit__`)
 The class supports standard context manager blocks (the `with` statement) to ensure `close()` is automatically called when exiting the block.

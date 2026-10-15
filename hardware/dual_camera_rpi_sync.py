@@ -5,7 +5,7 @@ import threading
 from collections import OrderedDict, deque
 from typing import Optional, List, Tuple, Dict, Any
 
-from .base_dual_camera import BaseDualCamera
+from .base_dual_camera import BaseDualCamera, CaptureError
 from .camera import ArducamIMX477
 from hardware.camera.config import (
     DEFAULT_QUALITY,
@@ -46,6 +46,30 @@ def clamp_framerate(resolution: Tuple[int, int], requested_fps: int) -> int:
         return min(max(requested_fps, 1), 10)
     else:
         return min(max(requested_fps, 1), 40)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _summarize_metadata(md: Any) -> Dict[str, Any]:
+    """Extracts the exposure-related request metadata recorded with every still (None when unavailable)."""
+    if not isinstance(md, dict):
+        md = {}
+    exposure = md.get("ExposureTime")
+    gain = md.get("AnalogueGain")
+    ts = md.get("SensorTimestamp")
+    gains = md.get("ColourGains")
+    if isinstance(gains, (tuple, list)) and len(gains) == 2 and all(_is_number(g) for g in gains):
+        gains = [float(gains[0]), float(gains[1])]
+    else:
+        gains = None
+    return {
+        "exposure_time": int(exposure) if _is_number(exposure) else None,
+        "analogue_gain": float(gain) if _is_number(gain) else None,
+        "colour_gains": gains,
+        "sensor_timestamp": int(ts) if _is_number(ts) else None,
+    }
 
 
 class DualCameraRPISync(BaseDualCamera):
@@ -142,7 +166,7 @@ class DualCameraRPISync(BaseDualCamera):
 
         self._lores_slots: List[Optional[Tuple[int, int, int, Any]]] = [None, None]
         self._lores_slot: Optional[Tuple[int, int, int, Any]] = None  # (cam_idx, seq, ts, yuv_array)
-        self._still: List[Optional[Tuple[int, int, Any]]] = [None, None]  # (seq, ts, still_yuv_array)
+        self._still: List[Optional[Tuple[int, int, Any, Dict[str, Any]]]] = [None, None]  # (seq, ts, still_yuv_array, metadata_summary)
         self._raw_reqs: List[Any] = [None, None]
         self._want_raw: bool = False
         self._still_target: Optional[int] = None
@@ -159,6 +183,7 @@ class DualCameraRPISync(BaseDualCamera):
         self._last_jpeg_kb: float = 0.0
 
         self._threads: List[threading.Thread] = []
+        self._closing = False  # set at the start of close(), before stop_stream()
 
         if auto_start:
             self._start_pipeline()
@@ -230,6 +255,8 @@ class DualCameraRPISync(BaseDualCamera):
 
     def _start_pipeline(self):
         """Configures dual streams and starts continuous rpi.sync background grab loops."""
+        if self._closed or self._closing:
+            raise RuntimeError("DualCameraRPISync is closed; create a new instance to restart the cameras")
         if self._is_streaming or self._running:
             return
 
@@ -248,50 +275,82 @@ class DualCameraRPISync(BaseDualCamera):
             self._ready[1].set()
             return
 
-        # Configure both cameras
-        # cam1 is SYNC_SERVER, cam2 is SYNC_CLIENT
-        modes = [SYNC_SERVER, SYNC_CLIENT]
-        for idx, (cam, mode) in enumerate(zip(self.cameras, modes)):
-            p2 = cam.picam2
-            controls = {
-                "FrameDurationLimits": (self.period_us, self.period_us),
-                "SyncMode": mode,
-            }
-            if mode == SYNC_SERVER:
-                controls["SyncFrames"] = self.sync_frames
+        started: List[Any] = []
+        try:
+            # Configure both cameras
+            # cam1 is SYNC_SERVER, cam2 is SYNC_CLIENT
+            modes = [SYNC_SERVER, SYNC_CLIENT]
+            for idx, (cam, mode) in enumerate(zip(self.cameras, modes)):
+                p2 = cam.picam2
+                controls = {
+                    "FrameDurationLimits": (self.period_us, self.period_us),
+                    "SyncMode": mode,
+                }
+                if mode == SYNC_SERVER:
+                    controls["SyncFrames"] = self.sync_frames
 
-            config = p2.create_video_configuration(
-                main={"size": self.size, "format": "YUV420"},
-                lores={"size": self.stream_size, "format": "YUV420"},
-                sensor={"output_size": self.size, "bit_depth": 12},
-                buffer_count=self.buffer_count,
-                controls=controls,
-            )
-            p2.configure(config)
+                config = p2.create_video_configuration(
+                    main={"size": self.size, "format": "YUV420"},
+                    lores={"size": self.stream_size, "format": "YUV420"},
+                    sensor={"output_size": self.size, "bit_depth": 12},
+                    buffer_count=self.buffer_count,
+                    controls=controls,
+                )
+                p2.configure(config)
 
-        self._running = True
-        self._ready[0].clear()
-        self._ready[1].clear()
+            self._running = True
+            self._ready[0].clear()
+            self._ready[1].clear()
 
-        # Startup order: Client (cam2) starts first to bind its listening IPC socket;
-        # Server (cam1) starts second to broadcast sync pulses.
-        log.info("DualCameraRPISync: Starting cam2 (SyncClient)...")
-        self.cam2.picam2.start()
-        time.sleep(0.05)
-        log.info("DualCameraRPISync: Starting cam1 (SyncServer)...")
-        self.cam1.picam2.start()
+            # Startup order: Client (cam2) starts first to bind its listening IPC socket;
+            # Server (cam1) starts second to broadcast sync pulses.
+            log.info("DualCameraRPISync: Starting cam2 (SyncClient)...")
+            self.cam2.picam2.start()
+            started.append(self.cam2)
+            time.sleep(0.05)
+            log.info("DualCameraRPISync: Starting cam1 (SyncServer)...")
+            self.cam1.picam2.start()
+            started.append(self.cam1)
 
-        # Launch background worker threads
-        self._threads = [
-            threading.Thread(target=self._grab_worker, args=(0,), name="RPISync-Grab-0", daemon=True),
-            threading.Thread(target=self._grab_worker, args=(1,), name="RPISync-Grab-1", daemon=True),
-            threading.Thread(target=self._publisher_worker, name="RPISync-Publisher", daemon=True),
-        ]
-        for t in self._threads:
-            t.start()
+            # Launch background worker threads
+            self._threads = [
+                threading.Thread(target=self._grab_worker, args=(0,), name="RPISync-Grab-0", daemon=True),
+                threading.Thread(target=self._grab_worker, args=(1,), name="RPISync-Grab-1", daemon=True),
+                threading.Thread(target=self._publisher_worker, name="RPISync-Publisher", daemon=True),
+            ]
+            for t in self._threads:
+                t.start()
+        except Exception:
+            # Roll back: never leave a half-started pipeline behind (the next call
+            # would silently see _running=True and wait for a SyncReady that never comes).
+            log.exception("DualCameraRPISync: pipeline start failed; rolling back")
+            self._running = False
+            self._is_streaming = False
+            for t in self._threads:
+                if t.is_alive():
+                    t.join(timeout=1.0)
+            self._threads = []
+            for cam in reversed(self.cameras):
+                if cam in started or getattr(getattr(cam, "picam2", None), "started", False):
+                    try:
+                        cam.picam2.stop()
+                    except Exception as exc:
+                        log.warning("DualCameraRPISync: rollback stop failed on cam %s: %s", getattr(cam, "camera_id", "?"), exc)
+                self._invalidate_focus(cam)
+            raise
 
         self._is_streaming = True
         log.info("DualCameraRPISync: Continuous stream pipeline started.")
+
+    @staticmethod
+    def _invalidate_focus(cam: Any) -> None:
+        """The CSI bus (and the VCM) is unpowered while a camera is stopped: force the next focus write."""
+        try:
+            focuser = getattr(cam, "focuser", None)
+            if focuser is not None:
+                focuser.invalidate()
+        except Exception as exc:
+            log.debug("DualCameraRPISync: focuser.invalidate() failed: %s", exc)
 
     def _grab_worker(self, cam_idx: int):
         """
@@ -328,6 +387,8 @@ class DualCameraRPISync(BaseDualCamera):
 
             try:
                 md = req.get_metadata()
+                if isinstance(md, dict):
+                    cam._last_metadata = md  # lets apply_settings lock a missing exposure
                 if not started:
                     if md.get("SyncReady", False):
                         started = True
@@ -368,6 +429,7 @@ class DualCameraRPISync(BaseDualCamera):
                     want_raw = self._want_raw if want_still else False
 
                 still = None
+                still_meta = None
                 raw_req = None
                 if want_still:
                     if want_raw:
@@ -378,6 +440,7 @@ class DualCameraRPISync(BaseDualCamera):
                             log.warning("DualCameraRPISync: req.acquire() failed: %s", e)
                     # 18.5 MB RAM copy of full 12 MP YUV420 plane
                     still = req.make_array("main").copy()
+                    still_meta = _summarize_metadata(md)
                     self._force_still[cam_idx] = False
 
             finally:
@@ -399,7 +462,7 @@ class DualCameraRPISync(BaseDualCamera):
                     self._lores_slot = (cam_idx, seq, ts, lores)
 
                 if still is not None and self._still[cam_idx] is None:
-                    self._still[cam_idx] = (seq, ts, still)
+                    self._still[cam_idx] = (seq, ts, still, still_meta)
                     if raw_req is not None:
                         self._raw_reqs[cam_idx] = raw_req
 
@@ -549,16 +612,42 @@ class DualCameraRPISync(BaseDualCamera):
 
     # ── Abstract Contract Implementation ───────────────────────
 
-    def prepare_scan(self, **kwargs) -> List[dict]:
+    def prepare_scan(self, *, lock_auto: bool = False, **kwargs) -> List[dict]:
         """
-        Prepares and locks both cameras for scanning under continuous rpi.sync.
-        Awaits SyncReady alignment within ready_timeout.
+        Prepares both cameras for scanning under continuous rpi.sync.
+        Awaits SyncReady alignment within ready_timeout (one shared deadline).
+
+        ``lock_auto=True`` additionally freezes AE/AWB after SyncReady: both cameras
+        settle, cam1's ExposureTime/AnalogueGain/ColourGains are written back with
+        AE/AWB disabled and copied to cam2, so every photo of the scan uses the
+        same exposure and white balance. Call it once the lighting is stable.
+        The default (False) leaves AE/AWB running (e.g. the first, cold call).
+
+        The returned per-camera info dicts carry ``locked`` (bool) and the locked
+        ``exposure_time`` / ``analogue_gain`` / ``colour_gains`` (None when not locked).
+        An optional ``settle_time`` kwarg (seconds, default 2.0) sets the AE/AWB settle
+        time before locking.
         """
         self._start_pipeline()
 
         kw1, kw2 = self._split_camera_kwargs(kwargs)
         if "focus" in kwargs and kwargs["focus"] is not None:
             self.focus_set(kwargs["focus"])
+        else:
+            # No explicit focus: put the lenses back to the saved position. After a
+            # reboot/camera restart the VCM is at 0, so the write is forced (CAM-2).
+            failed_focus = []
+            for cam in self.cameras:
+                try:
+                    restored = cam.focuser.restore_state()
+                except Exception as exc:
+                    log.error("DualCameraRPISync: could not restore focus on cam %s: %s", getattr(cam, "camera_id", "?"), exc)
+                    restored = False
+                if restored is False:
+                    failed_focus.append(getattr(cam, "camera_id", "?"))
+            if failed_focus and PICAMERA2_AVAILABLE:
+                # With the VCM at 0 after a boot every photo would be out of focus: do not scan.
+                raise RuntimeError(f"Could not restore the lens focus position on camera(s) {failed_focus}.")
 
         # Apply any runtime image controls passed in kwargs (exposure, gain, awb, etc.)
         control_keys = ("exposure_time", "analogue_gain", "colour_gains", "awb_mode", "brightness", "contrast", "saturation", "sharpness")
@@ -567,8 +656,9 @@ class DualCameraRPISync(BaseDualCamera):
             self.apply_settings(**runtime_controls)
 
         log.info("DualCameraRPISync: Awaiting SyncReady (timeout=%.1fs)...", self.ready_timeout)
-        ready1 = self._ready[0].wait(self.ready_timeout)
-        ready2 = self._ready[1].wait(self.ready_timeout)
+        deadline = time.monotonic() + self.ready_timeout
+        ready1 = self._ready[0].wait(max(0.0, deadline - time.monotonic()))
+        ready2 = self._ready[1].wait(max(0.0, deadline - time.monotonic()))
 
         if not (ready1 and ready2):
             log.warning(
@@ -579,32 +669,77 @@ class DualCameraRPISync(BaseDualCamera):
         else:
             log.info("DualCameraRPISync: Both cameras reported SyncReady!")
 
-        cam1_info = {
-            "camera_id": getattr(self.cam1, "camera_id", 0),
-            "ready": ready1,
-            "seq": self._latest[0],
-            "photo_resolution": self.size,
-            "preview_resolution": self.stream_size,
-            "quality": self.quality,
-            "stream_quality": self.stream_quality,
-            "fps": self.fps,
-            "focus": getattr(getattr(self.cam1, "focuser", None), "position", None),
-            "rotation": getattr(self.cam1, "rotation", 0),
-        }
-        cam2_info = {
-            "camera_id": getattr(self.cam2, "camera_id", 1),
-            "ready": ready2,
-            "seq": self._latest[1],
-            "photo_resolution": self.size,
-            "preview_resolution": self.stream_size,
-            "quality": self.quality,
-            "stream_quality": self.stream_quality,
-            "fps": self.fps,
-            "focus": getattr(getattr(self.cam2, "focuser", None), "position", None),
-            "rotation": getattr(self.cam2, "rotation", 0),
-        }
+        locks: List[Optional[dict]] = [None, None]
+        if lock_auto:
+            if ready1 and ready2:
+                locks = self._lock_auto_exposure(runtime_controls, kwargs.get("settle_time"))
+            else:
+                log.warning("DualCameraRPISync: AE/AWB lock skipped because the cameras are not SyncReady.")
+
+        def _info(idx: int, cam: Any, ready: bool) -> dict:
+            lock = locks[idx]
+            gains = lock.get("ColourGains") if lock else None
+            return {
+                "camera_id": getattr(cam, "camera_id", idx),
+                "ready": ready,
+                "seq": self._latest[idx],
+                "photo_resolution": self.size,
+                "preview_resolution": self.stream_size,
+                "quality": self.quality,
+                "stream_quality": self.stream_quality,
+                "fps": self.fps,
+                "focus": getattr(getattr(cam, "focuser", None), "position", None),
+                "rotation": getattr(cam, "rotation", 0),
+                "locked": lock is not None and all(
+                    lock.get(k) is not None for k in ("ExposureTime", "AnalogueGain", "ColourGains")
+                ),
+                "exposure_time": lock.get("ExposureTime") if lock else None,
+                "analogue_gain": lock.get("AnalogueGain") if lock else None,
+                "colour_gains": [float(g) for g in gains] if gains is not None else None,
+            }
+
+        cam1_info = _info(0, self.cam1, ready1)
+        cam2_info = _info(1, self.cam2, ready2)
         log.info("DualCameraRPISync: Prepared camera settings: cam1=%s, cam2=%s", cam1_info, cam2_info)
         return [cam1_info, cam2_info]
+
+    def _lock_auto_exposure(self, runtime_controls: dict, settle_time: Optional[float]) -> List[Optional[dict]]:
+        """
+        Re-arms AE/AWB (so a second scan does not inherit the previous scan's locked values),
+        lets them settle, then freezes cam1's result and copies it to cam2.
+        Returns the per-camera lock results ([None, None] when locking failed).
+        """
+        try:
+            rearm = {}
+            if "exposure_time" not in runtime_controls and "analogue_gain" not in runtime_controls:
+                rearm["AeEnable"] = True
+            if "colour_gains" not in runtime_controls:
+                rearm["AwbEnable"] = True
+            if rearm:
+                for cam in self.cameras:
+                    cam._pending_controls.update(rearm)
+                    if getattr(cam.picam2, "started", False):
+                        cam.picam2.set_controls(rearm)
+
+            if settle_time is None:
+                settle_time = 2.0 if PICAMERA2_AVAILABLE else 0.0
+            res = self.lock_auto_features(settle_time=float(settle_time))
+            locks: List[Optional[dict]] = [dict(r) if isinstance(r, dict) else None for r in res[:2]]
+            while len(locks) < 2:
+                locks.append(None)
+            if locks[0] is not None and locks[1] is not None:
+                for key in ("ExposureTime", "AnalogueGain", "ColourGains"):
+                    locks[1][key] = locks[0].get(key)  # cam2 was synced to cam1 by lock_auto_features
+            log.info(
+                "DualCameraRPISync: AE/AWB locked (exposure=%s us, gain=%s, colour_gains=%s)",
+                locks[0].get("ExposureTime") if locks[0] else None,
+                locks[0].get("AnalogueGain") if locks[0] else None,
+                locks[0].get("ColourGains") if locks[0] else None,
+            )
+            return locks
+        except Exception as exc:
+            log.error("DualCameraRPISync: AE/AWB lock failed, exposure is NOT constant: %s", exc)
+            return [None, None]
 
     def start_stream(self, bitrate: int = 4_000_000) -> List[str]:
         """
@@ -641,6 +776,7 @@ class DualCameraRPISync(BaseDualCamera):
                     cam.picam2.stop()
                 except Exception as e:
                     log.warning("DualCameraRPISync: Error stopping picam2 on cam %s: %s", getattr(cam, "camera_id", "?"), e)
+            self._invalidate_focus(cam)
 
         log.info("DualCameraRPISync: Stream pipeline stopped.")
 
@@ -664,8 +800,16 @@ class DualCameraRPISync(BaseDualCamera):
            - Invokes cam._process_captured_image(path, resolution, quality) to inject photogrammetry EXIF
              metadata (BodySerialNumber = b"cam1" / b"cam2", focal length) and apply optional software resizing.
 
-        Returns [path1, path2].
+        Returns [path1, path2] and stores per-camera exposure metadata in
+        ``self.last_capture_info``.
+
+        Raises CaptureError (real hardware mode only) when the driver is closed,
+        when a frame for either camera is missing, or when an output file is
+        missing/empty after encoding. Stub mode (no picamera2) writes placeholder
+        files and never raises.
         """
+        if self._closed or self._closing:
+            raise CaptureError("capture_photo called on a closed DualCameraRPISync")
         self._start_pipeline()
 
         path1, path2 = self._resolve_capture_paths(output_prefix, output_dir, meshroom_rig)
@@ -686,7 +830,15 @@ class DualCameraRPISync(BaseDualCamera):
                         self.cameras[cam_idx]._process_captured_image(p, resolution, quality)
                     except Exception as e:
                         log.debug("Stub _process_captured_image: %s", e)
+                self.last_capture_info = {
+                    "paths": [path1, path2],
+                    "cameras": [
+                        dict(_summarize_metadata(None), width=None, height=None) for _ in range(2)
+                    ],
+                }
                 return [path1, path2]
+
+            self.last_capture_info = None
 
             # Tier 1: Arm grab workers for target sequence matching
             with self._cond:
@@ -754,10 +906,25 @@ class DualCameraRPISync(BaseDualCamera):
                 self._force_still = [False, False]
                 self._want_raw = False
 
-            def _process_one(cam_idx: int, out_path: str):
+            # Never report success without both frames (DUAL-2): release held DMA requests and fail.
+            missing = [i + 1 for i in range(2) if still_pair[i] is None]
+            if missing:
+                for held in raw_pair:
+                    if held is not None:
+                        try:
+                            held.release()
+                        except Exception:
+                            pass
+                raise CaptureError(
+                    f"no frame received from camera(s) {missing} "
+                    f"(running={self._running}, closed={self._closed or self._closing})"
+                )
+
+            def _process_one(cam_idx: int, out_path: str) -> Dict[str, Any]:
                 still_item = still_pair[cam_idx]
                 raw_req = raw_pair[cam_idx]
                 cam = self.cameras[cam_idx]
+                out_w = out_h = None
 
                 # Save raw DNG if acquired
                 if raw and raw_req is not None:
@@ -773,18 +940,31 @@ class DualCameraRPISync(BaseDualCamera):
                         except Exception:
                             pass
 
+                # A stale file from an earlier capture must not pass the size check below
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                except OSError as exc:
+                    log.warning("DualCameraRPISync: could not remove stale %s: %s", out_path, exc)
+
                 # Encode still_yuv to disk as JPEG
-                yuv = still_item[2] if still_item is not None else None
+                yuv = still_item[2]
                 if OPENCV_AVAILABLE and yuv is not None and hasattr(yuv, "shape"):
                     try:
                         bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+                        # The ISP pads YUV420 rows to the buffer stride; drop the padding
+                        # columns so they never reach the JPEG (no-op when stride == width).
+                        shape = getattr(bgr, "shape", None)
+                        if isinstance(shape, tuple) and len(shape) >= 2:
+                            if isinstance(shape[1], int) and shape[1] > self.size[0]:
+                                bgr = bgr[:, : self.size[0]]
+                            out_h, out_w = int(shape[0]), min(int(shape[1]), self.size[0])
                         cv2.imwrite(out_path, bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
                     except Exception as exc:
                         log.warning("DualCameraRPISync: Failed cv2.imwrite for %s: %s", out_path, exc)
 
-                if not os.path.exists(out_path):
-                    with open(out_path, "wb") as f:
-                        f.write(b"")
+                if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                    raise CaptureError(f"camera {cam_idx + 1}: no image written to {out_path}")
 
                 # Invoke cam._process_captured_image to inject EXIF and resize
                 try:
@@ -792,12 +972,42 @@ class DualCameraRPISync(BaseDualCamera):
                 except Exception as exc:
                     log.warning("DualCameraRPISync: _process_captured_image error on %s: %s", out_path, exc)
 
-            # Dispatch concurrently via BaseDualCamera._executor
-            f1 = self._executor.submit(_process_one, 0, path1)
-            f2 = self._executor.submit(_process_one, 1, path2)
-            f1.result()
-            f2.result()
+                if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                    raise CaptureError(f"camera {cam_idx + 1}: {out_path} is empty after post-processing")
 
+                # Final image size as _process_captured_image leaves it (resize, then rotate)
+                full = getattr(cam, "FULL_RES", None)
+                if out_w is not None and isinstance(resolution, tuple) and isinstance(full, tuple) and resolution != full:
+                    out_w, out_h = resolution
+                if out_w is not None and getattr(cam, "rotation", 0) in (90, 270):
+                    out_w, out_h = out_h, out_w
+
+                info = dict(still_item[3] or _summarize_metadata(None))
+                info["width"], info["height"] = out_w, out_h
+                return info
+
+            # Dispatch concurrently via BaseDualCamera._executor
+            try:
+                futures = [
+                    self._executor.submit(_process_one, 0, path1),
+                    self._executor.submit(_process_one, 1, path2),
+                ]
+            except RuntimeError as exc:  # executor already shut down (close() raced us)
+                raise CaptureError(f"capture aborted, driver is shutting down: {exc}") from exc
+            infos: List[Optional[Dict[str, Any]]] = []
+            first_error: Optional[BaseException] = None
+            for fut in futures:
+                try:
+                    infos.append(fut.result())
+                except Exception as exc:
+                    infos.append(None)
+                    first_error = first_error or exc
+            if first_error is not None:
+                if isinstance(first_error, CaptureError):
+                    raise first_error
+                raise CaptureError(f"capture failed: {first_error}") from first_error
+
+            self.last_capture_info = {"paths": [path1, path2], "cameras": infos}
             log.info("DualCameraRPISync: Photos delivered successfully: %s, %s", path1, path2)
             return [path1, path2]
 
@@ -811,8 +1021,16 @@ class DualCameraRPISync(BaseDualCamera):
         raise NotImplementedError("Video recording is not supported under continuous rpi.sync mode.")
 
     def close(self):
-        """Idempotent teardown releasing streaming pipeline and camera resources."""
+        """
+        Idempotent teardown: stops the streaming pipeline first, then closes the
+        executor and both cameras (stop recording, Picamera2.close(), focuser bus).
+        After close() the instance refuses to start the cameras again.
+        """
         if getattr(self, "_closed", False):
             return
-        self.stop_stream()
+        self._closing = True  # blocks _start_pipeline()/capture_photo() while we tear down
+        try:
+            self.stop_stream()
+        except Exception as e:
+            log.warning("DualCameraRPISync: stop_stream failed during close: %s", e)
         super().close()

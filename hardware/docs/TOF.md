@@ -20,7 +20,7 @@ The VL53L1X communicates via **I2C** (`SDA` and `SCL`, address `0x29`). The driv
 | `distance_mode` | `1` (short) | Best ambient-light immunity, ranges up to ~136 cm. The rig measures 25-65 cm. |
 | `roi_xy` | `(4, 4)` | Smallest receiving window, narrowest cone. |
 | `roi_center` | `199` | Optical centre of the 16x16 SPAD array. |
-| `timing_budget` | `200` ms | Lower jitter. Costs nothing, the scan loop already reserves 0.2 s per stop. |
+| `timing_budget` | `200` ms | Lower jitter. Not free: every read waits up to one budget (about 0.2 s), and a stop makes up to two reads, see section 4. |
 
 All four are constructor parameters of `ToFSensor`. They are applied in a fixed order: `distance_mode` → `timing_budget` → `roi_xy` → `roi_center` → `start_ranging()`.
 - The distance mode selects the table of valid timing budgets, so it must come first.
@@ -47,7 +47,7 @@ A 4x4 window has only 16 of 256 SPADs, so about 94% less light than full frame. 
 ### 1. Timing Budget
 The sensor accepts only `15` (short mode only), `20`, `33`, `50`, `100`, `200` or `500` **milliseconds**. A longer budget improves repeatability (noise falls roughly with the square root of the time), but not absolute accuracy, which depends on the offset and the cone. Because the scan loop pauses at every stop for the object to settle, we are not constrained by speed, so the default is 200 ms. If measurements on the rig show no difference against 100 ms, 100 ms is enough.
 
-### 2. Fresh Measurement per Read (`get_distance_mm`)
+### 2. Fresh Measurement per Read (`read_distance_mm`)
 The sensor ranges continuously, so a sample may already be waiting from before the last turntable move. Every read therefore:
 1. Discards the waiting sample with `clear_interrupt()`.
 2. Polls `data_ready` every 5 ms, with a timeout of `2 × timing_budget + 100 ms`.
@@ -55,25 +55,66 @@ The sensor ranges continuously, so a sample may already be waiting from before t
 
 A read blocks for up to one timing budget (about 200 ms). The whole sequence is guarded by a `threading.Lock`, because the scan loop and the `/test/tof` endpoint (which FastAPI runs in a thread pool) can call it at the same time, and one caller's `clear_interrupt()` would otherwise consume the sample the other is waiting for.
 
-### 3. Infinity & Error Handling
-The wrapper returns Python's `float('inf')` (meaning "clear / no object") when:
+**Limit of "fresh".** A measurement that was already in progress when `clear_interrupt()` ran finishes afterwards and is returned, so the sample can be up to one timing budget (about 200 ms) older than the call. The scanner's settling pause is what keeps this harmless; the driver does not throw that sample away.
+
+### 3. Invalid Reading vs No Object
+The wrapper separates two different things:
+
+| Outcome | Meaning | Returned by `read_distance_mm()` |
+| :--- | :--- | :--- |
+| **Valid reading, far** | The sensor sees the backdrop (about 535 mm). No object in the cone. | the distance in mm |
+| **Valid reading, near** | An object is in the cone. | the distance in mm |
+| **Invalid reading** | Unknown. Not "no object". | `None` |
+
+`read_distance_mm()` returns `None` when:
+- the sensor is not available (library missing, I2C wires disconnected, wrong model ID at start-up). The call returns immediately, it does not wait;
 - the driver reports `None`, which happens when the range status is not valid (no target, signal too weak, out of range);
 - the wait for a measurement times out;
-- an I2C error occurs.
+- an I2C or driver error occurs;
+- the value is not a finite positive number.
 
-If the I2C wires are disconnected or the model ID is wrong at start-up (`Wrong sensor ID or type!`), `__init__` catches the exception and permanently disables the sensor for that run. In this fallback mode `get_distance_mm()` always returns `float('inf')`.
+It never returns `inf`. The empty backdrop is itself a **valid** reading, so an invalid reading cannot mean "nothing there": a dark or absorbing object, a failing sensor and a loose cable all look like this, and none of them is evidence that the object has ended. The scan must therefore not end because of invalid readings.
 
-### 4. Double-Read Confirmation (`is_object_detected`)
-Laser sensors can occasionally bounce off dust or highly reflective surfaces at odd angles. To prevent a false positive, `is_object_detected()` requires **two consecutive fresh readings**, both below the threshold. Each read waits for its own measurement, so the second one is always taken entirely after the first and after the turntable has stopped. If the first reading is not below the threshold, the second is skipped.
+`get_distance_mm()` is kept for older callers and is built on `read_distance_mm()`: it returns `float('inf')` when the reading is `None`. It cannot tell "invalid" from "far", so new code should not use it for decisions.
+
+At start-up `__init__` never raises. If `board`, `busio` or `adafruit_vl53l1x` cannot be imported, importing `tof.py` still works and the sensor is marked `available = False` with a warning. If the driver constructor or the configuration fails after the I2C bus was opened, the bus is released (`deinit`) and the sensor is unavailable for that run. `close()` can be called any number of times.
+
+### 4. Object Probe (`probe_object`, `is_object_detected`)
+Laser sensors can occasionally bounce off dust or highly reflective surfaces at odd angles. To prevent a false positive, `probe_object(threshold, samples=2)` takes up to `samples` **consecutive fresh readings**. Each read waits for its own measurement, so the second one is always taken entirely after the first and after the turntable has stopped. It returns `Optional[bool]`, reading by reading:
+
+| Reading | Result |
+| :--- | :--- |
+| invalid (`None`) | stop, return `None` (no decision, even if an earlier reading was below the threshold) |
+| valid and `>= threshold` | stop, return `False` (backdrop seen, definite) |
+| valid and `< threshold` | take the next reading |
+| `samples` valid readings, all `< threshold` | return `True` (object present) |
+
+So `False` is always backed by a valid far reading; invalid readings only ever give `None`. The caller decides what `None` means (the scanner counts it as "unknown", not "object finished").
+
+`is_object_detected(threshold)` stays for compatibility and is `True` only when `probe_object(threshold)` is `True`; both `False` and `None` give `False`.
+
+**Cost.** Each read takes up to one timing budget, so a probe takes about one budget when the first reading is far or invalid and two budgets (about 0.4 s at 200 ms) when the object is present. The second read is not free: the scan loop reserves 0.2 s per stop and the scanner only sleeps what remains of it, so a stop with an object is longer than 0.2 s whenever the probe is made. A shorter timing budget (see section 1) lowers this directly.
 
 The threshold used by the scanner is `TOF_BACKGROUND_DISTANCE_MM - TOF_CLEARANCE_MARGIN_MM` (both constants in `scanner.py`), so ToF noise on the empty backdrop is not mistaken for an object.
+
+### 5. `GET /test/tof`
+Always answers `200`. It never fails because of an invalid reading.
+
+```json
+{ "status": "success", "distance_mm": 535.2, "valid": true,  "available": true }
+{ "status": "invalid", "distance_mm": null,  "valid": false, "available": true }
+{ "status": "invalid", "distance_mm": null,  "valid": false, "available": false }
+```
+
+- `valid: false, available: true`: the sensor is there but the reading is invalid (no target, weak signal, timeout, I2C error).
+- `available: false`: the sensor never initialised (see the start-up warning in the log: library missing, wires, wrong model ID). Restart after fixing the cause.
 
 ---
 
 ## 🚦 Integration in the Scanner Loop
 
 During `Scanner.scan()`:
-- At every rotational stop (e.g. 20 stops per 360° ring), after the turntable has moved, `tof.is_object_detected()` is called until the object has been seen on that level. The call also counts towards the settling pause, and the scanner sleeps whatever remains of 0.2 s.
+- At every rotational stop (e.g. 20 stops per 360° ring), after the turntable has moved, `tof.is_object_detected()` (or `probe_object()`, to keep an invalid reading apart from a far one) is called until the object has been seen on that level. The call also counts towards the settling pause, and the scanner sleeps whatever remains of 0.2 s.
 - If it returns `True`, a boolean flag `object_detected_this_level` is permanently set to `True` for that specific Z-level ring.
 - At the end of the 360° rotation, the scanner checks the flag. 
 - If `object_detected_this_level` is `False`, the scanner knows it just did a full 360° rotation above the object's roof. It safely terminates the overall scan, skips moving the Z-axis any higher, and proceeds to the cleanup phase.
@@ -101,8 +142,9 @@ Also check:
 
 ## ⚠️ Known Limitations
 
-- **Systematic misses.** The 20 stops on a ring are not independent chances. They help when the miss depends on the angle (asymmetric object, partial coverage), but a miss caused by the material (very dark, transparent, glossy) is the same on every stop and ends the scan after level 1. The log then shows `ToF Sensor cleared the object at level 1`.
-- **`None` and "empty" are the same reading.** An object that absorbs all light cannot be told apart from a clear backdrop. If the material check shows this is a real problem, a possible change is to treat an invalid reading as "object present" when the backdrop itself reliably returns valid readings.
+- **Systematic misses.** The 20 stops on a ring are not independent chances. They help when the miss depends on the angle (asymmetric object, partial coverage), but a miss caused by the material is the same on every stop. If the sensor sees through or past the object and returns a *valid* far reading (transparent, glossy), the scan ends after level 1 and the log shows `ToF Sensor cleared the object at level 1`. If the material gives an *invalid* reading (very dark), the result is unknown, not "no object".
+- **An object that absorbs all light** returns an invalid reading, not a far one. It is reported as unknown (`None`), never as "no object", so it cannot end the scan by itself; but it also gives no evidence that the object is there.
+- **Invalid readings on every stop** (sensor unplugged, flaky I2C, very dark backdrop) mean the roof can never be confirmed. How the scanner reacts is decided in `scanner.py`, not here.
 - **Objects narrower than the cone.** At 4x4 the cone is about 10-14 cm wide at working distance. Narrower parts return a mix of object and backdrop.
 - **Sloped or curved tops** reflect light sideways and return weakly, which is where the roof detection matters most.
 - **Glossy and transparent objects:** specular reflection sends light away from the sensor, and transparent material lets it through, so the sensor sees the backdrop.

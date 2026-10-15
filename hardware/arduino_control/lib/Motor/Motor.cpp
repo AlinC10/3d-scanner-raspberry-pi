@@ -1,15 +1,6 @@
 #include "Motor.h"
 #include "Protocol.h"
 
-static inline void safeDelayMicroseconds(uint32_t us) {
-    if (us > 16000) {
-        delay(us / 1000);
-        delayMicroseconds(us % 1000);
-    } else if (us > 0) {
-        delayMicroseconds(us);
-    }
-}
-
 Motor::Motor():
     id(0),
     dirPin(-1),
@@ -26,7 +17,7 @@ Motor::Motor(const uint8_t id, const int8_t pulsePin, const int8_t dirPin, const
     pulsePin(pulsePin),
     enPin(enPin),
     configured(false),
-    enableStatus(enPin != -1)
+    enableStatus(false) // EN is only driven by pinSetup(); until then the motor is not known to be energized
 {
 
 }
@@ -41,14 +32,18 @@ void Motor::pinSetup(const uint8_t id , const int8_t pulsePin, const int8_t dirP
     pinMode(this->pulsePin, OUTPUT);
 
     if (this->enPin >= 0) {
+        // EN is active LOW (LOW = driver energized). Latch HIGH in the port register BEFORE switching the pin to
+        // OUTPUT, otherwise it would come up LOW (energized) while enableStatus is false, and DISABLE / 0xFF would
+        // be no-ops until the first ENABLE or move.
+        digitalWrite(this->enPin, HIGH);
         pinMode(this->enPin, OUTPUT);
-        this->disable();
     }
+    this->enableStatus = false;
     this->configured = true;
 }
 
 void Motor::enable() {
-    if (this->enPin == -1 || this->isEnabled())
+    if (this->enPin < 0 || this->isEnabled())
         return;
 
     digitalWrite(this->enPin, LOW);
@@ -56,7 +51,8 @@ void Motor::enable() {
 }
 
 void Motor::disable() {
-    if (this->enPin == -1 || !this->isEnabled())
+    // Always write the pin (idempotent): it must not depend on enableStatus, which can disagree with the real EN level.
+    if (this->enPin < 0)
         return;
 
     digitalWrite(this->enPin, HIGH);
@@ -75,27 +71,16 @@ uint8_t Motor::rotate(const bool clockwise, const uint32_t steps, const uint32_t
     digitalWrite(this->dirPin, clockwise ? HIGH : LOW);
     delayMicroseconds(20); // TB6600 direction setup time
 
-    constexpr uint8_t TB6600_REQ_MICROS_DELAY = 50;
-    const uint32_t lowDelay = (delayMicros > TB6600_REQ_MICROS_DELAY) ? (delayMicros - TB6600_REQ_MICROS_DELAY) : TB6600_REQ_MICROS_DELAY;
-
+    // Same absolute-time scheduling and 0xFF polling as rotateRamp(): the first pulse is emitted immediately and a stop
+    // is honoured within ~1 ms even with step periods above 16 ms. stepAt() enforces the 60 us period floor.
+    uint32_t nextStepAt = micros();
     for (uint32_t i = 0; i < steps; i++) {
-        if (Serial.available() > 0) {
-            const uint8_t b = Serial.peek();
-
-            if (b == CMD_EMERGENCY_STOP || b == CMD_EMERGENCY_ALIAS) {
-                Serial.read();
-                this->disable();
-                return STATUS_ERR_ABORTED;
-            }
-        }
-
-        digitalWrite(this->pulsePin, HIGH);
-        delayMicroseconds(TB6600_REQ_MICROS_DELAY);
-        digitalWrite(this->pulsePin, LOW);
-        safeDelayMicroseconds(lowDelay);
+        const uint8_t status = this->stepAt(nextStepAt, delayMicros);
+        if (status != STATUS_OK) return status;
     }
 
-    return STATUS_OK;
+    // Let the final step period elapse before reporting completion (same as rotateRamp).
+    return this->waitUntil(nextStepAt);
 }
 
 void Motor::stop() {
@@ -146,6 +131,10 @@ uint8_t Motor::stepAt(uint32_t& nextStepAt, const uint32_t periodUs) {
 }
 
 // Step period (us) for a squared speed v2 (steps^2 / s^2).
+// NOTE: sqrtf + a float divide cost roughly 200-400 us on the ATmega328P (estimate, not measured). Because steps are
+// scheduled against an absolute deadline this is hidden inside the wait, but below a ~400 us step period it can exceed
+// the period and make ramp steps run late. The firmware does not guard against this; the Python side enforces
+// STEP_DELAY_MIN = 0.0001 s (hardware/motor.py) and recommends >= 0.0005 s for scans.
 static inline uint32_t periodFromSpeedSquared(const float v2) {
     return (uint32_t)(1000000.0f / sqrtf(v2) + 0.5f);
 }

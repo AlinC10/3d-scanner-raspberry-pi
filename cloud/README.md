@@ -16,11 +16,25 @@ INPUT_IMAGES = os.path.join(BASE_DIR, "input_images")
 ```
 This guarantees it will reliably find `input_images` and `output` folders regardless of the current working directory.
 
-### 2. Strict Socket Timeouts
-Because the background upload queue (`scanner.py`) relies on network stability, `boto3` is explicitly configured to prevent Python threads from hanging infinitely in kernel I/O wait during Wi-Fi drops:
-- `connect_timeout=5`: Fails fast if the TCP socket cannot open.
-- `read_timeout=15`: Fails if an ongoing data transfer stalls.
-- `retries={'max_attempts': 1}`: Internal blind retries are disabled so our custom Resilient Upload Worker can actively manage the backoff and cancellation logic.
+### 2. Strict Socket Timeouts and Bounded Retries
+Because the background upload queue (`scanner.py`) relies on network stability, `boto3` is explicitly configured (`R2_CONFIG`) to prevent Python threads from hanging infinitely in kernel I/O wait during Wi-Fi drops:
+- `connect_timeout=10`: Fails fast if the TCP socket cannot open.
+- `read_timeout=60`: Fails if an ongoing data transfer stalls.
+- `retries={'max_attempts': 1}`: Internal blind retries are disabled. Retrying is the job of the upload worker in `hardware/scanner.py`, which uses a **bounded** number of attempts with backoff and a global drain deadline, so a scan can never wait on R2 forever.
+- `region_name="auto"`: the region R2 expects.
+
+`upload_file()` never raises: `ClientError`, `BotoCoreError`, `S3UploadFailedError` and `OSError` are logged and reported as `False`. A local file that is missing or has 0 bytes returns `False` immediately, without any network call. The worker decides whether to retry; the photo always stays on disk.
+
+### 2b. Checksum Note (audit CLOUD-16)
+boto3 >= 1.36 adds CRC checksums to requests and validates them on responses by default, which R2 can reject. The config therefore sets `request_checksum_calculation="when_required"` and `response_checksum_validation="when_required"`. Older botocore versions do not know these keywords, so the config builder falls back to the options it accepts (a `TypeError` is caught). `preflight()` exercises this behaviour with a real write.
+
+### 2c. Verification and Preflight
+- `list_keys(prefix="", bucket=...)`: paginated listing (`list_objects_v2` paginator, so more than 1000 objects work) returning a set of keys. Raises `R2Error` if the listing fails.
+- `verify_keys(expected, bucket=...)`: does **one** paginated listing and returns the sorted list of expected keys that are missing from the bucket. An empty list means every photo of the manifest is in R2.
+- `preflight(bucket=...)`: raises `R2Error` with a human readable message if `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID` or `R2_SECRET_ACCESS_KEY` is missing/empty (read from `os.environ` at call time), or if a small write + head + delete round trip on `_preflight/<uuid>.txt` fails (credentials, bucket permissions, checksum behaviour). The probe object is always removed. Called at `/prepare`, before homing, so a misconfigured R2 fails before the scan and not after it.
+
+### 2d. What `/prepare` Wipes
+At the start of every new scan the bucket and the local photo directory are wiped. `delete_all_files_from_bucket()` lists the bucket with the paginator, calls `delete_objects` in chunks of 1000 keys, inspects the `Errors` list of every response and raises `R2Error` naming the keys that could not be deleted. It returns the number of deleted objects. Listing/delete request failures are also raised as `R2Error`. Because the previous scan's photos are gone after `/prepare`, download them from the bucket (or copy the local folder) before starting a new scan.
 
 ### 3. Pipeline Validation (`file_exists_and_is_new`)
 To determine if Meshroom succeeded or failed on RunPod, the system uses `file_exists_and_is_new()`. This relies on `boto3.head_object()` to check the `LastModified` UNIX timestamp against the time the job was started. This guarantees we don't accidentally download a stale `output.zip` from a previous scan.

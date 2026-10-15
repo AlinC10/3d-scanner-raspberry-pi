@@ -9,7 +9,9 @@ CommandHandler::CommandHandler(Motor* motors, const uint8_t motorCount):
 
 void CommandHandler::begin(const uint32_t baudRate) {
     Serial.begin(baudRate);
-    Serial.println(STATUS_OK);
+    // Boot banner. It is deliberately NOT a numeric status: if the board resets in the middle of a command, the
+    // host must not mistake this line for the "0" (OK) answer of the command that was lost.
+    Serial.println(F("READY"));
 }
 
 void CommandHandler::update() {
@@ -39,7 +41,7 @@ void CommandHandler::update() {
 }
 
 void CommandHandler::parseAndExecute(const char* cmd) {
-    char* p = strchr(cmd, ' '); // Pointer to arguments following the command token
+    char* p = const_cast<char*>(strchr(cmd, ' ')); // Pointer to arguments following the command token (read-only use)
     if (p) p++;                 // Advance past delimiter space
 
     // Instant O(1) dispatch on opcode digit or initial ASCII letter (zero strcmp!)

@@ -3,6 +3,8 @@ from fastapi.responses import StreamingResponse
 from typing import Optional, Annotated
 import logging
 import threading
+import contextlib
+import importlib
 from schemas.scanner import *
 
 import os
@@ -13,10 +15,27 @@ if MOCK_HARDWARE:
     from hardware.scanner_mock import ScannerState
 else:
     from hardware.scanner import Scanner, ScannerState
-import cloud.runpod as runpod
 import cloud.cloudflare_r2 as r2
+# cloud.runpod is imported lazily (see _load_runpod): a missing RunPod package or configuration must not affect scans
+# that do not launch RunPod.
 
 log = logging.getLogger(__name__)
+
+# Exception class raised by scan() when the verification finds photos missing from the bucket. Resolved defensively:
+# older scanner modules and the mock scanner do not define it (the router then matches it by class name).
+try:
+    if MOCK_HARDWARE:
+        from hardware.scanner_mock import ScannerUploadError as _ScannerUploadError
+    else:
+        from hardware.scanner import ScannerUploadError as _ScannerUploadError
+    if not (isinstance(_ScannerUploadError, type) and issubclass(_ScannerUploadError, BaseException)):
+        _ScannerUploadError = None
+except ImportError:
+    _ScannerUploadError = None
+
+# At most this many missing keys are echoed by GET /status and the log
+_MISSING_KEYS_REPORTED = 50
+_MISSING_KEYS_LOGGED = 20
 
 router = APIRouter(
     prefix="/scanner",
@@ -67,6 +86,67 @@ scanner = _LazyScanner(lambda: Scanner(xvs=False))
 _start_lock = threading.Lock()
 _start_state = {"pending": False}
 
+def _load_runpod():
+    """Imports cloud.runpod on first use (only scans that set cloud.launch_runpod need it)."""
+    return importlib.import_module("cloud.runpod")
+
+
+def __getattr__(name):
+    # Backward compatibility: `router.scanner.runpod` used to be a module-level import
+    if name == "runpod":
+        return _load_runpod()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _is_upload_error(error: BaseException) -> bool:
+    if _ScannerUploadError is not None and isinstance(error, _ScannerUploadError):
+        return True
+    return type(error).__name__ == "ScannerUploadError"
+
+
+def _runpod_config_problem() -> str | None:
+    """
+    Returns why RunPod cannot be launched with the current configuration (None when it looks usable), so a scan that
+    asks for RunPod is refused before the physical scan instead of failing after it (API-10, CLOUD-11).
+    """
+    try:
+        runpod_module = _load_runpod()
+    except Exception as e:
+        return f"The RunPod module could not be loaded: {e}"
+
+    api_key = getattr(runpod_module, "RUNPOD_API_KEY", None)
+    if not isinstance(api_key, str) or not api_key.strip():
+        return "RUNPOD_API_KEY is not set; configure it or send cloud.launch_runpod=false."
+
+    image = getattr(runpod_module, "IMAGE_NAME", None)
+    if not isinstance(image, str) or not image.strip() or image.strip().lower().startswith("yourdockerhubuser/"):
+        return "The RunPod image name is not configured (placeholder value); set it or send cloud.launch_runpod=false."
+    return None
+
+
+def _cancel_requested() -> bool:
+    cancel_event = getattr(scanner, "_cancel_event", None)
+    return cancel_event is not None and cancel_event.is_set() is True
+
+
+def _set_state_unless_cancelled(new_state) -> bool:
+    """
+    Compare-and-set of the scanner state (API-1): writes `new_state` unless the run was cancelled meanwhile, in which
+    case the state is left (or forced) as CANCELLED. The cancel flag is set before emergency_stop() has published the
+    CANCELLED state, so it counts as well. Returns whether `new_state` was written.
+    """
+    lock = getattr(scanner, "_lock", None)
+    guard = lock if hasattr(lock, "__enter__") and hasattr(lock, "__exit__") else contextlib.nullcontext()
+    with guard:
+        if scanner.state == ScannerState.CANCELLED:
+            return False
+        if _cancel_requested():
+            scanner.state = ScannerState.CANCELLED
+            return False
+        scanner.state = new_state
+        return True
+
+
 def _finish_preparation_worker(kwargs: dict):
     scanner.finish_preparation(**kwargs)
 
@@ -75,6 +155,27 @@ def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
     """
     Safely triggers the homing, lighting, and camera initializations for the frontend framing.
     """
+    # A manual /test move (or any motion still in flight) owns the rig: do not start preparing on top of it.
+    # Entering and leaving the guard is only a non-blocking probe; `conflict` is duck-typed for the mock scanner.
+    guard = getattr(scanner, "motion_guard", None)
+    if guard is not None:
+        try:
+            with guard():
+                pass
+        except Exception as busy:
+            if getattr(busy, "conflict", False):
+                raise HTTPException(status_code=409, detail=str(busy))
+            raise
+
+    # Refuse a wrong state before touching anything: a refused /prepare must not change the LED brightness.
+    # setup_and_stream() validates the state again, atomically; this is only the early, side-effect free check.
+    if getattr(scanner, "_stopping", False) is True:
+        raise HTTPException(status_code=409, detail="Cannot prepare. An emergency stop is still in progress.")
+    state = scanner.state
+    allowed = getattr(ScannerState, "PREPARE_ALLOWED", None)
+    if isinstance(state, str) and allowed is not None and state not in allowed:
+        raise HTTPException(status_code=400, detail=f"Cannot prepare. Scanner is currently {state}")
+
     try:
         scanner.lights.set_brightness(req.illumination_brightness)
         
@@ -93,19 +194,25 @@ def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
             stream_urls=urls
         )
     except RuntimeError as e:
-        # State validation failures
-        raise HTTPException(status_code=400, detail=str(e))
+        # State validation failures. A refusal that is only temporary (an emergency stop is still tearing the previous
+        # run down: `conflict` is set on the error) is a 409, not a 400. Duck-typed so the mock scanner needs no import.
+        status = 409 if getattr(e, "conflict", False) else 400
+        raise HTTPException(status_code=status, detail=str(e))
     except Exception as e:
+        # A busy rig (ScannerBusyError, a locked light) is a temporary refusal, not a server fault: 409
+        if getattr(e, "conflict", False) is True:
+            raise HTTPException(status_code=409, detail=str(e))
         # Hardware errors, S3 bucket cleanup errors, etc.
         raise HTTPException(status_code=500, detail=str(e))
 
 def _orchestrate_pipeline(req: StartRequest):
     """
-    Background worker that runs the mechanical scan and cloud pipeline synchronously.
-    Updates the global scanner.state natively so the frontend polling loop is always accurate.
+    Background worker that runs the mechanical scan and, only when the request asks for it (cloud.launch_runpod), the
+    cloud pipeline. Updates the global scanner.state natively so the frontend polling loop is always accurate.
+    Every state write goes through _set_state_unless_cancelled(): a CANCELLED state is never overwritten.
     """
     try:
-        # 1. Mechanical Scan
+        # 1. Mechanical Scan (scan() returns once the photos are also verified in the bucket)
         try:
             scanner.scan(
                 angle=req.mechanical.turntable.angle,
@@ -129,11 +236,22 @@ def _orchestrate_pipeline(req: StartRequest):
             # That is not a failure of the running state: do not overwrite it.
             log.warning("Scan not started: %s", e)
             return
-        
+        except Exception as e:
+            if not _is_upload_error(e):
+                raise
+            # The physical scan finished but photos are missing from the bucket. The scanner already carries
+            # `missing` and `error` (shown by /status); the files stay on disk.
+            missing = list(getattr(e, "missing", None) or getattr(scanner, "missing", None) or [])
+            log.error(
+                "Upload verification failed: %d photo(s) missing from the bucket (first %d: %s): %s",
+                len(missing), _MISSING_KEYS_LOGGED, missing[:_MISSING_KEYS_LOGGED], e,
+            )
+            _set_state_unless_cancelled(ScannerState.ERROR)
+            return
+
         # Check if it was cancelled during the scan (the cancel flag is set before emergency_stop() has time to
         # publish the CANCELLED state)
-        cancel_event = getattr(scanner, "_cancel_event", None)
-        if scanner.state == ScannerState.CANCELLED or (cancel_event is not None and cancel_event.is_set()):
+        if scanner.state == ScannerState.CANCELLED or _cancel_requested():
             scanner.state = ScannerState.CANCELLED
             log.info("Scan was cancelled, aborting cloud pipeline.")
             return
@@ -143,9 +261,18 @@ def _orchestrate_pipeline(req: StartRequest):
             log.error("Scan ended in error state (e.g. stalled uploads). Aborting cloud pipeline.")
             return
 
-        # 2. Cloud Processing
-        scanner.state = ScannerState.PROCESSING
-        
+        # 2. RunPod is optional: without it the scan is done once the photos are in the bucket
+        if getattr(req.cloud, "launch_runpod", False) is not True:
+            if _set_state_unless_cancelled(ScannerState.COMPLETED):
+                log.info("Scan completed: photos verified in the bucket (RunPod not requested).")
+            return
+
+        # 3. Cloud Processing
+        runpod = _load_runpod()
+        if not _set_state_unless_cancelled(ScannerState.PROCESSING):
+            log.info("Scan was cancelled, aborting cloud pipeline.")
+            return
+
         job = {
             "job_id": req.job_id,
             "photo_count": scanner.total_photos,
@@ -154,33 +281,36 @@ def _orchestrate_pipeline(req: StartRequest):
             "depthmap_downscale": req.cloud.depthmap_downscale,
             "max_input_points": req.cloud.max_input_points
         }
-        
+
         success = runpod.launch_job(job, cancel_event=scanner._cancel_event)
-        
-        if scanner._cancel_event.is_set():
+
+        if _cancel_requested() or scanner.state == ScannerState.CANCELLED:
             scanner.state = ScannerState.CANCELLED
             log.info("Job cancelled during cloud processing.")
             return
-            
+
         if not success:
             raise RuntimeError("RunPod processing failed.")
-            
-        # 3. Downloading Assets
-        scanner.state = ScannerState.DOWNLOADING
+
+        # 4. Downloading Assets
+        if not _set_state_unless_cancelled(ScannerState.DOWNLOADING):
+            log.info("Job cancelled before the download.")
+            return
         # R2 download_generated_obj defaults to dest_dir=os.getcwd() if not provided, but let's be explicit
         success = r2.download_generated_obj(object_name="output.zip", dest_dir=r2.OUTPUT_DIR)
-        
+
         if not success:
             raise RuntimeError("Failed to download or extract output.zip from R2.")
-            
-        # 4. Completed!
-        scanner.state = ScannerState.COMPLETED
-        log.info("Full pipeline completed successfully.")
-        
+
+        # 5. Completed! (not if a cancel arrived during the download)
+        if _set_state_unless_cancelled(ScannerState.COMPLETED):
+            log.info("Full pipeline completed successfully.")
+        else:
+            log.info("Job cancelled during the download; state stays CANCELLED.")
+
     except Exception as e:
         log.error("Pipeline failed: %s", e)
-        if scanner.state != ScannerState.CANCELLED:
-            scanner.state = ScannerState.ERROR
+        _set_state_unless_cancelled(ScannerState.ERROR)
     finally:
         with _start_lock:
             _start_state["pending"] = False
@@ -190,6 +320,12 @@ def start_scan(req: StartRequest, background_tasks: BackgroundTasks):
     """
     Delegates the mechanical scan and cloud execution to a background pipeline.
     """
+    # RunPod requested: refuse now when it cannot work, not after the physical scan (API-10, CLOUD-11)
+    if getattr(req.cloud, "launch_runpod", False) is True:
+        problem = _runpod_config_problem()
+        if problem:
+            raise HTTPException(status_code=400, detail=f"RunPod is not configured: {problem}")
+
     with _start_lock:
         if scanner.state != ScannerState.PREPARED:
             raise HTTPException(status_code=400, detail=f"Cannot start scan from state {scanner.state}. Must be PREPARED.")
@@ -216,10 +352,33 @@ def get_status():
     """
     Poll this endpoint to observe the active pipeline state.
     """
+    def _text(name):
+        value = getattr(scanner, name, None)
+        return value if isinstance(value, str) else None
+
+    def _count(name):
+        value = getattr(scanner, name, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    def _texts(name, limit=None):
+        value = getattr(scanner, name, None)
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return []
+        items = [str(item) for item in value]
+        return items[:limit] if limit else items
+
     return StatusResponse(
         state=scanner.state,
-        total_photos=getattr(scanner, "total_photos", 0),
-        stream_urls=getattr(scanner, "stream_urls", None)
+        total_photos=_count("total_photos"),
+        stream_urls=getattr(scanner, "stream_urls", None),
+        phase=_text("phase"),
+        phase_message=_text("phase_message"),
+        level=_count("level"),
+        photos_captured=_count("photos_captured"),
+        photos_uploaded=_count("photos_uploaded"),
+        missing=_texts("missing", _MISSING_KEYS_REPORTED),
+        error=_text("error"),
+        tof_warnings=_texts("tof_warnings"),
     )
 
 

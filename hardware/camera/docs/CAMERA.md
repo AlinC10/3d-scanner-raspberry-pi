@@ -98,7 +98,9 @@ For 3D photogrammetry with Meshroom, lighting must not flicker or shift color be
 3. Selectively locks Auto Exposure (`AeEnable=False`) and/or Auto White Balance (`AwbEnable=False`), writing the live metadata back to the sensor.
 4. Freezes exposure and white balance for all subsequent 360° captures.
 
-*Note: The `prepare_scan` method intelligently orchestrates this. If you supply a manual `exposure_time`, it correctly skips locking AE while still locking AWB, ensuring a manual shutter speed does not cause color drift.*
+*Note: The `prepare_scan` method intelligently orchestrates this. If you supply a manual `exposure_time`, it correctly skips locking AE while still locking AWB, ensuring a manual shutter speed does not cause color drift. A gain-only call (`analogue_gain` without `exposure_time`) disables AE and locks the exposure at its current metadata value.*
+
+*Note: once locked, the lock is not undone by later `apply_settings(brightness=..., contrast=...)` calls (they no longer touch AE). The dual-camera driver exposes the lock as `DualCameraRPISync.prepare_scan(lock_auto=True)`; see [DUAL_CAMERAS.md](../../docs/DUAL_CAMERAS.md).*
 
 ---
 
@@ -137,8 +139,8 @@ Captures a high-resolution still image from the `main` stream.
 #### `record_video(output=None, duration=10.0, resolution=None, quality=25) -> str`
 Records an MP4 video clip locally.
 
-#### `apply_settings(exposure_time=None, analogue_gain=None, awb_mode=None, brightness=None, contrast=None, saturation=None, sharpness=None) -> None`
-Applies runtime image adjustments without restarting the stream.
+#### `apply_settings(exposure_time=None, analogue_gain=None, awb_mode=None, brightness=None, contrast=None, saturation=None, sharpness=None, colour_gains=None) -> None`
+Applies runtime image adjustments without restarting the stream. Only the controls that are passed are written: `exposure_time` (or `analogue_gain`) disables AE, `awb_mode` presets keep AWB enabled, `colour_gains=(r, b)` disables AWB, and the image-tuning values (`brightness`, ...) never change AE/AWB state.
 
 #### `lock_auto_features(settle_time=2.0, lock_ae=True, lock_awb=True) -> dict`
 Extracts converged exposure and color balance metadata and locks the specified auto features.
@@ -150,7 +152,7 @@ Sets lens focus position (`0`–`1023`).
 Runs contrast-detection sweep autofocus on the specified ROI and returns the winning position.
 
 #### `close() -> None`
-Stops `picamera2` and safely terminates I2C VCM connection. Also supported via context manager (`with ArducamIMX477(...) as cam:`).
+Stops recording/preview/the sensor, calls `Picamera2.close()` and closes the I2C VCM bus (in a `finally`, so a failing step cannot leak the bus). Idempotent. Also supported via context manager (`with ArducamIMX477(...) as cam:`).
 
 ---
 

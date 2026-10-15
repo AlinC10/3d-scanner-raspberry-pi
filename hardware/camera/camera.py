@@ -116,6 +116,10 @@ class ArducamIMX477:
         self._rotation = self._validate_rotation(rotation)
         self._pending_controls = {}
         self._scan_prepared = False
+        self._closed = False
+        # Latest request metadata seen for this camera (set by DualCameraRPISync's
+        # grab worker and by lock_auto_features); used to lock a missing exposure.
+        self._last_metadata: Optional[dict] = None
 
         # Select the correct I2C bus for this camera's VCM
         vcm_bus = _vcm_bus_for_camera(camera_id)
@@ -280,6 +284,30 @@ class ArducamIMX477:
         )
         self.picam2.configure(cfg)
 
+    def _stop_camera(self):
+        """Stop the camera and mark the VCM as unpowered (the CSI bus is power-gated)."""
+        try:
+            self.picam2.stop()
+        finally:
+            self.focuser.invalidate()
+
+    def _is_recording(self) -> bool:
+        """True while an encoder is attached (picamera2 has no ``recording`` flag on all versions)."""
+        return bool(getattr(self.picam2, "recording", False) or getattr(self.picam2, "encoders", None))
+
+    def _metadata_exposure(self, allow_capture: bool = False) -> Optional[int]:
+        """Latest known ExposureTime (us) from request metadata, or None."""
+        md = self._last_metadata
+        if md is None and allow_capture and getattr(self.picam2, "started", False):
+            try:
+                md = self.picam2.capture_metadata()
+            except Exception as exc:
+                log.debug("capture_metadata failed while locking exposure: %s", exc)
+        value = md.get("ExposureTime") if isinstance(md, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return int(value)
+        return None
+
     # ── Camera settings ───────────────────────────────────────────────────────
     def apply_settings(
         self,
@@ -290,48 +318,74 @@ class ArducamIMX477:
         saturation=None,
         sharpness=None,
         awb_mode=None,
+        colour_gains=None,
     ):
         """
         Apply image controls to the camera.
 
+        Only the controls that are given are touched: in particular AE is NOT
+        re-enabled when only brightness/contrast/... are passed, so a locked
+        exposure stays locked.
+
         Args:
-            exposure_time:  Shutter speed in microseconds (None = auto).
-            analogue_gain:  Analogue ISO gain (1.0 – 16.0).
+            exposure_time:  Shutter speed in microseconds. Disables AE.
+            analogue_gain:  Analogue ISO gain (1.0 – 16.0). Disables AE; when
+                            no exposure_time is given the exposure is locked
+                            at the latest metadata value (if one is known,
+                            otherwise AE stays as it is and may override the gain).
             brightness:     -1.0 to +1.0 (default 0.0).
             contrast:       0.0 to 32.0  (default 1.0).
             saturation:     0.0 to 32.0  (default 1.0).
             sharpness:      0.0 to 16.0  (default 1.0).
             awb_mode:       auto | daylight | cloudy | indoor | fluorescent | tungsten
+                            (AWB stays enabled; the preset selects its colour model).
+            colour_gains:   (red, blue) manual gains. Disables AWB.
         """
         ctls = {}
 
         if exposure_time is not None:
             ctls["ExposureTime"] = int(exposure_time)
             ctls["AeEnable"]     = False
-        else:
-            ctls["AeEnable"]     = True
 
         if analogue_gain is not None:
             ctls["AnalogueGain"] = float(analogue_gain)
+            if exposure_time is None:
+                exposure = self._metadata_exposure()
+                if exposure is not None:
+                    ctls["ExposureTime"] = exposure
+                    ctls["AeEnable"]     = False
+                else:
+                    log.warning(
+                        "analogue_gain set without exposure_time and no metadata yet: "
+                        "AE is left unchanged and may override the gain"
+                    )
         if brightness  is not None: ctls["Brightness"]  = float(brightness)
         if contrast    is not None: ctls["Contrast"]    = float(contrast)
         if saturation  is not None: ctls["Saturation"]  = float(saturation)
         if sharpness   is not None: ctls["Sharpness"]   = float(sharpness)
 
-        AWB_MAP = {
-            "auto":        libcontrols.AwbModeEnum.Auto,
-            "daylight":    libcontrols.AwbModeEnum.Daylight,
-            "cloudy":      libcontrols.AwbModeEnum.Cloudy,
-            "indoor":      libcontrols.AwbModeEnum.Indoor,
-            "fluorescent": libcontrols.AwbModeEnum.Fluorescent,
-            "tungsten":    libcontrols.AwbModeEnum.Tungsten,
-        }
-        if awb_mode is not None:
+        if colour_gains is not None:
+            ctls["ColourGains"] = tuple(float(v) for v in colour_gains)
+            ctls["AwbEnable"] = False
+
+        if awb_mode is not None and libcontrols is None:
+            log.warning("libcamera controls unavailable; ignoring awb_mode '%s'", awb_mode)
+        elif awb_mode is not None:
+            AWB_MAP = {
+                "auto":        libcontrols.AwbModeEnum.Auto,
+                "daylight":    libcontrols.AwbModeEnum.Daylight,
+                "cloudy":      libcontrols.AwbModeEnum.Cloudy,
+                "indoor":      libcontrols.AwbModeEnum.Indoor,
+                "fluorescent": libcontrols.AwbModeEnum.Fluorescent,
+                "tungsten":    libcontrols.AwbModeEnum.Tungsten,
+            }
             awb_mode = awb_mode.lower()
             mode = AWB_MAP.get(awb_mode)
             if mode is not None:
                 ctls["AwbMode"] = mode
-                ctls["AwbEnable"] = awb_mode == "auto"
+                # A preset keeps AWB running (with that colour model); it must not
+                # silently switch AWB off. Manual colour_gains (above) still wins.
+                ctls.setdefault("AwbEnable", True)
             else:
                 log.warning("Unknown AWB mode '%s'. Choices: %s", awb_mode, list(AWB_MAP))
 
@@ -367,6 +421,8 @@ class ArducamIMX477:
             time.sleep(settle_time)
             
         metadata = self.picam2.capture_metadata()
+        if isinstance(metadata, dict):
+            self._last_metadata = metadata
         controls = {}
 
         if lock_ae:
@@ -455,10 +511,13 @@ class ArducamIMX477:
                     self.focus_sweep_autofocus(
                         step=autofocus_step, roi=autofocus_roi
                     )
-                elif self.focuser.position != focus:
+                else:
+                    # set_position is a no-op only when the lens is known to be there;
+                    # the first write after each camera start is forced (CAM-2).
                     self.focus_set(focus)
-            elif self.focuser.position:
+            else:
                 log.info("Keeping saved focus position %d", self.focuser.position)
+                self.focuser.restore_state()
 
             # --- PHOTOGRAMMETRY DEFAULTS ---
             manual_controls = {
@@ -471,6 +530,11 @@ class ArducamIMX477:
                     manual_controls["ExposureTime"] = int(exposure_time)
                 if analogue_gain is not None:
                     manual_controls["AnalogueGain"] = float(analogue_gain)
+                if exposure_time is None:
+                    # Gain-only: AE is off, so lock the exposure at its current value
+                    exposure = self._metadata_exposure(allow_capture=True)
+                    if exposure is not None:
+                        manual_controls["ExposureTime"] = exposure
 
             if colour_gains is not None:
                 manual_controls.update({
@@ -521,8 +585,8 @@ class ArducamIMX477:
                 time.sleep(settle_time)
         finally:
             if not keep_running:
-                self.picam2.stop()
-                
+                self._stop_camera()
+
         self._scan_prepared = True
 
         settings = {
@@ -534,7 +598,7 @@ class ArducamIMX477:
             "controls": locked,
             "show_preview": show_preview,
         }
-        log.info("ArducamIMX477 (cam%d): Prepared camera settings: %s", self._camera_id + 1, settings)
+        log.info("ArducamIMX477 (cam%d): Prepared camera settings: %s", self.camera_id + 1, settings)
         return settings
 
     # ── Focus (VCM) ───────────────────────────────────────────────────────────
@@ -791,7 +855,7 @@ class ArducamIMX477:
             log.info("Saved JPEG: %s (quality=%d)", output, jpeg_quality)
         finally:
             if not already_running:
-                self.picam2.stop()
+                self._stop_camera()
 
         self._process_captured_image(output, capture_resolution, jpeg_quality)
         return output
@@ -827,6 +891,7 @@ class ArducamIMX477:
         log.info("Recording %s for %.1f s …", output, duration)
         time.sleep(duration)
         self.picam2.stop_recording()
+        self.focuser.invalidate()
         log.info("Saved video: %s", output)
         return output
 
@@ -837,7 +902,7 @@ class ArducamIMX477:
             raise RuntimeError("Camera must be started (e.g. via prepare_scan) before streaming.")
 
         full_url = f"{rtsp_url}cam{self.camera_id + 1}"
-        if getattr(self.picam2, "recording", False):
+        if self._is_recording():
             log.warning("Camera %d is already streaming/recording.", self.camera_id)
             return full_url
 
@@ -856,8 +921,9 @@ class ArducamIMX477:
 
     def stop_stream(self):
         """Stops the H.264 RTSP stream."""
-        if getattr(self.picam2, "recording", False):
+        if self._is_recording():
             self.picam2.stop_recording()
+            self.focuser.invalidate()
             log.info("Live stream stopped for camera %d", self.camera_id)
 
 
@@ -951,7 +1017,7 @@ class ArducamIMX477:
                     self.focus_set(int(chr(key)) * 100)
         finally:
             cv2.destroyAllWindows()
-            self.picam2.stop()
+            self._stop_camera()
 
     def _interactive_preview_linebuf(self, resolution=None):
         """Fallback interactive preview using line-buffered input (requires Enter)."""
@@ -995,7 +1061,7 @@ class ArducamIMX477:
                 else:
                     log.info("Unknown command '%s'. Press q to quit.", key)
         finally:
-            self.picam2.stop()
+            self._stop_camera()
 
     def _print_preview_help(self):
         print(
@@ -1034,11 +1100,38 @@ class ArducamIMX477:
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     def close(self):
+        """
+        Release the camera: stop recording/preview/streaming, close the
+        Picamera2 handle (so the next Picamera2(id) does not hit "device busy")
+        and close the focuser bus. Idempotent; each step is guarded.
+        """
+        if self._closed:
+            return
+        self._closed = True
         try:
-            self.picam2.stop()
-        except Exception:
-            pass
-        self.focuser.close()
+            try:
+                if self._is_recording():
+                    self.picam2.stop_recording()
+            except Exception as exc:
+                log.warning("Camera %d: stop_recording failed: %s", self.camera_id, exc)
+            try:
+                self.picam2.stop_preview()
+            except Exception as exc:
+                log.debug("Camera %d: stop_preview failed: %s", self.camera_id, exc)
+            try:
+                if getattr(self.picam2, "started", False):
+                    self.picam2.stop()
+            except Exception as exc:
+                log.warning("Camera %d: stop failed: %s", self.camera_id, exc)
+            try:
+                self.picam2.close()
+            except Exception as exc:
+                log.warning("Camera %d: picam2.close() failed: %s", self.camera_id, exc)
+        finally:
+            try:
+                self.focuser.close()
+            except Exception as exc:
+                log.warning("Camera %d: focuser close failed: %s", self.camera_id, exc)
         log.info("Camera closed.")
 
     def __enter__(self):

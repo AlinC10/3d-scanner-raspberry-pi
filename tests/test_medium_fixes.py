@@ -80,9 +80,10 @@ def _fake_serial_modules():
 class _FakeSerial:
     """In-memory serial port: lines queued in `script` are delivered once something is written."""
 
-    def __init__(self, buffer=(), script=()):
+    def __init__(self, buffer=(), script=(), responder=None):
         self.buffer = list(buffer)   # bytes already waiting in the input buffer (stale data)
         self.script = list(script)   # answers the "Arduino" gives to the next write
+        self.responder = responder   # optional callable(bytes) -> list of reply lines, replaces `script`
         self.written = []
         self.timeout = 3.0
         self.is_open = True
@@ -90,7 +91,9 @@ class _FakeSerial:
 
     def write(self, data):
         self.written.append(bytes(data))
-        if data != bytes([0xFF]):
+        if self.responder is not None:
+            self.buffer.extend(self.responder(bytes(data)))
+        elif data != bytes([0xFF]):
             self.buffer.extend(self.script)
             self.script = []
 
@@ -135,6 +138,41 @@ class TestBridgeResync(unittest.TestCase):
         self.assertIn(bytes([0xFF]), port.written)        # the still-running move is stopped
         self.assertGreaterEqual(port.input_resets, 2)    # before the write and after the resync
         self.assertEqual(port.timeout, 3.0)               # per-command timeout is restored
+
+    def test_timeout_of_a_non_move_command_does_not_send_the_universal_stop(self):
+        port = _FakeSerial(script=[])  # ENABLE never answered
+        self._bridge(port).send_command("3 0", timeout=0.1)
+        self.assertNotIn(bytes([0xFF]), port.written)  # an idle Arduino would cut every motor on 0xFF
+
+    def test_not_configured_answer_restores_configuration_and_retries_once(self):
+        def arduino(data):
+            if data.startswith(b"2 "):
+                return [b"0\n"]
+            return [b"0\n"] if any(w.startswith(b"2 ") for w in port.written[:-1]) else [b"3\n"]
+
+        port = _FakeSerial(responder=arduino)
+        bridge = self._bridge(port)
+        bridge._configs = ["2 0 6 7 8"]
+        self.assertEqual(bridge.send_command("5 0 100 1 1000"), "0")
+        self.assertEqual(port.written, [b"5 0 100 1 1000\n", b"2 0 6 7 8\n", b"5 0 100 1 1000\n"])
+        self.assertEqual(bridge.connection_epoch, 1)  # drivers are disabled after a reset
+
+    def test_not_configured_is_not_retried_forever(self):
+        port = _FakeSerial(responder=lambda data: [b"0\n"] if data.startswith(b"2 ") else [b"3\n"])
+        bridge = self._bridge(port)
+        bridge._configs = ["2 0 6 7 8"]
+        self.assertEqual(bridge.send_command("5 0 100 1 1000"), "3")
+        self.assertEqual(len([w for w in port.written if w.startswith(b"5 ")]), 2)  # original + one retry
+
+    def test_not_configured_without_stored_configuration_is_returned_as_is(self):
+        port = _FakeSerial(script=[b"3\n"])
+        self.assertEqual(self._bridge(port).send_command("5 0 100 1 1000"), "3")
+
+    def test_reboot_banner_in_the_middle_of_a_command_is_an_abort(self):
+        port = _FakeSerial(script=[b"READY\n"])  # the board reset: the command was lost, "0" must not be assumed
+        bridge = self._bridge(port)
+        self.assertEqual(bridge.send_command("5 0 100 1 1000"), "4")
+        self.assertEqual(bridge.connection_epoch, 1)
 
     def test_next_command_after_timeout_gets_its_own_answer(self):
         port = _FakeSerial(script=[])
@@ -185,6 +223,22 @@ class TestMotorEnabledState(unittest.TestCase):
         self.assertTrue(motor.is_enabled)
         self.assertFalse(motor.rotate(steps=100, delay=0.001))
         self.assertFalse(motor.is_enabled)
+
+    def test_rotate_angle_and_distance_report_the_result(self):
+        mod, motor = self._motor(_FakeBridge())
+        self.assertTrue(motor.rotate_angle(angle=18, delay=0.001))
+        self.assertTrue(motor.rotate_distance(distance=1.0, delay=0.001))
+        mod, aborted = self._motor(_AbortingBridge())
+        self.assertFalse(aborted.rotate_angle(angle=18, delay=0.001))
+
+    def test_whole_step_helpers(self):
+        mod, _ = self._motor(_FakeBridge())
+        self.assertEqual(mod.angle_to_steps(18.0, mod.TURNTABLE_STEP_TYPE), 160)
+        self.assertEqual(mod.distance_to_steps(100.0, mod.Z_STEP_TYPE), 10000)
+        with self.assertRaises(mod.MotorError):
+            mod.angle_to_steps(10.0, mod.TURNTABLE_STEP_TYPE)
+        with self.assertRaises(mod.MotorError):
+            mod.distance_to_steps(33.333, mod.Z_STEP_TYPE)
 
     def test_reconnect_invalidates_enabled_state(self):
         bridge = _FakeBridge()
@@ -251,6 +305,8 @@ class TestTestRouterGuard(unittest.TestCase):
 
         fake_hw_scanner = types.ModuleType("hardware.scanner")
         fake_hw_scanner.ScannerError = type("ScannerError", (Exception,), {})
+        fake_hw_scanner.ScannerBusyError = type("ScannerBusyError", (fake_hw_scanner.ScannerError,), {})
+        self.busy_error = fake_hw_scanner.ScannerBusyError
         fake_endstop = types.ModuleType("hardware.endstop")
         fake_endstop.TopEndstopTriggered = type("TopEndstopTriggered", (Exception,), {})
         fake_endstop.BottomEndstopTriggered = type("BottomEndstopTriggered", (Exception,), {})
@@ -292,10 +348,33 @@ class TestTestRouterGuard(unittest.TestCase):
         self._assert_blocked(lambda: self.mod.test_home_bottom())
         self._assert_blocked(lambda: self.mod.test_move_to_top())
 
+    def test_manual_enable_and_disable_answer_409_while_a_motion_is_running(self):
+        self.scanner.state = _State.IDLE
+        busy = self.busy_error("Another motion is already in progress.")
+        self.scanner.motion_guard.return_value.__enter__.side_effect = busy
+        for call in (lambda: self.mod.test_motor_enable(), lambda: self.mod.test_motor_disable()):
+            with self.assertRaises(_HTTPException) as ctx:
+                call()
+            self.assertEqual(ctx.exception.status_code, 409)
+        self.scanner.turntable_motor.enable.assert_not_called()
+        self.scanner.z_axis_motor.disable.assert_not_called()
+
     def test_prepared_state_is_also_blocked(self):
         self.scanner.state = _State.PREPARED
         with self.assertRaises(_HTTPException):
             self.mod.test_motor_disable()
+
+    def test_aborted_movements_are_not_reported_as_success(self):
+        from_tests = self.mod
+        self.scanner.state = _State.IDLE
+        self.scanner.turntable_motor.rotate_angle.return_value = False
+        with self.assertRaises(_HTTPException) as ctx:
+            from_tests.test_turntable_rotate(_TurntableRotateRequest())
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.scanner.move_z_up_distance.return_value = False
+        with self.assertRaises(_HTTPException) as ctx:
+            from_tests.test_z_move(_ZMoveRequest())
+        self.assertEqual(ctx.exception.status_code, 500)
 
     def test_endpoints_work_when_idle(self):
         self.scanner.state = _State.IDLE
@@ -342,6 +421,14 @@ class TestStartIsAtomic(unittest.TestCase):
 
     def _req(self):
         return MagicMock()
+
+    def test_prepare_is_refused_while_a_motion_is_in_flight(self):
+        busy = type("Busy", (Exception,), {"conflict": True})("Another motion is already in progress.")
+        self.scanner.motion_guard.return_value.__enter__.side_effect = busy
+        with self.assertRaises(_HTTPException) as ctx:
+            self.mod.prepare_scan(self._req(), MagicMock())
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.scanner.setup_and_stream.assert_not_called()
 
     def test_second_start_is_rejected_while_the_first_is_pending(self):
         tasks = MagicMock()

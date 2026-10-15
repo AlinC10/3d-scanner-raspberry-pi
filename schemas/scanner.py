@@ -1,10 +1,14 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Annotated, Literal
 from hardware.camera.config import AF_ROI, AF_STEP, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_VIDEO_RESOLUTION, DEFAULT_PHOTO_RESOLUTION, DEFAULT_QUALITY
 from hardware.motor import (
     END_DELAY_MIN, END_DELAY_MAX, TURNTABLE_END_DELAY_DEFAULT,
     MotorError, angle_to_steps, distance_to_steps, TURNTABLE_STEP_TYPE, Z_STEP_TYPE,
 )
+from hardware.motor import STEP_DELAY_MIN, STEP_DELAY_MAX
+
+# Longest Z travel of the rig (decision D3); matches Z_TRAVEL_MAX_MM in hardware/scanner.py
+Z_DISTANCE_MAX_MM = 150.0
 
 
 class DualCameraConfig(BaseModel):
@@ -21,9 +25,17 @@ class DualCameraConfig(BaseModel):
         Field(description="Rotation degrees for the cameras.")
     ] = 0
 
-    focus: Annotated[int | str | tuple[int, int] | list[int] | None, Field(description="Focus value, 'auto', or tuple/list for dual independent focus.")] = None
+    focus: Annotated[int | str | tuple[int, int] | list[int] | None, Field(description="Focus position, or tuple/list for dual independent focus.")] = None
 
     show_preview: Annotated[bool, Field(description="Whether to show the native camera preview window.")] = False
+
+    @field_validator("focus")
+    @classmethod
+    def _focus_must_be_numeric(cls, v):
+        # 'auto' is not implemented by the camera driver (it used to end in a 500 after the lights were on)
+        if isinstance(v, str):
+            raise ValueError("focus must be an integer position (0-1023) or a pair of them; 'auto' is not supported")
+        return v
     settle_time: Annotated[float, Field(ge=0.0, description="Time in seconds to wait for auto-exposure/auto-white-balance to settle.")] = 2.0
     
     exposure_time: Annotated[int | None, Field(description="Manual exposure time in microseconds.")] = None
@@ -52,26 +64,28 @@ class PrepareRequest(BaseModel):
     )] = 2_000_000
     
     illumination_brightness: Annotated[float, Field(
-        ge=0.0,
+        gt=0.0,
         le=1.0,
-        description="Desired LED brightness during the scan (0.0 to 1.0). Defaults to 100%."
+        description=(
+            "Desired LED brightness during the scan (above 0.0, up to 1.0). Defaults to 100%. "
+            "0 is refused: the scanner cannot scan in the dark."
+        )
     )] = 1.0
 
     camera_config: Annotated[DualCameraConfig, Field(description="Configuration block for the dual camera array.")]
 
 
-class TurntableRotateRequest(BaseModel):
+class _TurntableMotion(BaseModel):
+    """Motion parameters shared by the manual turntable test and the scan configuration (no direction)."""
     angle: Annotated[float, Field(
         gt=0.0,
         le=360.0,
         description="Angle in degrees to rotate turntable."
     )] = 18.0
-    clockwise: Annotated[bool, Field(
-        description="Rotation direction (True = clockwise, False = counter-clockwise)."
-    )] = True
     delay: Annotated[float, Field(
-        ge=0.00005,
-        description="Delay in seconds between step pulses for the motor."
+        ge=STEP_DELAY_MIN,
+        le=STEP_DELAY_MAX,
+        description=f"Delay in seconds between step pulses for the motor ({STEP_DELAY_MIN}-{STEP_DELAY_MAX} s)."
     )] = 0.0010
     acceleration: Annotated[bool, Field(
         description="Whether to use trapezoidal acceleration ramping."
@@ -87,8 +101,9 @@ class TurntableRotateRequest(BaseModel):
         description="Optional separate percentage for the deceleration phase. Defaults to ramp_percent if null."
     )] = None
     start_delay: Annotated[float | None, Field(
-        ge=0.00005,
-        description="Starting delay in seconds for the ramp."
+        ge=STEP_DELAY_MIN,
+        le=STEP_DELAY_MAX,
+        description=f"Starting delay in seconds for the ramp ({STEP_DELAY_MIN}-{STEP_DELAY_MAX} s)."
     )] = None
     end_delay: Annotated[float | None, Field(
         ge=END_DELAY_MIN,
@@ -111,22 +126,69 @@ class TurntableRotateRequest(BaseModel):
         return value
 
 
-class ZMoveRequest(BaseModel):
+class TurntableRotateRequest(_TurntableMotion):
+    """Manual rotation (`/test/turntable/rotate`): up to 360° in either direction."""
+    clockwise: Annotated[bool, Field(
+        description="Rotation direction (True = clockwise, False = counter-clockwise)."
+    )] = True
+
+
+class TurntableScanConfig(_TurntableMotion):
+    """
+    Turntable settings of a scan (MechanicalConfig.turntable). Stricter than the manual test request: one ring of
+    photos must cover exactly one revolution, so the angle must divide a full turn in whole steps and is at most 180°.
+    A scan always turns the platter in one fixed direction, so there is no `clockwise` field here (a client that
+    still sends one is ignored).
+
+    Unknown keys are rejected (422) so a misspelled setting is not silently replaced by its default.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_keys(cls, data):
+        # `clockwise` was part of the old scan request: still accepted, but ignored
+        if isinstance(data, dict) and "clockwise" in data:
+            data = {key: value for key, value in data.items() if key != "clockwise"}
+        return data
+
+    angle: Annotated[float, Field(
+        gt=0.0,
+        le=180.0,
+        description="Angle in degrees between two photos. At most 180 and must divide 360 in whole steps."
+    )] = 18.0
+
+    @field_validator("angle")
+    @classmethod
+    def _angle_must_divide_a_full_turn(cls, value: float) -> float:
+        try:
+            steps = angle_to_steps(value, TURNTABLE_STEP_TYPE)
+            full_turn = angle_to_steps(360.0, TURNTABLE_STEP_TYPE)
+        except MotorError as e:
+            raise ValueError(str(e))
+        if full_turn % steps != 0:
+            raise ValueError(
+                f"angle {value}° ({steps} steps) does not divide a full revolution ({full_turn} steps) evenly; "
+                "the scan would not close the circle"
+            )
+        return value
+
+
+class _ZMotion(BaseModel):
+    """Motion parameters shared by the manual Z test and the scan configuration (no direction)."""
     distance_mm: Annotated[float, Field(
         gt=0.0,
-        le=200.0,
-        description="Distance in millimeters to travel."
+        le=Z_DISTANCE_MAX_MM,
+        description=f"Distance in millimeters to travel (at most {Z_DISTANCE_MAX_MM:g} mm, the Z travel)."
     )] = 100.0
-    direction: Annotated[Literal["up", "down"], Field(
-        description="Direction of carriage travel."
-    )] = "up"
     delay: Annotated[float, Field(
-        ge=0.00005,
-        description="Delay in seconds between step pulses for the motor."
-    )] = 0.0015
+        ge=STEP_DELAY_MIN,
+        le=STEP_DELAY_MAX,
+        description=f"Delay in seconds between step pulses for the motor ({STEP_DELAY_MIN}-{STEP_DELAY_MAX} s)."
+    )] = 0.0010
     acceleration: Annotated[bool, Field(
         description="Whether to use trapezoidal acceleration ramping."
-    )] = True
+    )] = False
     ramp_percent: Annotated[float, Field(
         ge=0.0,
         le=1.0,
@@ -138,9 +200,10 @@ class ZMoveRequest(BaseModel):
         description="Optional separate percentage for the deceleration phase. Defaults to ramp_percent if null."
     )] = None
     start_delay: Annotated[float | None, Field(
-        ge=0.00005,
-        description="Starting delay in seconds for the ramp."
-    )] = 0.0040
+        ge=STEP_DELAY_MIN,
+        le=STEP_DELAY_MAX,
+        description=f"Starting delay in seconds for the ramp ({STEP_DELAY_MIN}-{STEP_DELAY_MAX} s)."
+    )] = None
     end_delay: Annotated[float | None, Field(
         ge=END_DELAY_MIN,
         le=END_DELAY_MAX,
@@ -160,16 +223,55 @@ class ZMoveRequest(BaseModel):
         return value
 
 
+class ZMoveRequest(_ZMotion):
+    """Manual Z move (`/test/motor/z-move`): up or down."""
+    direction: Annotated[Literal["up", "down"], Field(
+        description="Direction of carriage travel."
+    )] = "up"
+
+
+class ZAxisScanConfig(_ZMotion):
+    """
+    Z-axis settings of a scan (MechanicalConfig.z_axis): `distance_mm` is the climb between two rings. A scan only
+    ever climbs, so there is no `direction` field here (a client that still sends one is ignored).
+
+    Unknown keys are rejected (422) so a misspelled setting is not silently replaced by its default.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_keys(cls, data):
+        # `direction` was part of the old scan request: still accepted, but ignored
+        if isinstance(data, dict) and "direction" in data:
+            data = {key: value for key, value in data.items() if key != "direction"}
+        return data
+
+
 class MechanicalConfig(BaseModel):
-    turntable: Annotated[TurntableRotateRequest, Field(description="Configuration for the rotating turntable.")] = Field(default_factory=TurntableRotateRequest)
-    z_axis: Annotated[ZMoveRequest, Field(description="Configuration for the vertical Z-axis.")] = Field(default_factory=ZMoveRequest)
+    model_config = ConfigDict(extra="forbid")
+
+    turntable: Annotated[TurntableScanConfig, Field(description="Configuration for the rotating turntable.")] = Field(default_factory=TurntableScanConfig)
+    z_axis: Annotated[ZAxisScanConfig, Field(description="Configuration for the vertical Z-axis.")] = Field(default_factory=ZAxisScanConfig)
 
 
 class CloudConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    launch_runpod: Annotated[bool, Field(
+        description=(
+            "When false (default) the scan stops once the photos are verified in the R2 bucket and the state "
+            "becomes `completed`. When true the RunPod pipeline (Meshroom job, output download) runs afterwards."
+        )
+    )] = False
+
     resolution_mp: Annotated[float, Field(
         gt=0.0,
-        lt=12.0,
-        description="Camera capture resolution in megapixels. Used to calculate required cloud GPU RAM."
+        le=13.0,
+        description=(
+            "Camera capture resolution in megapixels (12.0 nominal, 12.33 real sensor value). "
+            "Used to calculate required cloud GPU RAM."
+        )
     )] = 12.0
 
     mode: Annotated[Literal["single", "rig", "two-sides"], Field(
@@ -186,11 +288,15 @@ class CloudConfig(BaseModel):
 
 
 class StartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: Annotated[str, Field(
         description="Unique identifier for this scanning and processing job, used to track RunPod execution."
     )] = "meshroom-job"
     mechanical: MechanicalConfig = Field(default_factory=MechanicalConfig)
     cloud: CloudConfig = Field(default_factory=CloudConfig)
+
+
 class PrepareResponse(BaseModel):
     status: str = "accepted"
     message: str = "Live stream started. Rig homing and camera tuning in progress."
@@ -201,6 +307,16 @@ class StatusResponse(BaseModel):
     state: str
     total_photos: int = 0
     stream_urls: list[str] | None = None
+
+    # Progress and failure detail (API-11). All optional so an older scanner object still produces a valid response.
+    phase: str | None = None            # preparing / scanning / uploading / verifying / done ...
+    phase_message: str | None = None    # human readable detail of the phase
+    level: int = 0                      # current ring (0 = bottom)
+    photos_captured: int = 0
+    photos_uploaded: int = 0
+    missing: list[str] = []             # R2 keys that could not be verified in the bucket
+    error: str | None = None            # why the scan ended in `error`
+    tof_warnings: list[str] = []
 
 class CancelResponse(BaseModel):
     status: str = "success"
