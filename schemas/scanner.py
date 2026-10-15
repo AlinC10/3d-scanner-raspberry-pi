@@ -1,7 +1,10 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Annotated, Literal
 from hardware.camera.config import AF_ROI, AF_STEP, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_VIDEO_RESOLUTION, DEFAULT_PHOTO_RESOLUTION, DEFAULT_QUALITY
-from hardware.motor import END_DELAY_MIN, END_DELAY_MAX, TURNTABLE_END_DELAY_DEFAULT
+from hardware.motor import (
+    END_DELAY_MIN, END_DELAY_MAX, TURNTABLE_END_DELAY_DEFAULT,
+    MotorError, angle_to_steps, distance_to_steps, TURNTABLE_STEP_TYPE, Z_STEP_TYPE,
+)
 
 
 class DualCameraConfig(BaseModel):
@@ -97,6 +100,16 @@ class TurntableRotateRequest(BaseModel):
         )
     )] = TURNTABLE_END_DELAY_DEFAULT
 
+    @field_validator("angle")
+    @classmethod
+    def _angle_must_be_whole_steps(cls, value: float) -> float:
+        # Same rule the motor applies when the move is executed, so a bad angle is a 422 now and not a failed scan later
+        try:
+            angle_to_steps(value, TURNTABLE_STEP_TYPE)
+        except MotorError as e:
+            raise ValueError(str(e))
+        return value
+
 
 class ZMoveRequest(BaseModel):
     distance_mm: Annotated[float, Field(
@@ -136,6 +149,15 @@ class ZMoveRequest(BaseModel):
             f"({END_DELAY_MIN}-{END_DELAY_MAX} s). null (default) disables it."
         )
     )] = None
+
+    @field_validator("distance_mm")
+    @classmethod
+    def _distance_must_be_whole_steps(cls, value: float) -> float:
+        try:
+            distance_to_steps(value, Z_STEP_TYPE)
+        except MotorError as e:
+            raise ValueError(str(e))
+        return value
 
 
 class MechanicalConfig(BaseModel):

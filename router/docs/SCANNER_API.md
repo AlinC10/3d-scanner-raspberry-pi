@@ -249,6 +249,7 @@ Starts the automated scanning and cloud 3D generation workflow.
 
 ### Error Responses
 * `400 Bad Request`: If scanner state is not `PREPARED`.
+* `422 Unprocessable Entity`: `turntable.angle` is not a whole number of microsteps (multiples of `0.1125°` at 1/16) or `z_axis.distance_mm` is not a whole number of steps (multiples of `0.01 mm` at 1/4). Validated up front, so a bad value no longer fails the scan after `prepare`.
 * `409 Conflict`: A previous `POST /scanner/start` was already accepted and its pipeline has not finished yet (prevents two simultaneous scans from a double click).
   ```json
   {"detail": "Cannot start scan from state idle. Must be PREPARED."}

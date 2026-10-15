@@ -173,7 +173,7 @@ class ArduinoBridge:
                 except Exception:
                     pass
 
-    def send_command(self, cmd: str, timeout: Optional[float] = 30.0) -> str:
+    def send_command(self, cmd: str, timeout: Optional[float] = 30.0, _after_replay: bool = False) -> str:
         """
         Sends a standard command and waits for the response synchronously.
         
@@ -188,9 +188,12 @@ class ArduinoBridge:
             raise RuntimeError("Arduino is not connected. Cannot send command.")
             
         clean_cmd = cmd.strip() + "\n"
+        is_config = clean_cmd.startswith(str(ArduinoCommand.CONFIG.value) + " ")
+        # Moves are the only commands that can still be running on the Arduino after a timeout
+        is_move = clean_cmd.split()[0] in ("5", "16", "r", "R", "a", "A")
         
         # Intercept and store CONFIG commands for auto-healing
-        if clean_cmd.startswith(str(ArduinoCommand.CONFIG.value) + " "):
+        if is_config:
             cmd_no_nl = cmd.strip()
             if cmd_no_nl not in self._configs:
                 self._configs.append(cmd_no_nl)
@@ -216,8 +219,18 @@ class ArduinoBridge:
                 # Block until the Arduino executes the command and returns its Status Code (e.g., '0' or '4')
                 line = self._read_status_line()
                 if not line:
-                    log.error(f"[ArduinoBridge] No answer to '{cmd.strip()}' within {timeout}s. Stopping the Arduino to resync.")
-                    self._resync_after_timeout()
+                    log.error(f"[ArduinoBridge] No answer to '{cmd.strip()}' within {timeout}s. Resynchronising.")
+                    self._resync_after_timeout(was_move=is_move)
+                elif (line == str(ArduinoStatus.ERR_NOT_CONFIGURED.value) and not is_config
+                      and not _after_replay and self._configs):
+                    # The Arduino rebooted on its own (brownout) and forgot the motor pins. The command was refused
+                    # before doing anything, so it is safe to configure the motors again and run it once more.
+                    log.warning("[ArduinoBridge] Arduino reports 'not configured' (it was reset?). Restoring motor "
+                                "configuration and retrying once.")
+                    self.connection_epoch += 1  # every driver is disabled after a reset
+                    for cfg in list(self._configs):
+                        self.send_command(cfg, timeout=2.0, _after_replay=True)
+                    return self.send_command(cmd, timeout=timeout, _after_replay=True)
                 return line
             except serial.SerialException as e:
                 log.error(f"[ArduinoBridge] Serial connection lost during send_command: {e}. Attempting to reconnect...")
@@ -239,20 +252,28 @@ class ArduinoBridge:
                 return ""
             if line.isdigit():
                 return line
+            if "READY" in line.upper():
+                # The boot banner in the middle of a transaction: the board reset and the command was lost
+                self.connection_epoch += 1
+                log.error("[ArduinoBridge] Arduino rebooted while a command was in flight; the command was lost.")
+                return str(ArduinoStatus.ERR_ABORTED.value)
             log.warning(f"[ArduinoBridge] Ignoring unexpected line from Arduino: {line!r}")
         return ""
 
-    def _resync_after_timeout(self) -> None:
+    def _resync_after_timeout(self, was_move: bool = True) -> None:
         """
-        After a timeout the Arduino may still be stepping and will answer later. Abort it (0xFF), swallow that
-        late answer and empty the buffer so the next command starts from a clean stream.
+        After a timeout the Arduino may still be stepping and will answer later. For a move, abort it (0xFF),
+        swallow that late answer and empty the buffer so the next command starts from a clean stream.
+        For any other command nothing can be running, and a 0xFF sent to an idle Arduino would cut the torque of
+        every motor, so only the buffer is emptied.
         """
         try:
-            with self._write_lock:
-                self.serial.write(bytes([ArduinoCommand.EMERGENCY_STOP.value]))
-                self.serial.flush()
-            self.serial.timeout = 0.5
-            self.serial.readline()  # '4' if a move was still running, nothing if the Arduino was idle
+            if was_move:
+                with self._write_lock:
+                    self.serial.write(bytes([ArduinoCommand.EMERGENCY_STOP.value]))
+                    self.serial.flush()
+                self.serial.timeout = 0.5
+                self.serial.readline()  # '4' if the move was still running, nothing if it had just finished
             self.serial.reset_input_buffer()
         except Exception as e:
             log.warning(f"[ArduinoBridge] Resync after timeout failed: {e}")
