@@ -913,7 +913,7 @@ class DualCameraRPISync(BaseDualCamera):
            - Encodes still_yuv to JPEG directly at output path on disk.
            - If raw=True, calls req.save_dng() and releases the acquired request.
            - Invokes cam._process_captured_image(path, resolution, quality) to inject photogrammetry EXIF
-             metadata (BodySerialNumber = b"cam1" / b"cam2", focal length) and apply optional software resizing.
+             metadata (BodySerialNumber = b"cam1" / b"cam2", ImageUniqueID = "cam<id>_<file stem>", focal length) and apply optional software resizing.
 
         Returns [path1, path2] and stores per-camera exposure metadata in
         ``self.last_capture_info``.

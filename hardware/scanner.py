@@ -48,7 +48,20 @@ def _env_backoff(name: str, default: tuple) -> tuple:
     except (KeyError, ValueError):
         return default
 
-# Root of the photo tree: input_images/rig/0/lvl_1_shot_0.jpg, ... and manifest.json: the same "rig/<camera>/<name>"
+# A photo name carries the shot number in 3 digits, so a ring holds at most 1000 photos per camera (more would make
+# names of different rings collide, e.g. ring 1 shot 1000 and ring 11 shot 0).
+MAX_SHOTS_PER_RING = 1000
+
+
+def photo_file_stem(level: Union[int, str], shot: int) -> str:
+    """
+    Name (without extension) of the photo of ring `level`, shot `shot`, the format Meshroom accepts:
+    "f_<level><shot on 3 digits>", e.g. f_1000 (ring 1, shot 0) and f_2019 (ring 2, shot 19).
+    """
+    return f"f_{level}{int(shot):03d}"
+
+
+# Root of the photo tree: input_images/rig/0/f_1000.jpg, ... and manifest.json: the same "rig/<camera>/<name>"
 # layout Meshroom expects (and the one the R2 download code writes). The cloud key is "rig/" + the path relative to
 # it (see Scanner._cloud_key). Only this folder is wiped at the start of a scan, never input_images/ itself.
 INPUT_IMAGES_DIR = str(Path(__file__).resolve().parent.parent / "input_images" / "rig")
@@ -404,7 +417,7 @@ class Scanner:
 
     def _cloud_key(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None) -> str:
         """
-        The R2 object key of a photo: "rig/" + its path relative to the photo root (e.g. "rig/0/lvl_1_shot_0.jpg"),
+        The R2 object key of a photo: "rig/" + its path relative to the photo root (e.g. "rig/0/f_1000.jpg"),
         which keeps the camera sub-directories the downstream download code (rig_mode) expects.
 
         :raises ValueError: if the path is not below the photo root.
@@ -1405,6 +1418,11 @@ class Scanner:
         # Whole shots per revolution from the integer step counts (exact: no round(360 / angle) drift)
         full_turn_steps = angle_to_steps(360, TURNTABLE_STEP_TYPE)
         total_shots = max(1, full_turn_steps // steps)
+        if total_shots > MAX_SHOTS_PER_RING:
+            raise ScannerError(
+                f"A ring of {total_shots} photos per camera is too many: the photo names hold the shot number "
+                f"in 3 digits (at most {MAX_SHOTS_PER_RING} per ring). Use a larger turntable angle."
+            )
         object_seen = False
         backdrop_count = 0
         unknown_count = 0
@@ -1424,7 +1442,7 @@ class Scanner:
             # 1. Capture 2 photos using DualCamera / DualCameraXVS (Master & Slave)
             try:
                 photo_paths = cameras.capture_photo(
-                    output_prefix=f"lvl_{level_label}_shot_{shot}",
+                    output_prefix=photo_file_stem(level_label, shot),
                     output_dir=images_dir,
                     meshroom_rig=True
                 )
