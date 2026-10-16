@@ -152,12 +152,12 @@ class ScannerTestCase(unittest.TestCase):
     def ring_levels(self):
         """The set of levels that were photographed (from the capture prefixes)."""
         prefixes = {c.kwargs["output_prefix"] for c in self.cams.capture_photo.call_args_list}
-        return {int(p.split("_")[1]) for p in prefixes}
+        return {int(p[2:-3]) for p in prefixes}   # "f_<level><shot on 3 digits>"
 
     def start_worker(self):
         self.s.start_upload_worker()
 
-    def add_file(self, name="lvl_1_shot_0.jpg", content=b"jpeg", cam=0):
+    def add_file(self, name="f_1000.jpg", content=b"jpeg", cam=0):
         cam_dir = os.path.join(self.s.images_dir, str(cam))
         os.makedirs(cam_dir, exist_ok=True)
         path = os.path.join(cam_dir, name)
@@ -173,14 +173,14 @@ class ScannerTestCase(unittest.TestCase):
 
 class TestUploadPolicy(ScannerTestCase):
     def test_cloud_key_is_rig_plus_the_relative_path(self):
-        path = os.path.join(self.s.images_dir, "1", "lvl_2_shot_5.jpg")
-        self.assertEqual(self.s._cloud_key(path), "rig/1/lvl_2_shot_5.jpg")
+        path = os.path.join(self.s.images_dir, "1", "f_2005.jpg")
+        self.assertEqual(self.s._cloud_key(path), "rig/1/f_2005.jpg")
         with self.assertRaises(ValueError):
-            self.s._cloud_key("/somewhere/else/lvl_1_shot_0.jpg")
+            self.s._cloud_key("/somewhere/else/f_1000.jpg")
 
     def test_intermittent_failures_eventually_upload_everything(self):
         self.start_worker()
-        files = [self.add_file(f"lvl_1_shot_{i}.jpg") for i in range(6)]
+        files = [self.add_file(f"f_1{i:03d}.jpg") for i in range(6)]
         for _, key in files:
             self.r2.fail_plan[key] = 2          # two transient failures, below the 3 attempts of a file
         for path, key in files:
@@ -194,9 +194,9 @@ class TestUploadPolicy(ScannerTestCase):
 
     def test_missing_file_is_failed_at_once_and_does_not_block_the_queue(self):
         self.start_worker()
-        gone, gone_key = self.add_file("lvl_1_shot_0.jpg")
+        gone, gone_key = self.add_file("f_1000.jpg")
         os.remove(gone)
-        good, good_key = self.add_file("lvl_1_shot_1.jpg")
+        good, good_key = self.add_file("f_1001.jpg")
         self.enqueue(gone, gone_key)
         self.enqueue(good, good_key)
         self.assertEqual(self.s._drain_uploads(5.0), "done")
@@ -207,7 +207,7 @@ class TestUploadPolicy(ScannerTestCase):
 
     def test_empty_file_is_failed_at_once(self):
         self.start_worker()
-        empty, key = self.add_file("lvl_1_shot_0.jpg", content=b"")
+        empty, key = self.add_file("f_1000.jpg", content=b"")
         self.enqueue(empty, key)
         self.assertEqual(self.s._drain_uploads(5.0), "done")
         self.assertIn(empty, self.s._upload_failed)
@@ -215,10 +215,10 @@ class TestUploadPolicy(ScannerTestCase):
 
     def test_failing_file_does_not_block_the_files_behind_it(self):
         self.start_worker()
-        bad, bad_key = self.add_file("lvl_1_shot_0.jpg")
+        bad, bad_key = self.add_file("f_1000.jpg")
         self.r2.fail_plan[bad_key] = 10_000
         self.enqueue(bad, bad_key)
-        others = [self.add_file(f"lvl_1_shot_{i}.jpg") for i in range(1, 5)]
+        others = [self.add_file(f"f_1{i:03d}.jpg") for i in range(1, 5)]
         for path, key in others:
             self.enqueue(path, key)
         deadline = time.monotonic() + 2.0
@@ -284,6 +284,31 @@ class TestModuleDefaults(unittest.TestCase):
         self.assertEqual(scanner_module.MIN_FREE_DISK_MB, 2048.0)
 
 
+class TestPhotoNames(ScannerTestCase):
+    """Photo names are the Meshroom format f_<level><shot on 3 digits>."""
+
+    def test_stem_format(self):
+        self.assertEqual(scanner_module.photo_file_stem(1, 0), "f_1000")
+        self.assertEqual(scanner_module.photo_file_stem(1, 19), "f_1019")
+        self.assertEqual(scanner_module.photo_file_stem(2, 5), "f_2005")
+        self.assertEqual(scanner_module.photo_file_stem(12, 7), "f_12007")
+        self.assertEqual(scanner_module.photo_file_stem(3, 359), "f_3359")
+
+    def test_names_of_different_rings_never_collide(self):
+        names = {
+            scanner_module.photo_file_stem(level, shot)
+            for level in range(1, 30) for shot in range(scanner_module.MAX_SHOTS_PER_RING)
+        }
+        self.assertEqual(len(names), 29 * scanner_module.MAX_SHOTS_PER_RING)
+
+    def test_a_ring_with_too_many_shots_is_refused_before_any_photo(self):
+        # 18 deg = 160 steps -> 20 shots per revolution; with a limit of 10 the ring must be refused
+        with patch.object(scanner_module, "MAX_SHOTS_PER_RING", 10):
+            with self.assertRaises(ScannerError) as ctx:
+                self.s._capture_turntable_slice(self.s.images_dir, 18.0, 160, 0.001, level_label=1)
+        self.assertIn("too many", str(ctx.exception))
+
+
 # ──────────────────────────────────── B. drain deadline and cancel ─────────────────────────────────────
 
 class TestDrain(ScannerTestCase):
@@ -302,7 +327,7 @@ class TestDrain(ScannerTestCase):
         self.r2.delay = 0.1
         self.start_worker()
         for i in range(6):
-            path, key = self.add_file(f"lvl_1_shot_{i}.jpg")
+            path, key = self.add_file(f"f_1{i:03d}.jpg")
             self.enqueue(path, key)
         self.assertEqual(self.s._drain_uploads(0.35), "done")
         self.assertEqual(len(self.r2.bucket), 6)
@@ -361,7 +386,7 @@ class TestScanVerification(ScannerTestCase):
 
     def test_key_absent_from_the_bucket_raises_with_the_missing_list(self):
         self.verdicts = {1: False}
-        lost = "rig/1/lvl_1_shot_7.jpg"
+        lost = "rig/1/f_1007.jpg"
         self.r2.lost.add(lost)                        # uploaded "successfully" but not in the bucket
         with self.assertRaises(ScannerUploadError) as ctx:
             self.s.scan()
@@ -385,14 +410,14 @@ class TestScanVerification(ScannerTestCase):
         original = self.s._enqueue_upload
 
         def vanishing(path, key):
-            if key == "rig/0/lvl_1_shot_3.jpg":
+            if key == "rig/0/f_1003.jpg":
                 os.remove(path)
             original(path, key)
 
         self.s._enqueue_upload = vanishing
         with self.assertRaises(ScannerUploadError) as ctx:
             self.s.scan()
-        self.assertEqual(ctx.exception.missing, ["rig/0/lvl_1_shot_3.jpg"])
+        self.assertEqual(ctx.exception.missing, ["rig/0/f_1003.jpg"])
         self.assertEqual(len(self.r2.bucket) - 1, 39)      # +1: the manifest, 39 photos
 
     def test_r2_down_for_the_whole_drain_ends_in_error_with_every_photo_missing(self):
@@ -481,7 +506,7 @@ class TestScanVerification(ScannerTestCase):
         real_upload = self.r2.upload_file
 
         def spy(file_name, bucket=None, object_name=None):
-            if object_name and object_name.endswith("shot_19.jpg"):   # a late file of the only ring
+            if object_name and object_name.endswith("f_1019.jpg"):   # a late file of the only ring
                 seen.append((self.s.lights.off.called, self.s.dual_cameras is None, self.s.phase))
             return real_upload(file_name, bucket, object_name)
 
@@ -499,7 +524,7 @@ class TestScanVerification(ScannerTestCase):
 
     def test_status_attributes_are_reset_by_the_next_prepare(self):
         self.verdicts = {1: False}
-        self.r2.lost.add("rig/0/lvl_1_shot_0.jpg")
+        self.r2.lost.add("rig/0/f_1000.jpg")
         with self.assertRaises(ScannerUploadError):
             self.s.scan()
         self.assertTrue(self.s.missing)
@@ -543,7 +568,7 @@ class TestManifest(ScannerTestCase):
         self.assertEqual(m["missing"], [])
         self.assertTrue(m["complete"])
         first = m["photos"][0]
-        self.assertEqual(first["key"], "rig/0/lvl_1_shot_0.jpg")
+        self.assertEqual(first["key"], "rig/0/f_1000.jpg")
         self.assertEqual((first["level"], first["shot"], first["camera"], first["size"]), (1, 0, 0, 4))
         self.assertEqual(first["exposure_time"], 10000)
         self.assertEqual(first["analogue_gain"], 1.5)

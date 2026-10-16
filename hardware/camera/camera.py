@@ -760,6 +760,12 @@ class ArducamIMX477:
         serial = f"cam{self.camera_id + 1}".encode('utf-8')
         exif_dict['Exif'][piexif.ExifIFD.BodySerialNumber] = serial
 
+        # Unique image ID for Meshroom: "cam<camera_id>_<file name without extension>", e.g. cam0_f_1000 for
+        # rig/0/f_1000.jpg. The camera id is the rig folder name (0/1), so the same shot of the two cameras
+        # never shares an ID.
+        image_id = f"cam{self.camera_id}_{Path(output).stem}"
+        exif_dict['Exif'][piexif.ExifIFD.ImageUniqueID] = image_id.encode('ascii', 'replace')
+
         # 3. Check if we need to resize or rotate using OpenCV
         needs_cv2 = (resolution != self.FULL_RES) or (self._rotation != 0)
         

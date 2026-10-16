@@ -52,7 +52,7 @@ def _photo_set(images_dir, level=1, shot=0, content=b"jpeg"):
     for cam in (0, 1):
         cam_dir = os.path.join(images_dir, str(cam))
         os.makedirs(cam_dir, exist_ok=True)
-        path = os.path.join(cam_dir, f"lvl_{level}_shot_{shot}.jpg")
+        path = os.path.join(cam_dir, f"{scanner_module.photo_file_stem(level, shot)}.jpg")
         with open(path, "wb") as f:
             f.write(content)
         paths.append(path)

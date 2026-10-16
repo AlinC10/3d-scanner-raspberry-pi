@@ -172,7 +172,7 @@ Slow Wi-Fi or transient socket errors must neither stall the scanner nor lose im
 
 1. **One worker, no head-of-line blocking**: a file that fails waits for its backoff *without* holding the files behind it. After 8 failed attempts it is parked (not dropped) and retried every 60 s; a later success clears it. A missing or 0-byte file fails immediately and permanently (no retry). Each attempt is `r2.upload_file(path, object_name=key)` (never raises, `False` on failure).
 2. **Bookkeeping**: `_pending` (still owed), `_uploaded`, `_upload_failed` (a `set` of failed or parked paths; the boolean view is the `upload_failed` property). A worker of an older scan cannot touch the new scan's sets (generation counter).
-3. **Cloud key**: `_cloud_key(path)` = `"rig/" + path relative to the photo root` (e.g. `rig/0/lvl_1_shot_0.jpg`), the layout the download code expects. The photo root is `input_images/rig/` (`INPUT_IMAGES_DIR`), so the local tree has the same `rig/<camera>/` layout Meshroom expects; only that folder is wiped at the start of a scan.
+3. **Cloud key**: `_cloud_key(path)` = `"rig/" + path relative to the photo root` (e.g. `rig/0/f_1000.jpg`), the layout the download code expects. The photo root is `input_images/rig/` (`INPUT_IMAGES_DIR`), so the local tree has the same `rig/<camera>/` layout Meshroom expects; only that folder is wiped at the start of a scan.
 4. **Drain deadline**: starts when the physical scan ends and restarts at every successful upload, so a slow but progressing uplink is never cut off while a dead one ends after 30 minutes. It replaces the former 45 s stall watchdog.
 5. **Verification** is authoritative (`r2.verify_keys`); the counters never decide on their own.
 
@@ -180,7 +180,7 @@ Slow Wi-Fi or transient socket errors must neither stall the scanner nor lose im
 Written atomically (temp file + `os.replace`) after every photo pair and again after verification:
 ```json
 {"scan_id": "20260101T120000-ab12cd", "started_at": "2026-01-01T12:00:00+00:00",
- "expected_keys": ["rig/0/lvl_1_shot_0.jpg", "..."],
+ "expected_keys": ["rig/0/f_1000.jpg", "..."],
  "photos": [{"key": "...", "path": "...", "size": 4123456, "level": 1, "shot": 0, "camera": 0,
              "exposure_time": 10000, "analogue_gain": 1.5, "colour_gains": [1.8, 1.6], "sensor_timestamp": 123}],
  "uploaded": ["..."], "missing": [], "complete": true}

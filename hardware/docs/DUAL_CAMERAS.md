@@ -152,7 +152,7 @@ During `capture_photo()`, images are retrieved with guaranteed delivery:
 * **Tier 2 (Resilient Fallback)**: If timing jitter exceeds 250 ms, the driver immediately latches the latest available frame from each camera (2 s deadline).
 * **No silent bad images**: in real hardware mode `capture_photo` raises **`CaptureError`** when a frame for either camera never arrived, when an output file is missing or 0 bytes after encoding/post-processing, or when the driver is closed. A pair is therefore either two real JPEGs or an exception; the caller must treat the exception as a failed shot. Stale files at the target path are removed before encoding so they cannot hide a failed encode. Stub mode (no `picamera2`, development) keeps writing placeholder files and never raises.
 * **Stride crop**: the ISP pads YUV420 rows to the buffer stride, so the decoded array can be wider than the configured width. The still path crops to the configured main width (`bgr[:, :w]`) before JPEG encoding; this is a no-op when stride equals width.
-* **EXIF Tag Injection**: Latched frames are saved to disk, then passed to `_process_captured_image()` to inject calibrated focal length and unique body serial numbers (`b"cam1"` and `b"cam2"`) into Meshroom stereoscopic folders (`0/` and `1/`).
+* **EXIF Tag Injection**: Latched frames are saved to disk, then passed to `_process_captured_image()` to inject calibrated focal length, unique body serial numbers (`b"cam1"` and `b"cam2"`) and a per-image `ImageUniqueID` (`cam<camera_id>_<file name without extension>`, e.g. `cam0_f_1000` for `rig/0/f_1000.jpg`) into Meshroom stereoscopic folders (`0/` and `1/`).
 * **`last_capture_info`** (after every successful capture; `None` before the first):
   ```python
   {"paths": [p1, p2],
