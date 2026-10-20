@@ -9,7 +9,7 @@ import router.scanner
 import router.test
 
 from system.exception import SystemConnectionError
-
+from fastapi.staticfiles import StaticFiles
 log = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -43,3 +43,4 @@ for router in routers:
     app.include_router(router.router)
 
 app.frontend("/", directory="../3d-scanner-front-end")
+app.mount("/docs", StaticFiles(directory="ai/ai-docs"), name="docs")

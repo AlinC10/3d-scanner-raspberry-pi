@@ -5,49 +5,52 @@ from ai_agent import ask_agent
 
 def main():
     print("=" * 60)
-    print("   Asistent AI pentru Scanner 3D (Interfață Terminal)   ")
+    print("   AI Assistant for 3D Scanner (Terminal Interface)   ")
     print("=" * 60)
     
     while True:
-        path = input("\nIntrodu calea către fișier SAU folderul cu documentație (ex: ../ai-docs): ").strip()
+        path = input("\nEnter path to file OR documentation folder (e.g. ../ai-docs): ").strip()
         path = path.strip('\"').strip('\'')
         
         if os.path.exists(path):
             break
         else:
-            print(f"[EROARE] '{path}' nu a fost găsit. Te rog verifică și încearcă din nou.")
+            print(f"[ERROR] '{path}' not found. Please verify and try again.")
 
-    print("\n[INFO] Citesc și procesez datele... Te rog așteaptă.")
+    doc_type_choice = input("Select document type:\n[1] User Manual\n[2] Technical Documentation\nChoice (1/2): ").strip()
+    doc_type = "technical" if doc_type_choice == "2" else "user_manual"
+
+    print(f"\n[INFO] Reading and processing data as '{doc_type}'... Please wait.")
     try:
         if os.path.isdir(path):
-            chunks_count = process_directory(path)
-            print(f"[SUCCES] Întregul folder a fost încărcat! ({chunks_count} secțiuni valide).")
+            chunks_count = process_directory(path, doc_type)
+            print(f"[SUCCESS] Entire folder loaded! ({chunks_count} valid chunks).")
         else:
-            chunks_count = process_document(path)
-            print(f"[SUCCES] Fișierul a fost încărcat în {chunks_count} secțiuni.")
+            chunks_count = process_document(path, doc_type)
+            print(f"[SUCCESS] File loaded in {chunks_count} chunks.")
     except Exception as e:
-        print("\n[EROARE FATALĂ] Nu am putut procesa datele:")
+        print("\n[FATAL ERROR] Could not process data:")
         traceback.print_exc()
         return
 
     print("\n" + "=" * 60)
-    print("Acum poți pune întrebări. (Scrie 'exit', 'quit' sau 'iesire' pentru a opri)")
+    print("You can ask questions now. (Type 'exit' or 'q' to quit)")
     print("=" * 60)
     
     history = []
     
     while True:
         try:
-            user_question = input("\nTu: ").strip()
+            user_question = input("\nYou: ").strip()
             
-            if user_question.lower() in ['exit', 'quit', 'iesire', 'q']:
-                print("\nAsistent oprit. O zi productivă în continuare!")
+            if user_question.lower() in ['exit', 'quit', 'q']:
+                print("\nAssistant stopped. Have a productive day!")
                 break
                 
             if not user_question:
                 continue
                 
-            print("AI se gândește...")
+            print("AI is thinking...")
             
             result = ask_agent(user_question, history)
             response_text = result.get("response", "")
@@ -61,10 +64,10 @@ def main():
                 history = history[-10:]
                 
         except KeyboardInterrupt:
-            print("\nAsistent oprit forțat. La revedere!")
+            print("\nAssistant forced stop. Goodbye!")
             break
         except Exception as e:
-            print(f"\n[EROARE CHAT] A apărut o problemă: {str(e)}")
+            print(f"\n[CHAT ERROR] An issue occurred: {str(e)}")
 
 if __name__ == "__main__":
     main()

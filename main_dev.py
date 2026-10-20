@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 
+
 # 1. Force the MOCK_HARDWARE flag so we don't have to remember to type it
 os.environ["MOCK_HARDWARE"] = "1"
 

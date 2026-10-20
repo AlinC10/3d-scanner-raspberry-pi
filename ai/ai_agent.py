@@ -11,13 +11,15 @@ if not groq_key:
 
 groq_client = Groq(api_key=groq_key)
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def read_agent_instructions():
-    file_path = "AGENT.md"
+    file_path = os.path.join(CURRENT_DIR, "AGENT.md")
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "You are a helpful and friendly AI assistant for a 3D Scanner. Answer naturally."
+        return "You are a helpful AI. Answer strictly based on context."
 
 def ask_agent(user_question, history=[]):
     search_query = user_question
@@ -33,45 +35,47 @@ def ask_agent(user_question, history=[]):
 
     extracted_context = ""
     try:
-        # Căutăm în baza de date
-        results = db.similarity_search(search_query, k=8)
+        # Căutăm k=15 fragmente pentru a fi absolut siguri că prindem informația corectă
+        results = db.similarity_search(search_query, k=15)
         for chunk in results:
             extracted_context += f"{chunk.page_content}\n\n"
             
         if not extracted_context.strip():
-            extracted_context = "Nu am găsit informații în documentație. Răspunde din cunoștințele generale într-un mod prietenos."
+            extracted_context = "[NO CONTEXT FOUND. USER MUST BE TOLD YOU DON'T KNOW THE ANSWER]"
             
     except Exception as e:
-        # Prindem cazul în care ChromaDB este goală sau neinițializată
-        extracted_context = "Baza de date cu documente este goală momentan. Răspunde din cunoștințele tale generale, scurt și clar."
+        extracted_context = "[DATABASE ERROR. NO CONTEXT AVAILABLE]"
 
-    system_message = read_agent_instructions()
-    groq_messages = [{"role": "system", "content": system_message}]
+    system_base_rules = read_agent_instructions()
+    full_system_message = f"""{system_base_rules}
+
+Extracted context from documentation:
+---
+{extracted_context}
+---"""
+
+    groq_messages = [{"role": "system", "content": full_system_message}]
     
     for msg in history:
         groq_messages.append({"role": msg['role'], "content": msg['text']})
         
-    final_prompt = f"""
-    Extracted context from documentation:
-    ---
-    {extracted_context}
-    ---
+    groq_messages.append({"role": "user", "content": user_question})
     
-    Current question: {user_question}
-    Answer:
-    """
-    groq_messages.append({"role": "user", "content": final_prompt})
-    
-    response = groq_client.chat.completions.create(
-        model="openai/gpt-oss-120b", # Am inlocuit cu modelul suportat de groq by default (poti modifica inapoi daca ai custom)
-        messages=groq_messages,
-        temperature=0.1
-    )
-    
-    response_text = response.choices[0].message.content
+    try:
+        response = groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b", 
+            messages=groq_messages,
+            temperature=0.0 # Blochează halucinațiile
+        )
+        response_text = response.choices[0].message.content
+    except Exception as e:
+        response_text = f"Eroare API Groq: {str(e)}"
     
     if "[NO_SOURCES]" in response_text:
         response_text = response_text.replace("[NO_SOURCES]", "").strip() 
+        
+    # Curățăm textul de steluțele de Markdown
+    response_text = response_text.replace("**", "")
 
     return {
         "response": response_text
