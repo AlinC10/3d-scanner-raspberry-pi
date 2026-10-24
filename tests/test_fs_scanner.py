@@ -680,6 +680,68 @@ class TestManifest(ScannerTestCase):
 
 # ───────────────────────────────────── D. local integrity ──────────────────────────────────────────
 
+class TestPairRetry(ScannerTestCase):
+    """A photo pair that could not be captured is retaken at the same position; a half pair is never kept."""
+
+    def flaky_capture(self, fail_on_call=1, failures=1, half=True):
+        original = self.s.dual_cameras.capture_photo.side_effect
+        state = {"calls": 0, "leftover_at_retry": None, "failed_prefixes": []}
+
+        def capture(output_prefix="x", output_dir=".", **kwargs):
+            state["calls"] += 1
+            if fail_on_call <= state["calls"] < fail_on_call + failures:
+                state["failed_prefixes"].append(output_prefix)
+                if half:   # camera 0 wrote its file, camera 1 did not deliver
+                    cam_dir = os.path.join(output_dir, "0")
+                    os.makedirs(cam_dir, exist_ok=True)
+                    with open(os.path.join(cam_dir, f"{output_prefix}.jpg"), "wb") as f:
+                        f.write(b"jpeg")
+                raise scanner_module.CaptureError("no frame received from camera(s) [2]")
+            if state["calls"] == fail_on_call + failures:
+                state["leftover_at_retry"] = os.path.exists(os.path.join(output_dir, "0", f"{output_prefix}.jpg"))
+            return original(output_prefix=output_prefix, output_dir=output_dir, **kwargs)
+
+        self.s.dual_cameras.capture_photo.side_effect = capture
+        return state
+
+    def test_a_failed_pair_is_retaken_and_the_scan_goes_on(self):
+        state = self.flaky_capture(fail_on_call=1, failures=1)
+        self.verdicts = {1: False}
+        self.s.scan()
+        self.assertEqual(state["calls"], 21)                 # 20 shots + 1 retry
+        self.assertEqual(self.s.total_photos, 40)            # a complete pair for every position
+        self.assertIs(state["leftover_at_retry"], False)     # the half pair was deleted before the retry
+        manifest = self.s._manifest
+        self.assertEqual(len(manifest["photos"]), 40)
+        self.assertEqual(len({p["key"] for p in manifest["photos"]}), 40)
+
+    def test_a_failure_in_the_middle_of_a_ring_is_retaken_too(self):
+        state = self.flaky_capture(fail_on_call=6, failures=2)
+        self.verdicts = {1: False}
+        self.s.scan()
+        self.assertEqual(state["calls"], 22)
+        self.assertEqual(self.s.total_photos, 40)
+
+    def test_three_failures_in_a_row_stop_the_scan_without_leaving_a_half_pair(self):
+        state = self.flaky_capture(fail_on_call=1, failures=99)
+        with self.assertRaises(ScannerError) as ctx:
+            self.s.scan()
+        self.assertEqual(state["calls"], 3)
+        self.assertIn("attempt 3 of 3", str(ctx.exception))
+        self.assertEqual(self.s.total_photos, 0)
+        self.assertEqual(self.s.state, ScannerState.ERROR)
+        leftovers = [name for _d, _s, files in os.walk(self.s.images_dir) for name in files if name.endswith(".jpg")]
+        self.assertEqual(leftovers, [])
+
+    def test_the_number_of_attempts_is_configurable(self):
+        state = self.flaky_capture(fail_on_call=1, failures=99)
+        with patch.object(scanner_module, "CAPTURE_ATTEMPTS", 1):
+            with self.assertRaises(ScannerError) as ctx:
+                self.s.scan()
+        self.assertEqual(state["calls"], 1)
+        self.assertIn("attempt 1 of 1", str(ctx.exception))
+
+
 class TestLocalIntegrity(ScannerTestCase):
     def test_zero_byte_capture_raises(self):
         def capture(output_prefix="x", output_dir=".", **kwargs):
@@ -814,10 +876,10 @@ class TestToFPolicy(ScannerTestCase):
         self.s.tof.probe_object.side_effect = boom
         self.assertIsNone(self.slice())
 
-    def test_threshold_is_the_backdrop_minus_the_margin(self):
+    def test_threshold_is_the_configured_distance_without_a_margin(self):
         self.probe_results([True])
         self.slice()
-        threshold = scanner_module.TOF_BACKGROUND_DISTANCE_MM - scanner_module.TOF_CLEARANCE_MARGIN_MM
+        threshold = scanner_module.TOF_BACKGROUND_DISTANCE_MM
         self.assertEqual(self.s.tof.probe_object.call_args.args[0], threshold)
 
     def test_ring_without_tof_check_reports_false(self):
@@ -975,6 +1037,7 @@ class TestPreflight(ScannerTestCase):
 
 class RecordingCameras:
     """A camera system that records prepare_scan() kwargs; accepts lock_auto like the sync driver."""
+    supports_lock_auto = True   # the capability flag of the BaseDualCamera interface
     instances = []
 
     def __init__(self, **kwargs):
@@ -1081,6 +1144,8 @@ class TestLifecycle(ScannerTestCase):
 
     def test_lock_auto_is_not_sent_to_drivers_that_do_not_support_it(self):
         class Legacy(RecordingCameras):
+            supports_lock_auto = False
+
             def prepare_scan(self, **kwargs):
                 if "lock_auto" in kwargs:
                     raise AssertionError("lock_auto must not reach this driver")
@@ -1133,11 +1198,11 @@ class TestLifecycle(ScannerTestCase):
         class Cams(RecordingCameras):
             def start_stream(self, *args, **kwargs):
                 started.append((args, kwargs))
-                return ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"]
+                return ["/scanner/stream/mjpeg?camera=1", "/scanner/stream/mjpeg?camera=2"]
 
         with patch.object(scanner_module, "DualCameraRPISync", Cams):
             urls = self.s.setup_and_stream(enable_stream=True, camera_mode="rpi_sync", bitrate=9_000_000)
-        self.assertEqual(urls, ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"])
+        self.assertEqual(urls, ["/scanner/stream/mjpeg?camera=1", "/scanner/stream/mjpeg?camera=2"])
         self.assertEqual(started, [((), {})])
         self.assertNotIn("bitrate", self.s.dual_cameras.prepare_calls[0])
 

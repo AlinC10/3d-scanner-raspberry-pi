@@ -3,6 +3,7 @@ import time
 import logging
 import piexif
 from pathlib import Path
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from typing import Optional
 
@@ -64,6 +65,10 @@ def _vcm_bus_for_camera(camera_id: int) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # Camera controller
 # ─────────────────────────────────────────────────────────────────────────────
+class CameraTimeoutError(RuntimeError):
+    """A camera call got no frame within CAMERA_CALL_TIMEOUT_S: the sensor or the camera pipeline is stalled."""
+
+
 class ArducamIMX477:
     """
     High-level interface for the Arducam IMX477 B0272 motorized camera.
@@ -295,12 +300,26 @@ class ArducamIMX477:
         """True while an encoder is attached (picamera2 has no ``recording`` flag on all versions)."""
         return bool(getattr(self.picam2, "recording", False) or getattr(self.picam2, "encoders", None))
 
+    def _capture_metadata(self, timeout: Optional[float] = None) -> dict:
+        """
+        ``picam2.capture_metadata()`` with a timeout (default CAMERA_CALL_TIMEOUT_S, 60 s): a sensor that delivers no
+        frame raises CameraTimeoutError instead of blocking the caller forever. (picamera2 >= 0.3.x accepts a number
+        of seconds for ``wait``; a version that only knows True/False simply waits as before.)
+        """
+        timeout = CAMERA_CALL_TIMEOUT_S if timeout is None else timeout
+        try:
+            return self.picam2.capture_metadata(wait=timeout)
+        except (TimeoutError, FuturesTimeoutError) as exc:
+            raise CameraTimeoutError(
+                f"Camera {self.camera_id}: no frame metadata within {timeout:g} s (the sensor or the camera pipeline is stalled)."
+            ) from exc
+
     def _metadata_exposure(self, allow_capture: bool = False) -> Optional[int]:
         """Latest known ExposureTime (us) from request metadata, or None."""
         md = self._last_metadata
         if md is None and allow_capture and getattr(self.picam2, "started", False):
             try:
-                md = self.picam2.capture_metadata()
+                md = self._capture_metadata()
             except Exception as exc:
                 log.debug("capture_metadata failed while locking exposure: %s", exc)
         value = md.get("ExposureTime") if isinstance(md, dict) else None
@@ -420,7 +439,7 @@ class ArducamIMX477:
         if settle_time:
             time.sleep(settle_time)
             
-        metadata = self.picam2.capture_metadata()
+        metadata = self._capture_metadata()
         if isinstance(metadata, dict):
             self._last_metadata = metadata
         controls = {}
@@ -1094,7 +1113,7 @@ class ArducamIMX477:
     # ── Info ──────────────────────────────────────────────────────────────────
     def _print_info(self):
         props = self.picam2.camera_properties
-        meta  = self.picam2.capture_metadata()
+        meta  = self._capture_metadata()
         print("\n=== Camera Properties ===")
         for k, v in sorted(props.items()):
             print(f"  {k}: {v}")

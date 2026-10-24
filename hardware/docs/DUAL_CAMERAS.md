@@ -20,9 +20,9 @@ All three drivers adhere to the `BaseDualCamera` interface contract, allowing [`
 | **Physical Wiring** | Two standard Raspberry Pi CSI ribbon cables | Standard CSI ribbons + **soldered XVS jumper wire** | Two standard Raspberry Pi CSI ribbon cables |
 | **Kernel / OS Config** | `cma=512M` in `/boot/firmware/cmdline.txt` | Custom `dtoverlay` lines in `/boot/firmware/config.txt` | Standard Raspberry Pi OS setup |
 | **Threading Model** | Single hardware ownership + background grab loops | Asymmetric Slave-First dispatch | Symmetric 0.15s staggered thread dispatch |
-| **Live Stream Engine** | Native FastAPI MJPEG (`/test/stream/mjpeg`) | H.264 RTSP via MediaMTX | H.264 RTSP via MediaMTX |
-| **Streaming Overhead** | **Encodes only watched cameras** (spectator tracking; with no viewer at all the active camera is still encoded) | Continuous background RTSP (~25-35% CPU) | Continuous background RTSP (~25-35% CPU) |
-| **Preview Quality Control** | Dedicated `stream_quality = 80` (decoupled from photo) | Shared `quality` parameter | Shared `quality` parameter |
+| **Live Stream Engine** | Native FastAPI MJPEG (`/scanner/stream/mjpeg`, also under `/test/stream/mjpeg`) | None (`supports_preview_stream = False`; `start_stream` is the single-camera H.264/RTSP path, which needs an H.264 encoder the Pi 5 does not have) | Same as XVS |
+| **Streaming Overhead** | **Encodes only watched cameras** (spectator tracking; with no viewer at all the active camera is still encoded) | No preview | No preview |
+| **Preview Quality Control** | Dedicated `stream_quality = 80` (decoupled from photo) | Stored, unused (no preview) | Stored, unused (no preview) |
 | **Photogrammetry Capture** | **Two-Tier Latching** (Zero Dropped Photos) | One-shot still grab | One-shot still grab |
 | **DMA Buffer Management** | **Triple-buffering (`buffer_count=3`)** + instant 3-5 ms release | Standard libcamera buffering | Standard libcamera buffering |
 | **Failure Mode** | Tier 2 fallback latches the newest frames; if a frame or file is still missing `capture_photo` raises `CaptureError` | If Master fails, Slave deadlocks forever | One failing does not block the other |
@@ -48,8 +48,8 @@ The abstract base class ([`hardware/base_dual_camera.py`](file:///home/alin/Desk
 ┌──────────────────────────────┐   ┌──────────────────────────────┐   ┌──────────────────────────────┐
 │      DualCameraRPISync       │   │        DualCameraXVS         │   │          DualCamera          │
 │ - Continuous rpi.sync loops  │   │ - Hardware XVS pad timing    │   │ - 0.15s staggered dispatch   │
-│ - Native MJPEG streaming     │   │ - Slave-first sequence       │   │ - RTSP H.264 streaming       │
-│ - On-demand spectator track  │   │ - RTSP H.264 streaming       │   │ - Development fallback       │
+│ - Native MJPEG streaming     │   │ - Slave-first sequence       │   │ - No live preview            │
+│ - On-demand spectator track  │   │ - No live preview            │   │ - Development fallback       │
 │ - Two-Tier photo latching    │   └──────────────────────────────┘   └──────────────────────────────┘
 └──────────────────────────────┘
 ```
@@ -67,11 +67,29 @@ def __init__(
     preview_size: Optional[Tuple[int, int]] = None,
     rotation1: int = 0,
     rotation2: int = 0,
+    stream_size: Optional[Tuple[int, int]] = None,   # live preview size, default (1024, 768)
+    stream_quality: int = 80,                        # live preview JPEG quality (1-100)
 ):
 ```
+* `DualCameraRPISync` adds its own sync parameters (`fps`, `sync_frames`, `buffer_count`, `ready_timeout`, `auto_start`); `DualCamera` and `DualCameraXVS` accept `stream_size` / `stream_quality` too (they only store them).
 * Backward compatibility: Keyword arguments `camera_id_1`, `camera_id_2`, `master_id`, `slave_id`, `rotation_1`, and `rotation_2` are automatically sanitized and mapped to `camera_id1` / `camera_id2`.
 
-### 2. Concrete Shared Functionality (Zero Duplication)
+### 2. The interface rule and the capability flags
+`BaseDualCamera` is **the** interface of `scanner.dual_cameras`: the scanner and the routers use only members declared in it (no `hasattr(...)` and no `isinstance(..., DualCameraRPISync)`). A member that only some drivers really implement still exists in the base with a safe default, and the driver says what it supports through two class attributes:
+
+| Capability | Meaning | `DualCameraRPISync` | `DualCamera` / `DualCameraXVS` |
+|---|---|---|---|
+| `supports_preview_stream` | live MJPEG preview: `wait_jpeg()`, spectators, `active_camera` switching | `True` | `False` (the routers answer 400 for the switch and send an empty stream) |
+| `supports_lock_auto` | `prepare_scan(lock_auto=True)` freezes AE/AWB after `SyncReady` and returns `locked`/`ready` per camera | `True` | `False`: they always lock AE/AWB inside `prepare_scan` and ignore `lock_auto` |
+| `supported_photo_sizes` | the still sizes the driver can capture without cropping the field of view (`None` = no restriction); a driver that sets it raises `ValueError` for any other `size` in the base constructor | `((4056, 3040), (2028, 1520))` | `None` (not restricted by the driver; the API accepts only the two sizes above, see "Still sizes") |
+
+`prepare_scan` has two interface arguments besides the camera settings: `lock_auto` and `copy_colour_gains` (default `False`: after the AE/AWB lock cam2 keeps the white-balance gains of its own AWB, exposure time and analogue gain are still copied from cam1). Every driver accepts both; `DualCamera` and `DualCameraXVS` ignore them (they always copy cam1's values, colour gains included, see `PROBLEME_RAMASE.md`).
+
+**Still sizes.** The scanner accepts only `4056x3040` and `2028x1520` (`SUPPORTED_PHOTO_RESOLUTIONS` in `camera_defaults.py`, `Literal` in `schemas/scanner.py`). `DualCameraRPISync` configures the sensor directly at the requested size: `2028x1520` is the 2x2 binned mode of the IMX477, which has the same field of view as the full readout (no crop, 4x fewer pixels, up to 40 fps instead of 10), so the photo is not captured at full size and shrunk afterwards.
+
+When a driver gains a feature that the scanner or a router uses, declare it in `base_dual_camera.py` first (default / `pass` in the base, capability flag if behaviour differs) and note what remains to be ported in `../../plans/FUTURE_WORK.md`. `tests/test_base_dual_camera_interface.py` checks that every driver has every interface member.
+
+### 3. Concrete Shared Functionality (Zero Duplication)
 * **Lifecycle & Teardown**: `__enter__()`, `__exit__()`, and idempotent `close()`. Closes the internal `ThreadPoolExecutor(max_workers=2)` with `cancel_futures=True` and safely terminates each camera handle within independent `try/except` blocks to prevent unreleased CSI kernel locks.
 * **Backward-Compatibility Aliases**: 
   * `@property master -> self.cam1`
@@ -81,7 +99,9 @@ def __init__(
 * **`last_capture_info`**: `None` until the first successful capture; afterwards `{"paths": [p1, p2], "cameras": [{...}, {...}]}` (see below). Only `DualCameraRPISync` fills it.
 * **Decoupled Quality Properties**:
   * `@property quality`: Sets still photo JPEG compression quality (default `95`).
-  * `@property stream_quality`: Sets live preview stream compression quality (default `80`, bounded between 1 and 100).
+  * `@property stream_quality`: Sets live preview stream compression quality (default `80`, bounded between 1 and 100). It never changes the quality of the scan photos, on any driver.
+* **Live-preview state** (shared by all drivers, fed only by those with `supports_preview_stream`): `stream_size`, `active_camera` (1-indexed, 1 or 2) and `active` (0-indexed) with validation, `add_spectator(idx)` / `remove_spectator(idx)` / `has_spectators(idx=None)` (idx 0/1 or 1/2), `wait_jpeg(camera_idx, last_id, timeout)` (default: returns `(last_id, None)` at once) and `get_sync_status()` (default: `{"ready": True, "is_streaming": ..., "mode": <class name>}`).
+* **`autofocus_positions`**: result of the last autofocus sweep (one position per lens), `None` until one ran.
 * **Motorized VCM Focus Subsystem**:
   * `focus_set(position: int | Tuple[int, int])`: Sets absolute focal positions (0 = infinity, 1023 = macro). Accepts integer for symmetric focus or 2-tuple for independent lens tuning.
   * `focus_step(delta: int | Tuple[int, int])`: Incremental relative adjustments.
@@ -90,13 +110,13 @@ def __init__(
 * **Image Controls & Transformations**:
   * `rotate(direction: str)`: Software rotation dispatched concurrently.
   * `apply_settings(**kwargs)`: Dynamic controls (`brightness`, `contrast`, `exposure_time`, etc.) forwarded concurrently.
-  * `lock_auto_features(settle_time: float)`: Settles and locks AE/AWB on both cameras, then copies cam1's `ExposureTime` / `AnalogueGain` / `ColourGains` to cam2 (AE/AWB disabled on both).
+  * `lock_auto_features(settle_time: float, copy_colour_gains: bool = True)`: Settles and locks AE/AWB on both cameras, then copies cam1's `ExposureTime` / `AnalogueGain` to cam2 (AE/AWB disabled on both). cam1's `ColourGains` are copied too only with `copy_colour_gains=True` (the base default); `DualCameraRPISync.prepare_scan` passes `False` unless the request asks otherwise, so cam2 keeps the gains of its own AWB.
 * **Standardized Path Generators**:
   * `_resolve_capture_paths(prefix, output_dir, meshroom_rig)`: Formats 1-indexed file paths (`0/{prefix}.jpg` and `1/{prefix}.jpg` for Meshroom rigs, or `{prefix}_cam1.jpg` and `{prefix}_cam2.jpg` for flat layouts).
 
-### 3. Abstract Method Contracts
+### 4. Abstract Method Contracts
 Subclasses must implement:
-* `prepare_scan(**kwargs) -> List[dict]`
+* `prepare_scan(*, lock_auto: bool = False, copy_colour_gains: bool = False, **kwargs) -> List[dict]` (`focus` kwarg: `"auto"` = sweep, an int = both lenses, a pair = (cam1, cam2))
 * `start_stream(bitrate: int) -> List[str]`
 * `stop_stream() -> None`
 * `capture_photo(output_prefix, output_dir, meshroom_rig, **kwargs) -> List[str]`
@@ -129,13 +149,13 @@ The driver configures physical frame timing limits on both cameras:
 ### 4. On-Demand Encoding & Spectator Tracking
 The driver tracks active viewers per camera link (`_spectators = [cam1_viewers, cam2_viewers]`):
 * **Zero Loading Latency**: Underlying sensor capture loops and hardware synchronization run continuously in the background. Switching between Camera 1 and Camera 2 in the browser is **instantaneous ($\le 100\text{ ms}$)** because the sensor is already warm and aligned.
-* **Concurrent Dual Streaming**: Users can open both cameras simultaneously in separate browser tabs (`/test/stream/mjpeg?camera=1` and `/test/stream/mjpeg?camera=2`). Both feeds encode and stream concurrently at 10 fps.
+* **Concurrent Dual Streaming**: Users can open both cameras simultaneously in separate browser tabs (`/scanner/stream/mjpeg?camera=1` and `/scanner/stream/mjpeg?camera=2`). Both feeds encode and stream concurrently at 10 fps.
 * **Encoding follows viewers**: JPEG compression runs only for cameras with a connected browser tab. With no viewer at all, the *active* camera is still encoded as a fallback (so the first viewer gets a fresh frame); the preview encode is a small lores (1024x768) frame and does not touch the full-resolution stills.
 
 ```
-Browser Tab (Camera 1) ──► GET /test/stream/mjpeg?camera=1 ──► add_spectator(0) ──┐
+Browser Tab (Camera 1) ──► GET /scanner/stream/mjpeg?camera=1 ──► add_spectator(0) ──┐
                                                                                   ├──► Encode & Stream
-Browser Tab (Camera 2) ──► GET /test/stream/mjpeg?camera=2 ──► add_spectator(1) ──┤
+Browser Tab (Camera 2) ──► GET /scanner/stream/mjpeg?camera=2 ──► add_spectator(1) ──┤
                                                                                   │
 Browser Disconnect     ──► Stream Generator Terminates     ──► remove_spectator() ┴──► 0 Spectators = active-camera fallback only
 ```
@@ -168,12 +188,17 @@ During `capture_photo()`, images are retrieved with guaranteed delivery:
 ### 7. Exposure & White-Balance Lock (`prepare_scan(lock_auto=True)`)
 `prepare_scan(..., lock_auto: bool = False)`:
 * `lock_auto=False` (default, also the first/cold call): AE/AWB keep running; the returned dicts have `locked: False`.
-* `lock_auto=True`: after both cameras report `SyncReady`, AE/AWB are re-armed (a second scan does not inherit the previous scan's values), settle for `settle_time` (kwarg, default 2.0 s), then `BaseDualCamera.lock_auto_features()` writes cam1's `ExposureTime`, `AnalogueGain` and `ColourGains` back with `AeEnable=False` / `AwbEnable=False` and copies them to cam2. Manually supplied `exposure_time`/`analogue_gain`/`colour_gains` are not re-armed. Call it only when the lighting is stable.
+* `lock_auto=True`: after both cameras report `SyncReady`, AE/AWB are re-armed (a second scan does not inherit the previous scan's values), settle for `settle_time` (kwarg, default 2.0 s), then `BaseDualCamera.lock_auto_features()` locks each camera on its own result (`AeEnable=False` / `AwbEnable=False`) and copies cam1's `ExposureTime` and `AnalogueGain` to cam2. cam1's `ColourGains` are copied as well only with the `copy_colour_gains=True` keyword of `prepare_scan` (default `False`, request field `camera_config.copy_colour_gains`): the two sensors do not answer alike to the same gains, and copying them gave cam2 a bluish cast. Manually supplied `exposure_time`/`analogue_gain`/`colour_gains` are not re-armed. Call it only when the lighting is stable.
 * The returned per-camera dicts carry `locked` plus the locked `exposure_time`, `analogue_gain`, `colour_gains` (`None` when not locked). A failure is logged and reported as `locked: False`; it does not raise. If the cameras are not `SyncReady` the lock is skipped.
 * `lock_auto` is a keyword-only argument of `prepare_scan`; it is never forwarded to the cameras.
 * Without `focus=`, the saved focus position is re-applied on both lenses (the first write after each camera start is forced, see [FOCUSER.md](../camera/docs/FOCUSER.md)). A focus I2C failure raises from `focus_set`.
 * The SyncReady waits for both cameras share one `ready_timeout` deadline.
 * Later `apply_settings(brightness=..., contrast=...)` calls do not re-enable AE; AWB presets keep AWB enabled but never switch it off.
+
+### 7b. Grab-worker failures and camera timeouts
+* A grab worker survives an unexpected error while handling one frame (for instance a `MemoryError` copying a 12 MP frame): the request is released, the error is logged and the loop goes on. After `GRAB_MAX_CONSECUTIVE_ERRORS` (100) failures in a row, or when `capture_request(wait=CAMERA_CALL_TIMEOUT_S)` gets no frame, the worker gives up and the camera is reported dead (`_worker_errors`).
+* From then on `capture_photo` fails at once with `CaptureError("a camera stopped delivering frames (camera N: ...)")` instead of waiting for frames that never come; `_start_pipeline` clears the marks.
+* `CAMERA_CALL_TIMEOUT_S` (60 s, environment variable of the same name) bounds every blocking metadata/request call (`ArducamIMX477._capture_metadata`, `lock_auto_features`, `wait_for_light_stable`): a stalled sensor raises `CameraTimeoutError`, the preparation ends in `ERROR` and the scanner does not go on.
 
 ### 8. Lifecycle & Second Scan
 * `_start_pipeline()` rolls back when a camera fails to start: whatever was started is stopped, `_running`/`is_streaming` become `False`, focusers are invalidated and the original exception is re-raised, so the next call can retry cleanly.
@@ -224,9 +249,9 @@ class Scanner:
         # Config priority: explicit camera_mode -> legacy xvs flag -> CAMERA_MODE env var -> default "rpi_sync"
         if camera_mode:
             self.camera_mode = camera_mode.lower()
-        elif xvs is not None:
-            self.camera_mode = "xvs" if xvs else "staggered"
-        else:
+        elif xvs is True:
+            self.camera_mode = "xvs"
+        else:  # xvs False or None
             self.camera_mode = os.environ.get("CAMERA_MODE", "rpi_sync").lower()
 
     def setup_and_stream(self, enable_stream=True, camera_mode=None, **kwargs):
@@ -245,10 +270,10 @@ class Scanner:
 
 ## 🌐 FastAPI Streaming Endpoints
 
-The camera subsystem is exposed to the frontend via native FastAPI endpoints in [`router/test.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/router/test.py) and [`router/scanner.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/router/scanner.py):
+The camera subsystem is exposed to the frontend via native FastAPI endpoints. The four preview endpoints are implemented once, in [`router/scanner.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/router/scanner.py) (`/scanner/stream/*`); [`router/test.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/router/test.py) registers the same functions under `/test/stream/*`, so they behave identically and there is one place to fix. The camera id / quality can be given as a query parameter or as a JSON body.
 
-* **`GET /test/stream/mjpeg?camera=1|2`**: Multipart MJPEG video stream with automatic spectator tracking.
-* **`POST /test/stream/active?camera_id=1|2`**: Instant active preview camera switching.
-* **`POST /test/stream/quality?quality=80`**: Dynamic runtime adjustment of preview JPEG compression quality (1–100).
-* **`GET /test/stream/sync-status`**: Real-time diagnostic telemetry (SyncReady, offset_ms, stream_fps, drops, spectators).
-* **`POST /test/camera/snap`**: Captures a synchronized test pair at full 12 MP resolution with EXIF tags.
+* **`GET /scanner/stream/mjpeg?camera=1|2`** (also `/test/stream/mjpeg`): Multipart MJPEG video stream with automatic spectator tracking. The `stream_urls` returned by `POST /scanner/prepare` point here.
+* **`POST /scanner/stream/active?camera_id=1|2`**: Instant active preview camera switching.
+* **`POST /scanner/stream/quality?quality=80`**: Dynamic runtime adjustment of preview JPEG compression quality (1–100).
+* **`GET /scanner/stream/sync-status`**: Real-time diagnostic telemetry (SyncReady, offset_ms, stream_fps, drops, spectators).
+* **`POST /test/camera/snap`**: Captures a synchronized test pair (`test_snaps/`) at the configured photo size with EXIF tags.

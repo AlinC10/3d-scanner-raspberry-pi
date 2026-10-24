@@ -20,3 +20,12 @@ plans/**
 DOCUMENTATION.tex
 
 *IDEAS.md
+
+*.zip
+stats.csv
+input_images/
+output/
+PROBLEME_RAMASE.md
+PRE_TEST_CHECKLIST.md
+test_snaps/
+.mcp.json

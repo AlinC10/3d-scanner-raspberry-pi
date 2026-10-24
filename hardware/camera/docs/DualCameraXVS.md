@@ -1,5 +1,7 @@
 # DualCameraXVS Class
 
+> **Status of the H.264 / RTSP streaming described here:** the methods exist, but they need an H.264 encoder that the Raspberry Pi 5 does not have, so they do not work on the scanner. The live preview of the scanner is the MJPEG stream of `DualCameraRPISync` (`/scanner/stream/mjpeg`, see [DUAL_CAMERAS.md](../../docs/DUAL_CAMERAS.md)); `DualCamera` and `DualCameraXVS` have no preview (`supports_preview_stream = False`).
+
 The `DualCameraXVS` class (`dual_camera_xvs.py`) provides an interface to control two Arducam IMX477 cameras simultaneously using true hardware synchronization over an XVS cable connection.
 
 ## Hardware & OS Prerequisites

@@ -20,7 +20,7 @@ The VL53L1X communicates via **I2C** (`SDA` and `SCL`, address `0x29`). The driv
 | `distance_mode` | `1` (short) | Best ambient-light immunity, ranges up to ~136 cm. The rig measures 25-65 cm. |
 | `roi_xy` | `(4, 4)` | Smallest receiving window, narrowest cone. |
 | `roi_center` | `199` | Optical centre of the 16x16 SPAD array. |
-| `timing_budget` | `200` ms | Lower jitter. Not free: every read waits up to one budget (about 0.2 s), and a stop makes up to two reads, see section 4. |
+| `timing_budget` | `200` ms | Lower jitter. Not free: a read waits for up to two budgets (about 0.4 s, see section 2) and a stop makes up to two reads, see section 4. |
 
 All four are constructor parameters of `ToFSensor`. They are applied in a fixed order: `distance_mode` → `timing_budget` → `roi_xy` → `roi_center` → `start_ranging()`.
 - The distance mode selects the table of valid timing budgets, so it must come first.
@@ -48,21 +48,19 @@ A 4x4 window has only 16 of 256 SPADs, so about 94% less light than full frame. 
 The sensor accepts only `15` (short mode only), `20`, `33`, `50`, `100`, `200` or `500` **milliseconds**. A longer budget improves repeatability (noise falls roughly with the square root of the time), but not absolute accuracy, which depends on the offset and the cone. Because the scan loop pauses at every stop for the object to settle, we are not constrained by speed, so the default is 200 ms. If measurements on the rig show no difference against 100 ms, 100 ms is enough.
 
 ### 2. Fresh Measurement per Read (`read_distance_mm`)
-The sensor ranges continuously, so a sample may already be waiting from before the last turntable move. Every read therefore:
-1. Discards the waiting sample with `clear_interrupt()`.
-2. Polls `data_ready` every 5 ms, with a timeout of `2 × timing_budget + 100 ms`.
-3. Reads the distance (centimetres from the driver, converted to millimetres) and clears the interrupt.
+The sensor ranges continuously and on its own once ranging has been started (it measures whether or not the host reads it), one measurement per timing budget. When `read_distance_mm()` is called, a finished result may be waiting (it can predate the last turntable move) and another measurement is already running (it began up to one budget earlier, so only part of it is after the call). Both are dropped; the reading comes from the first measurement that started after the call. Every read therefore:
+1. Calls `clear_interrupt()`, which discards the finished result that is waiting.
+2. Waits for `data_ready` (the measurement that was already running) and calls `clear_interrupt()` again to discard it.
+3. Waits for `data_ready` again (the next measurement, started after the call), reads the distance (centimetres from the driver, converted to millimetres) and clears the interrupt.
 
-A read blocks for up to one timing budget (about 200 ms). The whole sequence is guarded by a `threading.Lock`, because the scan loop and the `/test/tof` endpoint (which FastAPI runs in a thread pool) can call it at the same time, and one caller's `clear_interrupt()` would otherwise consume the sample the other is waiting for.
-
-**Limit of "fresh".** A measurement that was already in progress when `clear_interrupt()` ran finishes afterwards and is returned, so the sample can be up to one timing budget (about 200 ms) older than the call. The scanner's settling pause is what keeps this harmless; the driver does not throw that sample away.
+Each wait polls `data_ready` every 5 ms with a timeout of `2 x timing_budget + 100 ms`; a timeout gives `None`. A read blocks for up to **two timing budgets** (about 0.4 s at 200 ms). The whole sequence is guarded by a `threading.Lock`, because the scan loop and the `/test/tof` endpoint (which FastAPI runs in a thread pool) can call it at the same time, and one caller's `clear_interrupt()` would otherwise consume the sample the other is waiting for.
 
 ### 3. Invalid Reading vs No Object
 The wrapper separates two different things:
 
 | Outcome | Meaning | Returned by `read_distance_mm()` |
 | :--- | :--- | :--- |
-| **Valid reading, far** | The sensor sees the backdrop (about 535 mm). No object in the cone. | the distance in mm |
+| **Valid reading, far** | The sensor sees the backdrop, or a surface so dark that the laser is absorbed (a black part read ~480 mm on the rig). At or above the threshold: no object. | the distance in mm |
 | **Valid reading, near** | An object is in the cone. | the distance in mm |
 | **Invalid reading** | Unknown. Not "no object". | `None` |
 
@@ -93,9 +91,9 @@ So `False` is always backed by a valid far reading; invalid readings only ever g
 
 `is_object_detected(threshold)` stays for compatibility and is `True` only when `probe_object(threshold)` is `True`; both `False` and `None` give `False`.
 
-**Cost.** Each read takes up to one timing budget, so a probe takes about one budget when the first reading is far or invalid and two budgets (about 0.4 s at 200 ms) when the object is present. The second read is not free: the scan loop reserves 0.2 s per stop and the scanner only sleeps what remains of it, so a stop with an object is longer than 0.2 s whenever the probe is made. A shorter timing budget (see section 1) lowers this directly.
+**Cost.** Each read takes up to two timing budgets (see section 2), so a probe takes about 0.4 s at 200 ms when the first reading is far or invalid and about 0.8 s when the object is present. The scan loop reserves 0.2 s per stop and only sleeps what remains of it, so a stop with the probe is longer than 0.2 s. A shorter timing budget (see section 1) lowers this directly (at 100 ms: 0.2 s / 0.4 s).
 
-The threshold used by the scanner is `TOF_BACKGROUND_DISTANCE_MM - TOF_CLEARANCE_MARGIN_MM` (both constants in `scanner.py`), so ToF noise on the empty backdrop is not mistaken for an object.
+The threshold used by the scanner is `TOF_BACKGROUND_DISTANCE_MM` (`scanner.py`, 350 mm): a valid reading below it is the object, a valid reading at or above it is the backdrop. There is no separate margin any more; the value itself is the dividing distance, so set it between the distance to the object surface and the distance to the empty backdrop.
 
 ### 5. `GET /test/tof`
 Always answers `200`. It never fails because of an invalid reading.
@@ -127,8 +125,7 @@ Calibration is done on the rig, with the empty turntable and the lights on at sc
 
 | Constant (`scanner.py`) | How to set it |
 | :--- | :--- |
-| `TOF_BACKGROUND_DISTANCE_MM` | Mean reading of the empty backdrop at several Z heights. |
-| `TOF_CLEARANCE_MARGIN_MM` | Several times the measured spread, expected 20-30 mm. |
+| `TOF_BACKGROUND_DISTANCE_MM` | The threshold itself: between the distance to the object surface and the mean reading of the empty backdrop (several Z heights), clear of the spread of both. Measured on the rig: the object surface ~320 mm, a black part of an object read ~480 mm (a valid far reading), so 350 mm. |
 
 Also check:
 - **Cone:** slide a card in from the side at the object distance and note where the reading starts to change. The change should be symmetric left/right and up/down. This gives the real cone width and confirms the ROI is centred.
@@ -143,7 +140,7 @@ Also check:
 ## ⚠️ Known Limitations
 
 - **Systematic misses.** The 20 stops on a ring are not independent chances. They help when the miss depends on the angle (asymmetric object, partial coverage), but a miss caused by the material is the same on every stop. If the sensor sees through or past the object and returns a *valid* far reading (transparent, glossy), the scan ends after level 1 and the log shows `ToF Sensor cleared the object at level 1`. If the material gives an *invalid* reading (very dark), the result is unknown, not "no object".
-- **An object that absorbs all light** returns an invalid reading, not a far one. It is reported as unknown (`None`), never as "no object", so it cannot end the scan by itself; but it also gives no evidence that the object is there.
+- **An object that absorbs light** may return an invalid reading (reported as unknown, `None`, which cannot end the scan by itself) **or a valid far one**: a narrow black part of a screwdriver read ~480 mm on the rig, beyond the 350 mm threshold, i.e. like the backdrop. A dark object can therefore end the scan after the first ring (see R-1 in `PROBLEME_RAMASE.md` for the planned remedies).
 - **Invalid readings on every stop** (sensor unplugged, flaky I2C, very dark backdrop) mean the roof can never be confirmed. How the scanner reacts is decided in `scanner.py`, not here.
 - **Objects narrower than the cone.** At 4x4 the cone is about 10-14 cm wide at working distance. Narrower parts return a mix of object and backdrop.
 - **Sloped or curved tops** reflect light sideways and return weakly, which is where the roof detection matters most.

@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import os
 import logging
+import threading
 
 from .camera import ArducamIMX477
 from hardware.camera.config import (
@@ -19,11 +20,34 @@ class CaptureError(RuntimeError):
     """A still capture did not produce a usable image pair (missing frame, empty file, closed driver)."""
 
 
+DEFAULT_STREAM_SIZE = (1024, 768)
+
+
 class BaseDualCamera(ABC):
     """
     Abstract Base Class providing common lifecycle, controls, and helpers
-    for dual-camera setups (standard DualCamera and DualCameraXVS).
+    for dual-camera setups (DualCameraRPISync, DualCamera and DualCameraXVS).
+
+    This class is THE interface of every dual-camera driver: the scanner and the routers talk to `scanner.dual_cameras`
+    only through the members declared here (no `hasattr` / `isinstance` checks on a concrete class). A member that only
+    some drivers implement still exists here with a safe default, and the driver advertises what it really supports
+    through the capability flags below. When a driver gains a new feature that the scanner or a router uses, declare
+    it here first (see FUTURE_WORK.md).
+
+    Capabilities (class attributes, False unless the driver sets them):
+      - ``supports_preview_stream``: live MJPEG preview (``wait_jpeg``, spectators, ``active_camera``).
+      - ``supports_lock_auto``: ``prepare_scan(lock_auto=True)`` freezes AE/AWB after the cameras are in sync and
+        copies cam1's exposure time and analogue gain to cam2 (its white-balance gains too only with
+        ``copy_colour_gains=True``), and the returned dicts carry ``locked``/``ready``. Drivers without it always lock
+        AE/AWB inside every ``prepare_scan`` (the ``lock_auto`` and ``copy_colour_gains`` arguments are accepted and
+        ignored).
+      - ``supported_photo_sizes``: the still sizes (W, H) the driver can capture without cropping the field of view,
+        or None when it does not restrict them. A driver that sets it refuses any other ``size`` in its constructor.
     """
+
+    supports_preview_stream: bool = False
+    supports_lock_auto: bool = False
+    supported_photo_sizes: Optional[Tuple[Tuple[int, int], ...]] = None
 
     def __init__(
         self,
@@ -35,6 +59,8 @@ class BaseDualCamera(ABC):
         preview_size: Optional[Tuple[int, int]] = None,
         rotation1: int = 0,
         rotation2: int = 0,
+        stream_size: Optional[Tuple[int, int]] = None,
+        stream_quality: int = 80,
     ):
         self.camera_id1 = camera_id1
         self.camera_id2 = camera_id2
@@ -49,11 +75,25 @@ class BaseDualCamera(ABC):
         if preview_size is None:
             preview_size = DEFAULT_PREVIEW_RESOLUTION
 
+        if self.supported_photo_sizes is not None and tuple(size) not in self.supported_photo_sizes:
+            raise ValueError(
+                f"{type(self).__name__} supports the photo sizes {list(self.supported_photo_sizes)}, not {tuple(size)}"
+            )
+
         self.size = size
         self.video_size = video_size
         self.preview_size = preview_size
         self.rotation1 = rotation1
         self.rotation2 = rotation2
+
+        # Live-preview state shared by every driver (only drivers with supports_preview_stream feed it)
+        self.stream_size = tuple(stream_size) if stream_size else DEFAULT_STREAM_SIZE
+        self._stream_quality = max(1, min(100, int(stream_quality)))
+        self._active_idx = 0  # 0 for cam1, 1 for cam2
+        self._spectators = [0, 0]  # viewers connected to cam1 (idx 0) and cam2 (idx 1)
+        self._spectator_lock = threading.Lock()
+        # Result of the last autofocus sweep (one position per lens), None until one ran
+        self.autofocus_positions: Optional[List[int]] = None
 
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._closed: bool = False
@@ -126,11 +166,79 @@ class BaseDualCamera(ABC):
     @property
     def stream_quality(self) -> int:
         """JPEG encoding quality for the low-resolution live preview stream (1-100)."""
-        return getattr(self, "_stream_quality", 80)
+        return self._stream_quality
 
     @stream_quality.setter
     def stream_quality(self, val: int):
         self._stream_quality = max(1, min(100, int(val)))
+        log.info("%s: Stream JPEG quality updated to %d", type(self).__name__, self._stream_quality)
+
+    # ── Live preview (meaningful when supports_preview_stream) ─
+    @property
+    def active_camera(self) -> int:
+        """Returns the 1-indexed active preview camera (1 or 2)."""
+        return self._active_idx + 1
+
+    @active_camera.setter
+    def active_camera(self, camera_id: int):
+        """Sets the active preview camera (1 for cam1, 2 for cam2)."""
+        if camera_id not in (1, 2):
+            raise ValueError(f"active_camera must be 1 or 2 (got {camera_id})")
+        self._active_idx = camera_id - 1
+        log.info("%s: Active preview switched to camera %d", type(self).__name__, camera_id)
+
+    @property
+    def active(self) -> int:
+        """Returns the 0-indexed active preview camera (0 or 1)."""
+        return self._active_idx
+
+    @active.setter
+    def active(self, idx: int):
+        """Sets the active preview camera (0 for cam1, 1 for cam2)."""
+        if idx not in (0, 1):
+            raise ValueError(f"active must be 0 or 1 (got {idx})")
+        self._active_idx = idx
+
+    @staticmethod
+    def _spectator_index(camera_idx: int) -> int:
+        """Maps a 0-indexed or 1-indexed camera number to 0 or 1."""
+        return camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else 0)
+
+    def add_spectator(self, camera_idx: int) -> None:
+        """Increments the number of viewers of camera_idx (0-indexed or 1-indexed)."""
+        idx = self._spectator_index(camera_idx)
+        with self._spectator_lock:
+            self._spectators[idx] += 1
+            log.info("%s: Spectator connected to cam%d (active: %d)", type(self).__name__, idx + 1, self._spectators[idx])
+
+    def remove_spectator(self, camera_idx: int) -> None:
+        """Decrements the number of viewers of camera_idx (0-indexed or 1-indexed)."""
+        idx = self._spectator_index(camera_idx)
+        with self._spectator_lock:
+            self._spectators[idx] = max(0, self._spectators[idx] - 1)
+            log.info("%s: Spectator disconnected from cam%d (active: %d)", type(self).__name__, idx + 1, self._spectators[idx])
+
+    def has_spectators(self, camera_idx: Optional[int] = None) -> bool:
+        """True when camera_idx (or any camera) has viewers."""
+        with self._spectator_lock:
+            if camera_idx is not None:
+                return self._spectators[self._spectator_index(camera_idx)] > 0
+            return any(c > 0 for c in self._spectators)
+
+    def wait_jpeg(self, camera_idx: int = 0, last_id: int = -1, timeout: float = 1.0) -> Tuple[int, Optional[bytes]]:
+        """
+        Waits up to `timeout` seconds for a JPEG preview frame newer than `last_id` and returns (frame_id, jpeg_bytes),
+        or (last_id, None) on timeout. Drivers without ``supports_preview_stream`` have no preview: they return
+        (last_id, None) immediately, so callers check the capability first.
+        """
+        return last_id, None
+
+    def get_sync_status(self) -> Dict[str, Any]:
+        """
+        Synchronisation diagnostics (readiness, offsets, drops, fps). Drivers without a continuous sync pipeline return
+        just their mode and streaming state.
+        """
+        return {"ready": True, "is_streaming": self.is_streaming, "mode": type(self).__name__}
 
     def rotate(self, direction: str) -> List[int]:
         """Rotates both cameras."""
@@ -186,17 +294,24 @@ class BaseDualCamera(ABC):
         futures = [self._executor.submit(cam.focus_sweep_autofocus, step=step, roi=roi) for cam in self.cameras]
         return [f.result() for f in futures]
 
-    def lock_auto_features(self, settle_time: float = 2.0) -> List[dict]:
-        """Lock current AE/AWB settings and synchronize slave (cam2) to match master (cam1)."""
+    def lock_auto_features(self, settle_time: float = 2.0, copy_colour_gains: bool = True) -> List[dict]:
+        """
+        Lock current AE/AWB settings of both cameras and synchronize the exposure of the slave (cam2) to the master.
+
+        ``copy_colour_gains``: True also copies cam1's white-balance gains onto cam2. False (the scanner's default)
+        leaves cam2 on the gains its own AWB settled on, which it has just locked: the two sensors do not answer
+        alike to the same gains, so copying them gives cam2 a colour cast (a bluish one on this rig).
+        """
         futures = [self._executor.submit(cam.lock_auto_features, settle_time) for cam in self.cameras]
         res = [f.result() for f in futures]
         sync_controls = {
             "ExposureTime": res[0].get("ExposureTime"),
             "AnalogueGain": res[0].get("AnalogueGain"),
-            "ColourGains": res[0].get("ColourGains"),
             "AeEnable": False,
-            "AwbEnable": False,
         }
+        if copy_colour_gains:
+            sync_controls["ColourGains"] = res[0].get("ColourGains")
+            sync_controls["AwbEnable"] = False
         sync_controls = {k: v for k, v in sync_controls.items() if v is not None}
         if sync_controls and len(self.cameras) > 1 and self.cam2:
             if getattr(self.cam2.picam2, "started", False):
@@ -281,11 +396,18 @@ class BaseDualCamera(ABC):
 
     # ── Abstract Contract ──────────────────────────────────────
     @abstractmethod
-    def prepare_scan(self, **kwargs) -> List[dict]:
+    def prepare_scan(self, *, lock_auto: bool = False, copy_colour_gains: bool = False, **kwargs) -> List[dict]:
         """
         Prepare and lock both cameras for scanning.
         Subclasses MUST enforce timing contracts (e.g. 0.15s stagger in DualCamera;
         slave-first in DualCameraXVS).
+
+        ``lock_auto``: only drivers with ``supports_lock_auto`` use it (AE/AWB are frozen when it is True, left running
+        when False); the others always lock in every call and ignore it.
+        ``copy_colour_gains``: when AE/AWB are locked, False leaves cam2 on the white-balance gains its own AWB settled
+        on (exposure time and analogue gain are still copied from cam1); True also copies cam1's gains to cam2. Part of
+        the shared interface; a driver that does not implement it ignores it (see PROBLEME_RAMASE.md).
+        ``focus`` (kwarg): "auto" runs the sharpness sweep, an int sets both lenses, a pair sets (cam1, cam2).
         """
         pass
 

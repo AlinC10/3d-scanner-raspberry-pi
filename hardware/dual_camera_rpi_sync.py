@@ -3,13 +3,16 @@ import time
 import logging
 import threading
 from collections import OrderedDict, deque
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Optional, List, Tuple, Dict, Any
 
 from .base_dual_camera import BaseDualCamera, CaptureError
 from .camera import ArducamIMX477
+from hardware.camera.config import CAMERA_CALL_TIMEOUT_S
 from hardware.camera.config import (
     DEFAULT_QUALITY,
     DEFAULT_PHOTO_RESOLUTION,
+    SUPPORTED_PHOTO_RESOLUTIONS,
     DEFAULT_VIDEO_RESOLUTION,
     DEFAULT_PREVIEW_RESOLUTION,
     AF_STEP,
@@ -32,6 +35,9 @@ except ImportError:
     OPENCV_AVAILABLE = False
 
 log = logging.getLogger(__name__)
+
+# A grab worker that fails this many times in a row gives up (the camera is then reported dead, see _mark_worker_dead)
+GRAB_MAX_CONSECUTIVE_ERRORS = 100
 
 # rpi.sync synchronization mode constants
 SYNC_OFF = 0
@@ -88,6 +94,11 @@ class DualCameraRPISync(BaseDualCamera):
     while maintaining synchronized sequence counters for full 12 MP photogrammetry still capture.
     """
 
+    supports_preview_stream = True   # MJPEG preview: wait_jpeg(), spectators, active_camera
+    # The sensor is configured at the requested size (4056x3040, or the 2x2 binned 2028x1520 mode: same field of view)
+    supported_photo_sizes = SUPPORTED_PHOTO_RESOLUTIONS
+    supports_lock_auto = True        # prepare_scan(lock_auto=True) freezes AE/AWB (cam1's exposure and gain -> cam2)
+
     def __init__(
         self,
         camera_id1: int = 0,
@@ -121,6 +132,8 @@ class DualCameraRPISync(BaseDualCamera):
             preview_size=preview_size,
             rotation1=rotation1,
             rotation2=rotation2,
+            stream_size=stream_size,
+            stream_quality=stream_quality,
         )
 
         log.info("Initializing DualCameraRPISync (CSI %d and %d)", camera_id1, camera_id2)
@@ -144,8 +157,6 @@ class DualCameraRPISync(BaseDualCamera):
         )
         self.cameras = [self.cam1, self.cam2]
 
-        self.stream_size = stream_size
-        self._stream_quality = max(1, min(100, int(stream_quality)))
         self.fps = clamp_framerate(self.size, fps)
         self.period_ns = int(1e9 / self.fps)
         self.period_us = int(1e6 / self.fps)
@@ -156,11 +167,7 @@ class DualCameraRPISync(BaseDualCamera):
         # Internal state & synchronization primitives
         self._running = False
         self._is_streaming = False
-        self._active_idx = 0  # 0 for cam1, 1 for cam2
-
-        # Spectator tracking: number of active viewers connected to cam1 (idx 0) and cam2 (idx 1)
-        self._spectators = [0, 0]
-        self._spectator_lock = threading.Lock()
+        # (_active_idx, _spectators, _spectator_lock, stream_size and _stream_quality live in BaseDualCamera)
 
         self._cond = threading.Condition()
         self._ready = [threading.Event(), threading.Event()]
@@ -171,7 +178,6 @@ class DualCameraRPISync(BaseDualCamera):
         # Autofocus sweep: while a camera's flag is set the grab worker keeps a copy of its newest lores frame here
         self._af_active = [False, False]
         self._af_frame: List[Optional[Tuple[int, Any]]] = [None, None]  # (seq, lores yuv array)
-        self.autofocus_positions: Optional[List[int]] = None  # result of the last sweep
 
         self._lores_slots: List[Optional[Tuple[int, int, int, Any]]] = [None, None]
         self._lores_slot: Optional[Tuple[int, int, int, Any]] = None  # (cam_idx, seq, ts, yuv_array)
@@ -193,6 +199,9 @@ class DualCameraRPISync(BaseDualCamera):
 
         self._threads: List[threading.Thread] = []
         self._closing = False  # set at the start of close(), before stop_stream()
+        # Why a grab worker stopped (None while it runs): a dead worker means that camera delivers no more frames,
+        # so capture_photo fails at once with this reason instead of waiting for frames that never come
+        self._worker_errors: List[Optional[str]] = [None, None]
 
         if auto_start:
             self._start_pipeline()
@@ -203,62 +212,8 @@ class DualCameraRPISync(BaseDualCamera):
     def is_streaming(self) -> bool:
         return self._is_streaming and self._running
 
-    @property
-    def active_camera(self) -> int:
-        """Returns 1-indexed active preview camera (1 or 2)."""
-        return self._active_idx + 1
-
-    @active_camera.setter
-    def active_camera(self, camera_id: int):
-        """Sets active preview camera (1 for cam1, 2 for cam2)."""
-        if camera_id not in (1, 2):
-            raise ValueError(f"active_camera must be 1 or 2 (got {camera_id})")
-        self._active_idx = camera_id - 1
-        log.info("DualCameraRPISync: Active preview switched to camera %d", camera_id)
-
-    @property
-    def active(self) -> int:
-        """Returns 0-indexed active preview camera (0 or 1)."""
-        return self._active_idx
-
-    @active.setter
-    def active(self, idx: int):
-        """Sets active preview camera (0 for cam1, 1 for cam2)."""
-        if idx not in (0, 1):
-            raise ValueError(f"active must be 0 or 1 (got {idx})")
-        self._active_idx = idx
-
-    @property
-    def stream_quality(self) -> int:
-        """JPEG encoding quality for the low-resolution MJPEG live preview stream (1-100)."""
-        return self._stream_quality
-
-    @stream_quality.setter
-    def stream_quality(self, val: int):
-        self._stream_quality = max(1, min(100, int(val)))
-        log.info("DualCameraRPISync: Stream JPEG quality updated to %d", self._stream_quality)
-
-    def add_spectator(self, camera_idx: int) -> None:
-        """Increment active spectator count for camera_idx (0-indexed or 1-indexed)."""
-        idx = camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else 0)
-        with self._spectator_lock:
-            self._spectators[idx] += 1
-            log.info("DualCameraRPISync: Spectator connected to cam%d (active: %d)", idx + 1, self._spectators[idx])
-
-    def remove_spectator(self, camera_idx: int) -> None:
-        """Decrement active spectator count for camera_idx (0-indexed or 1-indexed)."""
-        idx = camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else 0)
-        with self._spectator_lock:
-            self._spectators[idx] = max(0, self._spectators[idx] - 1)
-            log.info("DualCameraRPISync: Spectator disconnected from cam%d (active: %d)", idx + 1, self._spectators[idx])
-
-    def has_spectators(self, camera_idx: Optional[int] = None) -> bool:
-        """Check if there are active spectators for camera_idx or any camera."""
-        with self._spectator_lock:
-            if camera_idx is not None:
-                idx = camera_idx if camera_idx in (0, 1) else (camera_idx - 1 if camera_idx in (1, 2) else 0)
-                return self._spectators[idx] > 0
-            return any(c > 0 for c in self._spectators)
+    # active_camera, active, stream_quality, add_spectator, remove_spectator and has_spectators are inherited from
+    # BaseDualCamera (the shared interface).
 
     # ── Continuous Streaming & Grab Lifecycle ──────────────────
 
@@ -308,6 +263,7 @@ class DualCameraRPISync(BaseDualCamera):
                 p2.configure(config)
 
             self._running = True
+            self._worker_errors = [None, None]
             self._ready[0].clear()
             self._ready[1].clear()
 
@@ -361,6 +317,18 @@ class DualCameraRPISync(BaseDualCamera):
         except Exception as exc:
             log.debug("DualCameraRPISync: focuser.invalidate() failed: %s", exc)
 
+    def _raise_if_a_worker_is_dead(self) -> None:
+        dead = [f"camera {i + 1}: {reason}" for i, reason in enumerate(self._worker_errors) if reason]
+        if dead:
+            raise CaptureError("a camera stopped delivering frames (" + "; ".join(dead) + "); restart the preparation")
+
+    def _mark_worker_dead(self, cam_idx: int, reason: str) -> None:
+        """A grab worker gave up: that camera delivers no more frames. Wakes everything waiting for frames."""
+        log.error("DualCameraRPISync: Grab worker %d STOPPED: %s", cam_idx + 1, reason)
+        with self._cond:
+            self._worker_errors[cam_idx] = reason
+            self._cond.notify_all()
+
     def _grab_worker(self, cam_idx: int):
         """
         Dedicated background worker thread for each camera.
@@ -372,6 +340,7 @@ class DualCameraRPISync(BaseDualCamera):
         seq = -1
         last_ts = None
         started = False
+        consecutive_errors = 0
 
         log.info("DualCameraRPISync: Grab worker %d started.", cam_idx + 1)
 
@@ -386,99 +355,126 @@ class DualCameraRPISync(BaseDualCamera):
                     log.warning("DualCameraRPISync: Failed applying pending controls on cam%d: %s", cam_idx + 1, e)
 
             try:
-                req = cam.picam2.capture_request()
+                req = cam.picam2.capture_request(wait=CAMERA_CALL_TIMEOUT_S)
+            except (TimeoutError, FuturesTimeoutError) as e:
+                if not self._running:
+                    break
+                # No frame for CAMERA_CALL_TIMEOUT_S: the sensor or the pipeline is stalled; stop waiting forever
+                self._mark_worker_dead(cam_idx, f"no frame for {CAMERA_CALL_TIMEOUT_S:g} s ({type(e).__name__})")
+                break
             except Exception as e:
                 if not self._running:
                     break
-                log.warning("DualCameraRPISync: capture_request failed on cam%d: %s", cam_idx + 1, e)
+                consecutive_errors += 1
+                if consecutive_errors >= GRAB_MAX_CONSECUTIVE_ERRORS:
+                    self._mark_worker_dead(cam_idx, f"capture_request failed {consecutive_errors} times in a row: {e}")
+                    break
+                if consecutive_errors == 1 or consecutive_errors % 20 == 0:
+                    log.warning("DualCameraRPISync: capture_request failed on cam%d (%d in a row): %s",
+                                cam_idx + 1, consecutive_errors, e)
                 time.sleep(0.02)
                 continue
+            consecutive_errors = 0
 
             try:
-                md = req.get_metadata()
-                if isinstance(md, dict):
-                    cam._last_metadata = md  # lets apply_settings lock a missing exposure
-                if not started:
-                    if md.get("SyncReady", False):
-                        started = True
-                        self._ready[cam_idx].set()
-                        log.info("DualCameraRPISync: Camera %d reached SyncReady state.", cam_idx + 1)
+                try:
+                    md = req.get_metadata()
+                    if isinstance(md, dict):
+                        cam._last_metadata = md  # lets apply_settings lock a missing exposure
+                    if not started:
+                        if md.get("SyncReady", False):
+                            started = True
+                            self._ready[cam_idx].set()
+                            log.info("DualCameraRPISync: Camera %d reached SyncReady state.", cam_idx + 1)
+                        else:
+                            continue  # Sync aligning; release and await SyncReady
+
+                    ts = md.get("SensorTimestamp") if isinstance(md, dict) else None
+                    if not isinstance(ts, (int, float)):
+                        ts = time.monotonic_ns()
+
+                    if last_ts is None:
+                        seq = 0
+                        gap = 1
                     else:
-                        continue  # Sync aligning; release and await SyncReady
+                        gap = max(1, round((ts - last_ts) / self.period_ns))
+                        seq += gap
 
-                ts = md.get("SensorTimestamp") if isinstance(md, dict) else None
-                if not isinstance(ts, (int, float)):
-                    ts = time.monotonic_ns()
+                    last_ts = ts
+                    self._latest[cam_idx] = seq
 
-                if last_ts is None:
-                    seq = 0
-                    gap = 1
-                else:
-                    gap = max(1, round((ts - last_ts) / self.period_ns))
-                    seq += gap
+                    # Selective Lores Copy: Only copy if spectators are watching this camera
+                    lores = None
+                    with self._spectator_lock:
+                        has_spec = self._spectators[cam_idx] > 0
+                        fallback = (not any(self._spectators)) and (cam_idx == self._active_idx)
+                    need_af = self._af_active[cam_idx]
+                    if has_spec or fallback or need_af:
+                        lores = req.make_array("lores").copy()
 
-                last_ts = ts
-                self._latest[cam_idx] = seq
+                    # On-demand Still Capture Check
+                    with self._cond:
+                        t = self._still_target
+                        want_still = (
+                            (t is not None and seq >= t and self._still[cam_idx] is None)
+                            or self._force_still[cam_idx]
+                        )
+                        want_raw = self._want_raw if want_still else False
 
-                # Selective Lores Copy: Only copy if spectators are watching this camera
-                lores = None
-                with self._spectator_lock:
-                    has_spec = self._spectators[cam_idx] > 0
-                    fallback = (not any(self._spectators)) and (cam_idx == self._active_idx)
-                need_af = self._af_active[cam_idx]
-                if has_spec or fallback or need_af:
-                    lores = req.make_array("lores").copy()
+                    still = None
+                    still_meta = None
+                    raw_req = None
+                    if want_still:
+                        if want_raw:
+                            try:
+                                req.acquire()
+                                raw_req = req
+                            except Exception as e:
+                                log.warning("DualCameraRPISync: req.acquire() failed: %s", e)
+                        # 18.5 MB RAM copy of full 12 MP YUV420 plane
+                        still = req.make_array("main").copy()
+                        still_meta = _summarize_metadata(md)
+                        self._force_still[cam_idx] = False
 
-                # On-demand Still Capture Check
+                finally:
+                    # CRITICAL: Always release DMA buffer back to libcamera kernel pool within 3-5 ms!
+                    req.release()
+
+                # Update state under condition lock
                 with self._cond:
-                    t = self._still_target
-                    want_still = (
-                        (t is not None and seq >= t and self._still[cam_idx] is None)
-                        or self._force_still[cam_idx]
-                    )
-                    want_raw = self._want_raw if want_still else False
+                    if gap > 1:
+                        self._drops[cam_idx] += (gap - 1)
 
-                still = None
-                still_meta = None
-                raw_req = None
-                if want_still:
-                    if want_raw:
-                        try:
-                            req.acquire()
-                            raw_req = req
-                        except Exception as e:
-                            log.warning("DualCameraRPISync: req.acquire() failed: %s", e)
-                    # 18.5 MB RAM copy of full 12 MP YUV420 plane
-                    still = req.make_array("main").copy()
-                    still_meta = _summarize_metadata(md)
-                    self._force_still[cam_idx] = False
+                    h = self._ts_hist[cam_idx]
+                    h[seq] = ts
+                    while len(h) > 32:
+                        h.popitem(last=False)
 
-            finally:
-                # CRITICAL: Always release DMA buffer back to libcamera kernel pool within 3-5 ms!
-                req.release()
+                    if lores is not None:
+                        self._lores_slots[cam_idx] = (cam_idx, seq, ts, lores)
+                        self._lores_slot = (cam_idx, seq, ts, lores)
+                        if self._af_active[cam_idx]:
+                            self._af_frame[cam_idx] = (seq, lores)
 
-            # Update state under condition lock
-            with self._cond:
-                if gap > 1:
-                    self._drops[cam_idx] += (gap - 1)
+                    if still is not None and self._still[cam_idx] is None:
+                        self._still[cam_idx] = (seq, ts, still, still_meta)
+                        if raw_req is not None:
+                            self._raw_reqs[cam_idx] = raw_req
 
-                h = self._ts_hist[cam_idx]
-                h[seq] = ts
-                while len(h) > 32:
-                    h.popitem(last=False)
+                    self._cond.notify_all()
 
-                if lores is not None:
-                    self._lores_slots[cam_idx] = (cam_idx, seq, ts, lores)
-                    self._lores_slot = (cam_idx, seq, ts, lores)
-                    if self._af_active[cam_idx]:
-                        self._af_frame[cam_idx] = (seq, lores)
-
-                if still is not None and self._still[cam_idx] is None:
-                    self._still[cam_idx] = (seq, ts, still, still_meta)
-                    if raw_req is not None:
-                        self._raw_reqs[cam_idx] = raw_req
-
-                self._cond.notify_all()
+            except Exception as exc:
+                # An unexpected error (e.g. MemoryError copying a 12 MP frame) must not kill the thread: that
+                # camera would stop delivering frames. The request was already released by the inner finally.
+                consecutive_errors += 1
+                if consecutive_errors >= GRAB_MAX_CONSECUTIVE_ERRORS:
+                    self._mark_worker_dead(cam_idx, f"{type(exc).__name__}: {exc}")
+                    break
+                log.error("DualCameraRPISync: grab worker %d error (%d in a row): %s: %s",
+                          cam_idx + 1, consecutive_errors, type(exc).__name__, exc)
+                time.sleep(0.02)
+            else:
+                consecutive_errors = 0
 
         log.info("DualCameraRPISync: Grab worker %d stopped.", cam_idx + 1)
 
@@ -632,7 +628,7 @@ class DualCameraRPISync(BaseDualCamera):
 
     # ── Abstract Contract Implementation ───────────────────────
 
-    def prepare_scan(self, *, lock_auto: bool = False, **kwargs) -> List[dict]:
+    def prepare_scan(self, *, lock_auto: bool = False, copy_colour_gains: bool = False, **kwargs) -> List[dict]:
         """
         Prepares both cameras for scanning under continuous rpi.sync.
         Awaits SyncReady alignment within ready_timeout (one shared deadline).
@@ -647,6 +643,9 @@ class DualCameraRPISync(BaseDualCamera):
         ``exposure_time`` / ``analogue_gain`` / ``colour_gains`` (None when not locked).
         An optional ``settle_time`` kwarg (seconds, default 2.0) sets the AE/AWB settle
         time before locking.
+
+        ``copy_colour_gains`` (only with ``lock_auto``): False (default) leaves cam2 on the white-balance gains its own
+        AWB settled on; True copies cam1's gains to it. Exposure time and analogue gain are copied either way.
         """
         self._start_pipeline()
 
@@ -709,7 +708,10 @@ class DualCameraRPISync(BaseDualCamera):
         locks: List[Optional[dict]] = [None, None]
         if lock_auto:
             if ready1 and ready2:
-                locks = self._lock_auto_exposure(runtime_controls, kwargs.get("settle_time"))
+                locks = self._lock_auto_exposure(
+                    runtime_controls, kwargs.get("settle_time"),
+                    copy_colour_gains=bool(copy_colour_gains),
+                )
             else:
                 log.warning("DualCameraRPISync: AE/AWB lock skipped because the cameras are not SyncReady.")
 
@@ -818,10 +820,14 @@ class DualCameraRPISync(BaseDualCamera):
         log.info("DualCameraRPISync: Autofocus done, locked positions: cam1=%d cam2=%d", best[0], best[1])
         return list(best)
 
-    def _lock_auto_exposure(self, runtime_controls: dict, settle_time: Optional[float]) -> List[Optional[dict]]:
+    def _lock_auto_exposure(
+        self, runtime_controls: dict, settle_time: Optional[float], copy_colour_gains: bool = False
+    ) -> List[Optional[dict]]:
         """
         Re-arms AE/AWB (so a second scan does not inherit the previous scan's locked values),
-        lets them settle, then freezes cam1's result and copies it to cam2.
+        lets them settle, then freezes both cameras and copies cam1's exposure and gain to cam2.
+        cam1's white-balance gains are copied too only with ``copy_colour_gains``; otherwise each camera keeps the
+        gains of its own AWB.
         Returns the per-camera lock results ([None, None] when locking failed).
         """
         try:
@@ -838,18 +844,22 @@ class DualCameraRPISync(BaseDualCamera):
 
             if settle_time is None:
                 settle_time = 2.0 if PICAMERA2_AVAILABLE else 0.0
-            res = self.lock_auto_features(settle_time=float(settle_time))
+            res = self.lock_auto_features(settle_time=float(settle_time), copy_colour_gains=copy_colour_gains)
             locks: List[Optional[dict]] = [dict(r) if isinstance(r, dict) else None for r in res[:2]]
             while len(locks) < 2:
                 locks.append(None)
             if locks[0] is not None and locks[1] is not None:
-                for key in ("ExposureTime", "AnalogueGain", "ColourGains"):
+                synced = ("ExposureTime", "AnalogueGain") + (("ColourGains",) if copy_colour_gains else ())
+                for key in synced:
                     locks[1][key] = locks[0].get(key)  # cam2 was synced to cam1 by lock_auto_features
             log.info(
-                "DualCameraRPISync: AE/AWB locked (exposure=%s us, gain=%s, colour_gains=%s)",
+                "DualCameraRPISync: AE/AWB locked (exposure=%s us, gain=%s, colour_gains cam1=%s cam2=%s, "
+                "copy_colour_gains=%s)",
                 locks[0].get("ExposureTime") if locks[0] else None,
                 locks[0].get("AnalogueGain") if locks[0] else None,
                 locks[0].get("ColourGains") if locks[0] else None,
+                locks[1].get("ColourGains") if locks[1] else None,
+                copy_colour_gains,
             )
             return locks
         except Exception as exc:
@@ -862,8 +872,8 @@ class DualCameraRPISync(BaseDualCamera):
         """
         self._start_pipeline()
         return [
-            "/test/stream/mjpeg?camera=1",
-            "/test/stream/mjpeg?camera=2",
+            "/scanner/stream/mjpeg?camera=1",
+            "/scanner/stream/mjpeg?camera=2",
         ]
 
     def stop_stream(self) -> None:
@@ -926,6 +936,7 @@ class DualCameraRPISync(BaseDualCamera):
         if self._closed or self._closing:
             raise CaptureError("capture_photo called on a closed DualCameraRPISync")
         self._start_pipeline()
+        self._raise_if_a_worker_is_dead()
 
         path1, path2 = self._resolve_capture_paths(output_prefix, output_dir, meshroom_rig)
         resolution = kwargs.get("resolution", self.size)
@@ -970,7 +981,8 @@ class DualCameraRPISync(BaseDualCamera):
             # Await Tier 1 sequence match within sync_timeout
             start_t = time.monotonic()
             with self._cond:
-                while (self._still[0] is None or self._still[1] is None) and self._running:
+                while (self._still[0] is None or self._still[1] is None) and self._running \
+                        and not any(self._worker_errors):
                     remaining = sync_timeout - (time.monotonic() - start_t)
                     if remaining <= 0:
                         break
@@ -1006,7 +1018,8 @@ class DualCameraRPISync(BaseDualCamera):
 
                 fallback_deadline = time.monotonic() + 2.0
                 with self._cond:
-                    while (self._still[0] is None or self._still[1] is None) and self._running:
+                    while (self._still[0] is None or self._still[1] is None) and self._running \
+                            and not any(self._worker_errors):
                         remaining = fallback_deadline - time.monotonic()
                         if remaining <= 0:
                             break
@@ -1030,9 +1043,11 @@ class DualCameraRPISync(BaseDualCamera):
                             held.release()
                         except Exception:
                             pass
+                dead = [f"camera {i + 1}: {reason}" for i, reason in enumerate(self._worker_errors) if reason]
                 raise CaptureError(
                     f"no frame received from camera(s) {missing} "
                     f"(running={self._running}, closed={self._closed or self._closing})"
+                    + (f"; grab worker stopped ({'; '.join(dead)})" if dead else "")
                 )
 
             def _process_one(cam_idx: int, out_path: str) -> Dict[str, Any]:

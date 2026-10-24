@@ -11,12 +11,31 @@ class BluetoothConnectionError(exception.SystemConnectionError):
 
 ALLOWED_ICONS = {"phone", "computer"}
 
+# Every bluetoothctl call has a deadline: a hung adapter or a device that never answers must not block a request
+# thread forever (repeated clicks used to exhaust the thread pool the scanner shares).
+BLUETOOTHCTL_TIMEOUT_S = 10.0   # power, show, devices, info, trust
+PAIR_TIMEOUT_S = 40.0           # pairing talks to the remote device
+CONNECT_TIMEOUT_S = 30.0        # connecting talks to the remote device
+SCAN_GRACE_S = 10.0             # extra time on top of the discovery duration
+
+
+def run_bluetoothctl(args: list[str], timeout: float = BLUETOOTHCTL_TIMEOUT_S, **kwargs) -> CompletedProcess:
+    """
+    Runs `bluetoothctl <args>` with a deadline (the child is killed when it expires).
+
+    :raises BluetoothConnectionError: when the command does not finish within `timeout` seconds.
+    """
+    try:
+        return subprocess.run(["bluetoothctl", *args], timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise BluetoothConnectionError(f"`bluetoothctl {' '.join(args)}` did not finish within {timeout:g} s")
+
 def check_and_raise_error(res: CompletedProcess, msg: str):
     exception.check_and_raise_error(res, msg, BluetoothConnectionError)
 
 def power_on() -> bool:
     """Activates the Bluetooth adapter."""
-    res = subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, text=True)
+    res = run_bluetoothctl(["power", "on"], capture_output=True, text=True)
     check_and_raise_error(res, f"Error in `power_on`")
 
     return "succeeded" in res.stdout.lower() or "already on" in res.stdout.lower()
@@ -24,7 +43,7 @@ def power_on() -> bool:
 
 def power_off() -> bool:
     """Deactivates the Bluetooth adapter."""
-    res = subprocess.run(["bluetoothctl", "power", "off"], capture_output=True, text=True)
+    res = run_bluetoothctl(["power", "off"], capture_output=True, text=True)
     check_and_raise_error(res, f"Error in `power_off`")
 
     return "succeeded" in res.stdout.lower()
@@ -32,7 +51,7 @@ def power_off() -> bool:
 
 def get_power_status() -> bool:
     """Returns True if the Bluetooth adapter is powered on."""
-    res = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True)
+    res = run_bluetoothctl(["show"], capture_output=True, text=True)
     check_and_raise_error(res, f"Error in retrieving Bluetooth status")
 
     return "Powered: yes" in res.stdout
@@ -62,10 +81,13 @@ def scan_devices(duration: int = 8, allowed_icons: Optional[list[str]] = None) -
     :return: all discovered devices
     :rtype: list
     """
-    subprocess.run(["bluetoothctl", "--timeout", str(duration), "scan", "on"], stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)
+    try:
+        run_bluetoothctl(["--timeout", str(duration), "scan", "on"], timeout=duration + SCAN_GRACE_S,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except BluetoothConnectionError:
+        pass  # a discovery that overran is cut off; the devices found so far are still listed below
 
-    res = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True)
+    res = run_bluetoothctl(["devices"], capture_output=True, text=True)
 
     check_and_raise_error(res, "Error on Bluetooth device scanning")
 
@@ -81,7 +103,10 @@ def scan_devices(duration: int = 8, allowed_icons: Optional[list[str]] = None) -
             mac, name = match.group(1), match.group(2)
 
             # fetch details (icon, paired, status)
-            info = subprocess.run(["bluetoothctl", "info", mac], capture_output=True, text=True).stdout
+            try:
+                info = run_bluetoothctl(["info", mac], capture_output=True, text=True).stdout
+            except BluetoothConnectionError:
+                info = ""  # no details for this device: it is still listed (icon "unknown")
             icon = "unknown"
             rssi = None
             device_class = None
@@ -129,15 +154,15 @@ def filter_by_icon(devices: list[BluetoothDevice], allowed_icons: Optional[list[
 
 def pair_device(mac_address: str) -> None:
     """Uses bluetoothctl's built-in agent for seamless pairing."""
-    res = subprocess.run(["bluetoothctl", "pair", mac_address], capture_output=True, text=True)
+    res = run_bluetoothctl(["pair", mac_address], timeout=PAIR_TIMEOUT_S, capture_output=True, text=True)
     check_and_raise_error(res, "Error on pairing with the device")
 
-    res = subprocess.run(["bluetoothctl", "trust", mac_address], capture_output=True, text=True)
+    res = run_bluetoothctl(["trust", mac_address], capture_output=True, text=True)
     check_and_raise_error(res, "Error on trusting the device")
 
 
 def connect_device(mac_address: str) -> None:
-    res = subprocess.run(["bluetoothctl", "connect", mac_address], capture_output=True, text=True)
+    res = run_bluetoothctl(["connect", mac_address], timeout=CONNECT_TIMEOUT_S, capture_output=True, text=True)
     check_and_raise_error(res, "Error on connecting to requested device")
 
 

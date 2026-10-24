@@ -578,7 +578,7 @@ class TestRouterPrepareMapping(unittest.TestCase):
 
         fake_schemas = types.ModuleType("schemas.scanner")
         for name in ("PrepareRequest", "PrepareResponse", "StartRequest", "StartResponse", "CancelResponse",
-                     "StatusResponse"):
+                     "StatusResponse", "StreamActiveRequest", "StreamQualityRequest"):
             setattr(fake_schemas, name, type(name, (_Response,), {}))
 
         with patch.dict(os.environ, {"MOCK_HARDWARE": "1"}):

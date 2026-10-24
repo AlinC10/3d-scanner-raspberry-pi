@@ -60,6 +60,8 @@ class DualCameraXVS(BaseDualCamera):
             preview_size=preview_size,
             rotation1=rotation1,
             rotation2=rotation2,
+            stream_size=kwargs.pop("stream_size", None),
+            stream_quality=kwargs.pop("stream_quality", 80),
         )
 
         log.info("Initializing DualCameraXVS (Master: CSI %d, Slave: CSI %d)", camera_id1, camera_id2)
@@ -96,10 +98,13 @@ class DualCameraXVS(BaseDualCamera):
 
     # ── Abstract Contract Implementation ───────────────────────
 
-    def prepare_scan(self, **kwargs) -> List[dict]:
+    def prepare_scan(self, *, lock_auto: bool = False, copy_colour_gains: bool = False, **kwargs) -> List[dict]:
         """
         Prepare and lock both cameras concurrently for scanning.
         Enforces XVS sequencing: Slave thread starts FIRST, pauses, Master starts SECOND.
+
+        ``lock_auto`` and ``copy_colour_gains`` are part of the shared interface and are ignored here: this driver
+        locks AE/AWB inside every call and always copies cam1's values to cam2.
         """
         kw1, kw2 = self._split_camera_kwargs(kwargs)
 

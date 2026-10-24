@@ -100,15 +100,15 @@ To deliver an immediate live video feed to the frontend while accommodating 15â€
 * **Execution**: Asynchronous background task (via `FastAPI.BackgroundTasks`).
 * **Actions**:
   1. Safely strips out initialization kwargs (`master_id`, `slave_id`, `video_resolution`, `rotation`) to prevent downstream signature errors.
-  2. Checks for cancellation (`_cancel_event`) **before the first command**, then moves the carriage down to the bottom endstop (`home_z_axis()`, at most `Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM` = 165 mm = 16500 steps). Incorporates a **0.5-second settling pause** before de-energizing the Z-axis coil (`disable()`); the pause is a mechanical settle, not a verified electrical protection.
-  3. Checks for cancellation: `if self._cancel_event.is_set(): return`.
-  4. Energizes Z explicitly (`z_axis_motor.enable()`, no reliance on the firmware's auto-enable) and raises the carriage by **+30.0 mm** to rest directly in front of the illuminated object, then releases the driver again.
+  2. Checks for cancellation (`_cancel_event`) **before the first command**, then moves the carriage down to the bottom endstop (`home_z_axis()`, at most `Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM` = 475 + 15 = 490 mm = 49000 steps). Incorporates a **0.5-second settling pause** before de-energizing the Z-axis coil (`disable()`); the pause is a mechanical settle, not a verified electrical protection.
+  3. Checks for cancellation: `if self._cancel_event.is_set(): return`. Then waits `Z_HOME_SETTLE_S` (1 s, env `SCAN_Z_HOME_SETTLE_S`) with the carriage on the bottom endstop before the climb; a cancel ends the wait at once.
+  4. Energizes Z explicitly (`z_axis_motor.enable()`, no reliance on the firmware's auto-enable) and raises the carriage by `z_start_mm` (`PrepareRequest.z_start_mm`, default **30.0 mm**, 0 to 100) to rest directly in front of the illuminated object, then releases the driver again. `0` skips the climb (the carriage stays on the bottom endstop). The value must convert to a whole number of Z steps (`distance_to_step_conversion`, checked before the homing starts; the request schema validates it too).
   5. Re-checks that the brightness is not 0 (the user may have changed it), then cleans the previous scan's assets from the Cloudflare R2 bucket (`r2.delete_all_files_from_bucket()`, paginated, raises on an incomplete cleanup). A failure is a `ScannerError("Cloud sanitization failed: ...")` and ends the preparation in `ERROR` before the cameras are touched. (The local photo directory is wiped at the start of `scan()`.)
   6. (checked in step 5)
   7. **Locks the brightness API** (`self.lights.lock_brightness()`) so operators cannot accidentally dim the lights mid-scan via `/lights/brightness` or `/lights/toggle`.
   8. Powers on the illumination if not already on.
-  9. Executes a **thermal stabilization loop** (`wait_for_light_stable()`) that monitors the optical drift of libcamera's auto-exposure metrics (`ExposureTime * AnalogueGain`). It waits for the LED strips to thermally plateau so exposure levels don't drift mid-scan.
-  10. **Re-calls `dual_cameras.prepare_scan(**kwargs, keep_running=True, lock_auto=True)`**: Because `picam2.started` is already `True`, stream reconfiguration is bypassed. With `focus="auto"` the sync driver first runs its autofocus sweep here (in front of the lit object) and leaves each lens on its sharpest position; then the cameras settle auto-exposure and auto-white-balance on the fully warmed-up object and the driver locks them (and copies the values to camera 2). `lock_auto` is passed only in this call, and only to drivers that accept it (`DualCameraRPISync`); a driver that rejects the keyword falls back to an unlocked recalibration with a warning.
+  9. Executes a **thermal stabilization loop** (`wait_for_light_stable()`) that monitors the optical drift of libcamera's auto-exposure metrics (`ExposureTime * AnalogueGain`). It waits for the LED strips to thermally plateau so exposure levels don't drift mid-scan. The drift is measured on camera 1 only (the two cameras see the same light).
+  10. **Re-calls `dual_cameras.prepare_scan(**kwargs, keep_running=True, lock_auto=True, copy_colour_gains=...)`**: Because `picam2.started` is already `True`, stream reconfiguration is bypassed. With `focus="auto"` the sync driver first runs its autofocus sweep here (in front of the lit object) and leaves each lens on its sharpest position; then the cameras settle auto-exposure and auto-white-balance on the fully warmed-up object and the driver locks them. Exposure time and analogue gain of camera 1 are copied to camera 2; the white-balance gains only with `copy_colour_gains=true` (default `false`: each camera keeps the gains its own AWB settled on, because the same gains give camera 2 a colour cast). `lock_auto` is passed only in this call, and only to drivers that accept it (`DualCameraRPISync`); a driver that rejects the keyword falls back to an unlocked recalibration with a warning.
   11. Transitions state:
      ```python
      with self._lock:
@@ -135,6 +135,7 @@ Triggered by `POST /scanner/start`, this method handles the physical 3D capture:
        - Calculates steps per jump (`angle_to_steps_conversion(angle)`) and shots per ring as `angle_to_steps(360, TURNTABLE_STEP_TYPE) // steps` (3200 // steps at 1/16), so 22.5 deg gives 16 shots and an angle that does not divide the turn is never rounded up to more than 360 deg.
        - Captures stereoscopic photo pair (`capture_photo()`; a driver `CaptureError` becomes a `ScannerError`).
        - **Verifies both files exist and are non-empty** (`ScannerError` otherwise), appends them to the manifest (written atomically) and only then enqueues them for upload (`_register_photos`).
+       - The **first pair of the scan** must not be black (mean luma below `BLACK_FRAME_MEAN_MAX` on a 1/8-size read): a closed lens cap, dead lights or a manual exposure of 0 end the scan at once with a `ScannerError` that names the camera and the reported exposure, instead of after 160 black photos. `SCAN_BLACK_FRAME_CHECK=0` turns the check off; without OpenCV the photo cannot be judged and passes.
        - Increments `self.total_photos += len(photo_paths)`.
        - Rotates turntable by `angle` inside `motion_guard()` (using a 20% constant-acceleration speed ramp by default to prevent heavy object slippage, ending in a slow tail of `turntable_end_delay` = `15 ms` per step so the platter has almost no kinetic energy left when it stops).
        - **ToF Verification**: After the rotation, calls `tof.probe_object(threshold)` (until the object has been seen on this ring). See "ToF policy" below and [TOF.md](TOF.md).
@@ -168,7 +169,11 @@ Slow Wi-Fi or transient socket errors must neither stall the scanner nor lose im
 | `UPLOAD_ATTEMPTS_PER_FILE` (`SCAN_UPLOAD_ATTEMPTS_PER_FILE`) | `8` | Failed attempts after which a file is **parked** |
 | `UPLOAD_PARK_RETRY_S` (`SCAN_UPLOAD_PARK_RETRY_S`) | `60` | A parked file gets one attempt per interval |
 | `UPLOAD_DRAIN_TIMEOUT_S` (`SCAN_UPLOAD_DRAIN_TIMEOUT_S`) | `1800` | Drain deadline, restarted by every successful upload |
+| `UPLOAD_BACKOFF_JITTER` (`SCAN_UPLOAD_BACKOFF_JITTER`) | `0.2` | Random spread of the backoff |
 | `MIN_FREE_DISK_MB` (`SCAN_MIN_FREE_DISK_MB`) | `2048` | Preflight disk space |
+| `CAPTURE_ATTEMPTS` (`SCAN_CAPTURE_ATTEMPTS`) | `3` | Attempts to take one photo pair |
+| `BLACK_FRAME_MEAN_MAX` (`SCAN_BLACK_FRAME_MEAN_MAX`, `SCAN_BLACK_FRAME_CHECK=0` disables) | `3.0` | Mean luma (0-255) below which a photo counts as black |
+| `Z_HOME_SETTLE_S` (`SCAN_Z_HOME_SETTLE_S`) | `1` | Pause on the bottom endstop after the homing of `finish_preparation` |
 
 1. **One worker, no head-of-line blocking**: a file that fails waits for its backoff *without* holding the files behind it. After 8 failed attempts it is parked (not dropped) and retried every 60 s; a later success clears it. A missing or 0-byte file fails immediately and permanently (no retry). Each attempt is `r2.upload_file(path, object_name=key)` (never raises, `False` on failure).
 2. **Bookkeeping**: `_pending` (still owed), `_uploaded`, `_upload_failed` (a `set` of failed or parked paths; the boolean view is the `upload_failed` property). A worker of an older scan cannot touch the new scan's sets (generation counter).
@@ -187,8 +192,14 @@ Written atomically (temp file + `os.replace`) after every photo pair and again a
 ```
 Exposure fields come from the camera driver's `last_capture_info` (null when unavailable). `complete` is true only after a successful verification.
 
+### Photo pairs are never half (`SCAN_CAPTURE_ATTEMPTS`)
+`_capture_turntable_slice` asks `capture_photo` for the pair of the current position. When it raises `CaptureError` (a missing frame, a file not written) the file of the camera that did succeed is deleted (`_discard_partial_pair`) and the pair is retaken at the same position (the turntable has not moved), up to `SCAN_CAPTURE_ATTEMPTS` times in total (default 3). After the last failure the scan stops with `ScannerError("Photo capture failed at level L, shot S (attempt N of N): ...")`. A pair is only registered in the manifest and queued for upload once both files are complete.
+
+### Who owns the rig (`scan_owns_rig`, manual sessions)
+`Scanner.scan_owns_rig` is true in the states `preparing`, `prepared` and `running`. The `/test` light and snap endpoints answer `409` then, and `DimmableLight.off(force=False)` (the form used by `/test/lights/disable`) refuses to lift the brightness lock; the scanner's own teardown calls `off()` (forced). A manual session started by `/test/stream/start` or `/test/camera/snap` (`setup_and_stream(preflight=False)`) sets `_manual_session`: it does not own the rig, and `stop_stream()` ends it (cameras released, lights off, state back to `IDLE`) so that `/scanner/prepare` is accepted again.
+
 ### ToF policy
-Per stop, `tof.probe_object(threshold)` (threshold = `TOF_BACKGROUND_DISTANCE_MM - TOF_CLEARANCE_MARGIN_MM`) answers `True` (object), `False` (backdrop seen with valid readings) or `None` (no valid reading). Ring verdict:
+Per stop, `tof.probe_object(threshold)` (threshold = `TOF_BACKGROUND_DISTANCE_MM`, 350 mm: a reading below it is the object, there is no extra margin) answers `True` (object), `False` (backdrop seen with valid readings) or `None` (no valid reading). Ring verdict:
 
 | Stops of the ring | Verdict | Effect |
 |---|---|---|
@@ -235,6 +246,12 @@ Called during normal teardown or error recovery (the hardware part is `_teardown
 
 ### Constructor & Properties
 
+#### Opening the hardware
+`Scanner.__init__` opens the ToF sensor, the two motors (and with them the Arduino bridge), the two endstops and the lights, in this order. If one of them fails (for example the PWM chip when `dtoverlay=pwm-2chan` is missing), `close_hardware()` releases the ones already opened before the error is raised: the GPIO pins, the I2C bus and the serial port do not stay claimed, so a new attempt in the same process (the lazy `_LazyScanner` of `router/scanner.py` builds the `Scanner` again on the next request) is not refused as "busy". A missing overlay still needs a reboot to take effect.
+
+#### Development mode
+With `MOCK_HARDWARE=1` (`main_dev.py`) the routers build `hardware.scanner_mock.ScannerMock`, a simulated rig with this class's API, states and status data; see the README.
+
 #### `Scanner(xvs: Optional[bool] = None, camera_mode: Optional[str] = None)`
 Initializes motion controllers, safety limit interrupts, LED illumination, and camera mode configuration.
 - **`camera_mode` Resolution Hierarchy**:
@@ -261,19 +278,19 @@ Raised by `scan()` when photos are missing from the bucket after the drain; `.mi
 Runs the preflight (skipped with `preflight=False`, which the manual `/test/stream/start` and `/test/camera/snap` use: they need no cloud), closes stale cameras, starts camera sensors using the resolved camera driver (`DualCameraRPISync`, `DualCameraXVS`, or `DualCamera`), boots the stream and returns stream URLs (`None` when a cancel landed meanwhile).
 
 #### `finish_preparation(**kwargs) -> None`
-Background worker for homing down, +30mm offset, R2 bucket cleanup, thermal stabilization, and in-place camera calibration (with `lock_auto=True`).
+Background worker for homing down, the `z_start_mm` climb (default 30 mm), R2 bucket cleanup, thermal stabilization, and in-place camera calibration (with `lock_auto=True`).
 
 #### `motion_guard() -> ContextManager`
 Non-blocking, re-entrant (per thread) exclusive right to move the rig. Raises `ScannerBusyError` immediately when another thread holds it. Used by `move_z_up`/`move_z_down`, `home_z_axis`, `move_z_to_top` and the turntable rotation of a ring; external callers (the `/test` router) wrap their own moves in it.
 
 #### Module constants
-`Z_TRAVEL_MAX_MM` (the usable Z travel of the rod, set per rig: currently `475`) and `Z_HOMING_MARGIN_MM = 15`: homing and move-to-top are limited to their sum (490 mm = **49000 steps** at 1/4 microstepping, 100 steps/mm). The schema limit of a single move (`Z_DISTANCE_MAX_MM` in `schemas/scanner.py`) is separate.
+`Z_TRAVEL_MAX_MM` (the usable Z travel of the rod, set per rig: currently `475`) and `Z_HOMING_MARGIN_MM = 15`: homing and move-to-top are limited to their sum (490 mm = **49000 steps** at 1/4 microstepping, 100 steps/mm). Both live in `hardware/rig_limits.py`; the longest single move a request may ask for (`Z_DISTANCE_MAX_MM` in `schemas/scanner.py`) is the travel itself, 475 mm.
 
 #### `home_z_axis(delay: float = Z_PREPARE_DELAY_S, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = False) -> None`
-Drives carriage downward in acceleration-controlled pulses until `down_endstop` triggers, for at most 16500 steps. The coils are released right away after the endstop STOP (the STOP already disabled the driver, so there is no extra settling pause on that path). The default is constant speed (`acceleration=False`, `delay = Z_PREPARE_DELAY_S = 0.0010`, the same profile as the manual z-move); `acceleration=True` ramps from `start_delay` (`ramp_percent` of the move). The +30 mm climb of `finish_preparation` uses the same constant profile. Raises `ScannerError` when the endstop was not reached (aborted or cancelled move, or the travel budget ran out) and `ScannerBusyError` if another motion is in progress; motor/serial errors are propagated, not swallowed.
+Drives carriage downward until `down_endstop` triggers, for at most 49000 steps (490 mm). The coils are released right away after the endstop STOP (the STOP already disabled the driver, so there is no extra settling pause on that path). The default is constant speed (`acceleration=False`, `delay = Z_PREPARE_DELAY_S = 0.0010`, the same profile as the manual z-move); `acceleration=True` ramps from `start_delay` (`ramp_percent` of the move). The `z_start_mm` climb of `finish_preparation` (default 30 mm) uses the same constant profile. Raises `ScannerError` when the endstop was not reached (aborted or cancelled move, or the travel budget ran out) and `ScannerBusyError` if another motion is in progress; motor/serial errors are propagated, not swallowed.
 
 #### `move_z_to_top(delay: float = Z_PREPARE_DELAY_S, start_delay: float = 0.004, ramp_percent: float = 0.1, acceleration: bool = False) -> None`
-Drives carriage upward until `up_endstop` triggers (same 16500-step budget), after which the coils are released (no extra settling pause on this path: the endstop STOP already disabled the driver). Raises `ScannerError` when the endstop was not reached.
+Drives carriage upward until `up_endstop` triggers (same 49000-step budget), after which the coils are released (no extra settling pause on this path: the endstop STOP already disabled the driver). Raises `ScannerError` when the endstop was not reached.
 
 #### `move_z_up_distance(distance: float = 100.0, delay: float = 0.002, ...) -> bool`
 Moves carriage UP by distance in millimeters. Blocked if top limit switch is active; `ScannerBusyError` if another motion is in progress; returns `False` (nothing sent) when a cancel applies.
@@ -286,12 +303,12 @@ Executes full physical scanning and parallel image upload sequence with independ
 * `turntable_end_delay`: step delay (s) at the end of each turntable deceleration (slow stop), clamped to `[0.005, 0.030]`; `None` disables it. Default `0.015`.
 * `z_end_delay`: same for the Z-axis; `None` (default) disables it.
 * `finish_state`: state left after a scan that completed normally **and was verified** (default `idle`). The state stays `RUNNING` until the drain and verification are done, then goes straight to `finish_state`: the API passes `processing`, so there is no `idle` gap in which a new `/scanner/prepare` could be accepted before the cloud pipeline starts. The end-delay tail is dropped automatically when the matching `*_acceleration` is `false`.
-* After the `+30 mm` start-position move in `finish_preparation()` the Z driver is released (the lead screw holds the carriage), so it is not energized at 1.8 A while waiting for `/scanner/start`.
+* After the `z_start_mm` start-position move in `finish_preparation()` the Z driver is released (the lead screw holds the carriage), so it is not energized at 1.8 A while waiting for `/scanner/start`.
 * A climb that ends exactly on the top switch now takes the final top ring; a cancel that tears the hardware down under the scan thread ends the scan quietly instead of raising.
 * `move_z_up()` / `move_z_down()` and the `move_z_*_distance()` helpers accept `end_delay` as well (default `None`).
 
 #### `generate_livestream() -> list[str] | None`
-Starts the preview pipeline of the active camera driver and returns its URLs (`/test/stream/mjpeg?camera=1|2` for `DualCameraRPISync`).
+Starts the preview pipeline of the active camera driver and returns its URLs (`/scanner/stream/mjpeg?camera=1|2` for `DualCameraRPISync`).
 
 #### `stop_stream() -> None`
 Terminates the preview stream and releases camera hardware locks.

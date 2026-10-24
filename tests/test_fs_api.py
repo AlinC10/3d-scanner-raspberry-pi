@@ -268,7 +268,7 @@ def _load_router(scanner, r2=None):
 
     fake_schemas = types.ModuleType("schemas.scanner")
     for name in ("PrepareRequest", "PrepareResponse", "StartRequest", "StartResponse", "CancelResponse",
-                 "StatusResponse"):
+                 "StatusResponse", "StreamActiveRequest", "StreamQualityRequest"):
         setattr(fake_schemas, name, type(name, (_Kwargs,), {}))
 
     router_pkg = types.ModuleType("router")
@@ -662,10 +662,10 @@ class TestStatusFields(_RouterCase):
 
 
 class TestPrepare(_RouterCase):
-    def _req(self, brightness=0.5):
+    def _req(self, brightness=0.5, z_start_mm=30.0):
         camera = SimpleNamespace(model_dump=lambda: {"quality": 95})
         return SimpleNamespace(enable_stream=True, bitrate=2_000_000, illumination_brightness=brightness,
-                               camera_config=camera)
+                               z_start_mm=z_start_mm, camera_config=camera)
 
     def test_refused_state_does_not_touch_the_brightness(self):
         for state in (_State.RUNNING, _State.PREPARED, _State.PREPARING, _State.PROCESSING):
@@ -692,6 +692,15 @@ class TestPrepare(_RouterCase):
         self.assertEqual(len(self.scanner.setup_calls), 1)
         tasks.add_task.assert_called_once()
         self.assertEqual(out.status, "accepted")
+
+    def test_z_start_goes_to_finish_preparation_beside_the_camera_settings(self):
+        self.scanner.state = _State.IDLE
+        tasks = MagicMock()
+        self.mod.prepare_scan(self._req(z_start_mm=12.5), tasks)
+        worker_kwargs = tasks.add_task.call_args.args[1]
+        self.assertEqual(worker_kwargs, {"quality": 95, "z_start_mm": 12.5})
+        # the camera settings given to setup_and_stream() do not carry it
+        self.assertNotIn("z_start_mm", self.scanner.setup_calls[0])
 
     def test_conflict_error_from_the_scanner_is_409_not_500(self):
         self.scanner.state = _State.IDLE

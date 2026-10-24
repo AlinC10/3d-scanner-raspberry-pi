@@ -3,9 +3,10 @@ from enum import Enum
 from typing import Literal, Annotated, Optional
 import logging
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app_paths import TEST_SNAPS_DIR
+from router import scanner as scanner_api
 from router.scanner import scanner, ScannerState
 from hardware.endstop import TopEndstopTriggered, BottomEndstopTriggered
 from hardware.scanner import ScannerError
@@ -34,6 +35,18 @@ def _require_motors_free() -> None:
         )
 
 
+def _require_lights_free() -> None:
+    """
+    The lights belong to the scan from /scanner/prepare until the scan ends (states preparing / prepared / running):
+    a manual switch-off or dimming would ruin the photos. A manual /test stream session does not count.
+    """
+    if getattr(scanner, "scan_owns_rig", False) is True:
+        raise HTTPException(
+            status_code=409,
+            detail=f"The lights are controlled by the scan (state: {scanner.state}). Cancel it with POST /scanner/cancel first."
+        )
+
+
 def _motion_busy() -> HTTPException:
     """409 for a motion request that arrives while another motion (Z move, rotation, homing) is still running."""
     return HTTPException(
@@ -51,22 +64,6 @@ class MotorTarget(str, Enum):
 
 
 from schemas.scanner import ZMoveRequest, TurntableRotateRequest
-
-class StreamActiveRequest(BaseModel):
-    camera_id: Annotated[int, Field(
-        ge=1,
-        le=2,
-        description="Camera ID to display in preview (1 for cam1, 2 for cam2)."
-    )]
-
-
-class StreamQualityRequest(BaseModel):
-    quality: Annotated[int, Field(
-        ge=1,
-        le=100,
-        description="JPEG compression quality (1 to 100)."
-    )]
-
 
 class BrightnessRequest(BaseModel):
     brightness: Annotated[float, Field(
@@ -127,6 +124,7 @@ def test_lights_enable(req: BrightnessRequest = BrightnessRequest(brightness=1.0
     """
     Turns on the LED illumination panels (via GPIO relay).
     """
+    _require_lights_free()
     try:
         scanner.lights.set_brightness(req.brightness)
         scanner.lights.on()
@@ -147,8 +145,9 @@ def test_lights_disable():
     """
     Turns off the LED illumination panels.
     """
+    _require_lights_free()
     try:
-        scanner.lights.off()
+        scanner.lights.off(force=False)
         return {
             "status": "success",
             "state": "disabled",
@@ -372,7 +371,7 @@ def test_turntable_rotate(req: TurntableRotateRequest):
 def test_stream_start():
     """
     Initializes the dual cameras and the lights and starts the MJPEG live preview.
-    Returns the preview URLs (`/test/stream/mjpeg?camera=1|2`), which can be used as `<img src>`.
+    Returns the preview URLs (`/scanner/stream/mjpeg?camera=1|2`), which can be used as `<img src>`.
 
     A pure hardware test: it does not touch Cloudflare R2, the ToF sensor or the disk-space check that
     `POST /scanner/prepare` runs first.
@@ -422,143 +421,41 @@ def test_stream_status():
     }
 
 
-@router.get("/stream/mjpeg")
-def test_stream_mjpeg(
-    camera: Annotated[Optional[int], Query(ge=1, le=2, description="Optional camera index (1 or 2) to activate")] = None
+# The preview endpoints are the ones of /scanner (router/scanner.py), registered here too under /test/stream/*, so
+# there is one implementation to fix. They also take the camera / quality as a query parameter or a JSON body.
+for _path, _methods, _endpoint in (
+    ("/stream/mjpeg", ["GET"], scanner_api.scanner_stream_mjpeg),
+    ("/stream/active", ["POST"], scanner_api.scanner_stream_switch_active),
+    ("/stream/quality", ["POST"], scanner_api.scanner_stream_set_quality),
+    ("/stream/sync-status", ["GET"], scanner_api.scanner_stream_sync_status),
 ):
-    """
-    Streams multipart MJPEG video directly from the active camera to browser <img> elements.
-    Accepts optional camera query parameter (1 or 2) to switch active view on connection.
-    Only encodes JPEGs on demand while viewers are connected.
-    """
-    if scanner.dual_cameras is None or not getattr(scanner, "is_streaming", False):
-        raise HTTPException(
-            status_code=400,
-            detail="Cameras are not streaming. Call /test/stream/start first."
-        )
-
-    if camera is not None and hasattr(scanner.dual_cameras, "active_camera"):
-        scanner.dual_cameras.active_camera = camera
-
-    cam_idx = (camera - 1) if camera in (1, 2) else getattr(scanner.dual_cameras, "active", 0)
-
-    def frame_generator():
-        if hasattr(scanner.dual_cameras, "add_spectator"):
-            scanner.dual_cameras.add_spectator(cam_idx)
-        try:
-            last_id = -1
-            while getattr(scanner, "is_streaming", False):
-                if not hasattr(scanner.dual_cameras, "wait_jpeg"):
-                    break
-                frame_id, frame_bytes = scanner.dual_cameras.wait_jpeg(cam_idx, last_id, timeout=1.0)
-                if frame_bytes and frame_id != last_id:
-                    last_id = frame_id
-                    yield (
-                        b"--FRAME\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
-                        + frame_bytes + b"\r\n"
-                    )
-        finally:
-            if hasattr(scanner.dual_cameras, "remove_spectator"):
-                scanner.dual_cameras.remove_spectator(cam_idx)
-
-    return StreamingResponse(
-        frame_generator(),
-        media_type="multipart/x-mixed-replace; boundary=FRAME"
-    )
-
-
-@router.post("/stream/active")
-def test_stream_switch_active(
-    camera_id: Annotated[Optional[int], Query(ge=1, le=2, description="Camera ID (1 or 2)")] = None,
-    req: Optional[StreamActiveRequest] = None,
-):
-    """
-    Switches active preview camera (1 for cam1, 2 for cam2) with zero latency.
-    """
-    target_id = camera_id if camera_id is not None else (req.camera_id if req is not None else None)
-    if target_id is None:
-        raise HTTPException(status_code=400, detail="Must provide camera_id via query param or JSON body.")
-
-    if scanner.dual_cameras is None:
-        raise HTTPException(status_code=400, detail="Cameras are not initialized.")
-
-    if not hasattr(scanner.dual_cameras, "active_camera"):
-        raise HTTPException(status_code=400, detail="Active camera switching not supported by current camera driver.")
-
-    scanner.dual_cameras.active_camera = target_id
-    return {
-        "status": "success",
-        "active_camera": scanner.dual_cameras.active_camera,
-        "message": f"Switched preview to camera {target_id}."
-    }
-
-
-@router.post("/stream/quality")
-def test_stream_set_quality(
-    quality: Annotated[Optional[int], Query(ge=1, le=100, description="Quality 1-100")] = None,
-    req: Optional[StreamQualityRequest] = None,
-):
-    """
-    Dynamically updates live JPEG compression quality (1-100) on active stream.
-    """
-    target_quality = quality if quality is not None else (req.quality if req is not None else None)
-    if target_quality is None:
-        raise HTTPException(status_code=400, detail="Must provide quality via query param or JSON body.")
-
-    if scanner.dual_cameras is None:
-        raise HTTPException(status_code=400, detail="Cameras are not initialized.")
-
-    try:
-        from hardware.dual_camera_rpi_sync import DualCameraRPISync
-        is_rpi_sync = isinstance(scanner.dual_cameras, DualCameraRPISync)
-    except Exception:
-        is_rpi_sync = False
-
-    if is_rpi_sync:
-        scanner.dual_cameras.stream_quality = target_quality
-        current_q = scanner.dual_cameras.stream_quality
-    else:
-        scanner.dual_cameras.quality = target_quality
-        current_q = scanner.dual_cameras.quality
-
-    return {
-        "status": "success",
-        "quality": current_q,
-        "message": f"Updated stream quality to {target_quality}."
-    }
-
-
-@router.get("/stream/sync-status")
-def test_stream_sync_status():
-    """
-    Returns hardware/software synchronization diagnostics (SyncReady, offsets, framerates, drops).
-    """
-    if scanner.dual_cameras is None:
-        raise HTTPException(status_code=400, detail="Cameras are not initialized.")
-
-    if hasattr(scanner.dual_cameras, "get_sync_status"):
-        return scanner.dual_cameras.get_sync_status()
-
-    return {
-        "ready": True,
-        "is_streaming": scanner.is_streaming,
-        "mode": scanner.dual_cameras.__class__.__name__
-    }
+    router.add_api_route(_path, _endpoint, methods=_methods)
 
 
 @router.post("/camera/snap")
 def test_camera_snap():
     """
-    Captures a single synchronized photo pair from both cameras to verify capture functionality.
-    Initializes cameras first if not currently running.
+    Captures a single synchronized photo pair from both cameras to verify capture functionality. The two photos are
+    saved in the `test_snaps/` folder of the project (`snap_<date>_<time>_cam1.jpg` and `_cam2.jpg`).
+    Initializes cameras first if not currently running, and releases them again afterwards when it started them
+    (the scanner returns to IDLE). Refused while a scan owns the cameras.
     """
+    if getattr(scanner, "scan_owns_rig", False) is True:
+        raise HTTPException(
+            status_code=409,
+            detail=f"The cameras belong to the scan (state: {scanner.state}). Cancel it with POST /scanner/cancel first."
+        )
+    started_here = scanner.dual_cameras is None
     try:
-        if scanner.dual_cameras is None:
+        if started_here:
             scanner.setup_and_stream(enable_stream=False, preflight=False)
 
-        photo_paths = scanner.dual_cameras.capture_photo()
+        # test_snaps/snap_<date>_<time>_cam1.jpg and _cam2.jpg: easy to tell from scan photos, never overwritten
+        photo_paths = scanner.dual_cameras.capture_photo(
+            output_prefix=time.strftime("snap_%Y%m%d_%H%M%S"),
+            output_dir=str(TEST_SNAPS_DIR),
+            meshroom_rig=False,
+        )
         return {
             "status": "success",
             "photo_paths": photo_paths,
@@ -566,6 +463,9 @@ def test_camera_snap():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Camera snap failed: {str(e)}")
+    finally:
+        if started_here:
+            scanner.stop_stream()
 
 
 # ── 7. Full Hardware Reset & Cleanup ─────────────────────────────────────────

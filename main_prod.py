@@ -8,6 +8,7 @@ import router.library
 import router.scanner
 import router.test
 
+from app_paths import frontend_directory
 from system.exception import SystemConnectionError
 
 log = logging.getLogger(__name__)
@@ -48,4 +49,20 @@ routers = [router.system, router.ai, router.library, router.scanner, router.test
 for router in routers:
     app.include_router(router.router)
 
-app.frontend("/", directory="../3d-scanner-front-end")
+# The front-end is located from this file (or FRONTEND_DIR), not from the current directory. A missing folder is a
+# warning: the API still works, only the UI at "/" is absent.
+_frontend_dir = frontend_directory()
+if _frontend_dir.is_dir():
+    app.frontend("/", directory=str(_frontend_dir))
+else:
+    log.warning("Front-end folder %s does not exist: serving the API only (set FRONTEND_DIR to its location).",
+                _frontend_dir)
+
+
+if __name__ == "__main__":
+    # `python main_prod.py`: the scanner is meant to be reached only from the Pi itself, so the server listens on the
+    # loopback address and is not visible in the network. (`fastapi dev` does the same; `fastapi run` listens on
+    # 0.0.0.0 unless `--host 127.0.0.1` is given.)
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

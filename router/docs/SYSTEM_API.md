@@ -2,7 +2,7 @@
 
 The System Router (`../system`) provides REST APIs to configure and manage the Raspberry Pi's host-level network interfaces and connectivity: **Wi-Fi**, **Bluetooth**, and **Ethernet**.
 
-Interactive OpenAPI documentation is accessible at: `http://<pi-ip>:8000/docs`
+Interactive OpenAPI documentation is accessible at: `http://127.0.0.1:8000/docs`
 
 ---
 

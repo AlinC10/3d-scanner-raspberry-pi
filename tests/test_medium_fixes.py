@@ -36,6 +36,9 @@ class _APIRouter:
 
     get = post = put = delete = _decorator
 
+    def add_api_route(self, *args, **kwargs):
+        pass
+
 
 def _web_stubs():
     """tests/__init__.py replaces pydantic/fastapi with MagicMocks; the routers need importable stand-ins."""
@@ -302,6 +305,9 @@ class TestTestRouterGuard(unittest.TestCase):
         fake_router_scanner = types.ModuleType("router.scanner")
         fake_router_scanner.scanner = self.scanner
         fake_router_scanner.ScannerState = _State
+        for _name in ("scanner_stream_mjpeg", "scanner_stream_switch_active", "scanner_stream_set_quality",
+                      "scanner_stream_sync_status"):
+            setattr(fake_router_scanner, _name, lambda *args, **kwargs: None)
 
         fake_hw_scanner = types.ModuleType("hardware.scanner")
         fake_hw_scanner.ScannerError = type("ScannerError", (Exception,), {})
@@ -404,7 +410,8 @@ class TestStartIsAtomic(unittest.TestCase):
         fake_mock_mod.ScannerState = _State
 
         fake_schemas = types.ModuleType("schemas.scanner")
-        for name in ("PrepareRequest", "PrepareResponse", "StartResponse", "CancelResponse", "StatusResponse"):
+        for name in ("PrepareRequest", "PrepareResponse", "StartResponse", "CancelResponse", "StatusResponse",
+                     "StreamActiveRequest", "StreamQualityRequest"):
             setattr(fake_schemas, name, type(name, (_Response,), {}))
         fake_schemas.StartRequest = _StartRequest
 

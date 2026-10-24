@@ -71,13 +71,27 @@ class ToFSensor:
                 finally:
                     self.i2c = None
 
+    def _wait_for_measurement(self) -> bool:
+        """Waits until the sensor has a finished measurement; False when none arrives within two budgets."""
+        deadline = time.monotonic() + (2 * self._timing_budget_ms + 100) / 1000.0
+        while not self.sensor.data_ready:
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
     def read_distance_mm(self) -> Optional[float]:
         """
-        Returns the distance in mm of a fresh measurement (taken after this call started
-        waiting, so it blocks for up to one timing budget), or None when there is no valid
+        Returns the distance in mm of a fresh measurement, or None when there is no valid
         reading: sensor not available (returns immediately), invalid range status (no target,
         signal too weak, out of range), timeout, or any driver/I2C error.
         None means "unknown", never "no object": the empty backdrop is itself a valid reading.
+
+        Fresh means that the whole measurement was taken after this call started. The sensor ranges on its own, back
+        to back, whether or not it is read, so when the call starts a measurement is already running and began up to
+        one timing budget earlier. clear_interrupt() only drops a result that is already finished; the running one
+        still completes afterwards, so it is waited for and dropped too, and the reading comes from the next one.
+        The call therefore blocks for up to two timing budgets.
         """
         if not self.available:
             return None
@@ -87,15 +101,17 @@ class ToFSensor:
             if not self.available or self.sensor is None:
                 return None
             try:
-                # Discard the sample that is already waiting, it may predate the last move
+                # Discard the finished sample that is already waiting, it may predate the last move ...
                 self.sensor.clear_interrupt()
-
-                deadline = time.monotonic() + (2 * self._timing_budget_ms + 100) / 1000.0
-                while not self.sensor.data_ready:
-                    if time.monotonic() > deadline:
-                        log.warning("ToF read timed out waiting for a measurement.")
-                        return None
-                    time.sleep(0.005)
+                # ... and the measurement that is running right now: it started before this call
+                if not self._wait_for_measurement():
+                    log.warning("ToF read timed out waiting for a measurement.")
+                    return None
+                self.sensor.clear_interrupt()
+                # The next one started after this call: this is the reading
+                if not self._wait_for_measurement():
+                    log.warning("ToF read timed out waiting for a measurement.")
+                    return None
 
                 dist_cm = self.sensor.distance
                 self.sensor.clear_interrupt()

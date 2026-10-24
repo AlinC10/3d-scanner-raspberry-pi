@@ -53,6 +53,8 @@ class DualCamera(BaseDualCamera):
             preview_size=preview_size,
             rotation1=rotation1,
             rotation2=rotation2,
+            stream_size=kwargs.pop("stream_size", None),
+            stream_quality=kwargs.pop("stream_quality", 80),
         )
 
         log.info("Initializing DualCamera (CSI %d and %d)", camera_id1, camera_id2)
@@ -78,11 +80,14 @@ class DualCamera(BaseDualCamera):
 
     # ── Abstract Contract Implementation ───────────────────────
 
-    def prepare_scan(self, **kwargs) -> List[dict]:
+    def prepare_scan(self, *, lock_auto: bool = False, copy_colour_gains: bool = False, **kwargs) -> List[dict]:
         """
         Prepare and lock both cameras for scanning.
         Enforces a 0.15s stagger between cam1 and cam2 thread execution to prevent
         VideoCore ISP memory allocation collisions.
+
+        ``lock_auto`` and ``copy_colour_gains`` are part of the shared interface and are ignored here: this driver
+        locks AE/AWB inside every call and always copies cam1's values to cam2.
         """
         kw1, kw2 = self._split_camera_kwargs(kwargs)
 
