@@ -536,6 +536,84 @@ curl -X GET http://localhost:8000/scanner/stream/sync-status
 
 ---
 
+## 9. Autonomous Facial Capture (`POST /scanner/face/capture`)
+
+Executes autonomous facial scanning, mechatronic auto-framing, vibration damping, synchronized 12.3MP stereo photo capture, and Cloudflare R2 cloud upload.
+
+### Request Body (`FaceCaptureRequest`)
+
+```json
+{
+  "strategy": "sweep_best_score",
+  "start_z_mm": 180.0,
+  "search_range_mm": 150.0,
+  "step_mm": 8.0,
+  "manual_z": null,
+  "home": true,
+  "upload_r2": true,
+  "illumination_brightness": 0.5,
+  "settle_s": 0.150
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `strategy` | `string` | `"sweep_best_score"` | `"sweep_best_score"` (sweeps full range and returns to apex) or `"direct_stop"` (stops as soon as face is vertically centered). |
+| `start_z_mm` | `float` | `180.0` | Initial rapid carriage climb height in mm (100.0 to 350.0) before starting framing evaluations. |
+| `search_range_mm` | `float` | `150.0` | Vertical search window in mm (10.0 to 250.0) above `start_z_mm`. Total travel must not exceed 475.0 mm. |
+| `step_mm` | `float` | `8.0` | Vertical climb increment between evaluations (must be whole Z motor steps). |
+| `manual_z` | `float \| null` | `null` | Optional manual target height in mm (`200.0` to `475.0`). Skips auto-framing search when provided. |
+| `home` | `bool` | `true` | Performs homing to bottom limit switch (GPIO 4, Z=0.0 mm) before moving. |
+| `upload_r2` | `bool` | `true` | Enqueues captured photo pair to Cloudflare R2 background upload queue and verifies against the bucket. |
+| `illumination_brightness` | `float` | `0.5` | Chamber LED PWM brightness level (0.0 to 1.0; 0.5 = 50% duty cycle to avoid blinding subject). |
+| `settle_s` | `float` | `0.150` | Damping settle time in seconds before taking the 12.3MP photo pair. |
+
+### Mechanical & Auto-Framing Workflow
+
+1. **Safety & Motion Guard**: Validates that no overlapping motion is active (`motion_guard()`). Checks that scanner is in an allowed state (`idle`, `completed`, `cancelled`, `error`, `prepared`).
+2. **Turntable**: Remained disabled / unenergized throughout facial scanning.
+3. **Lighting**: Sets LED brightness to `illumination_brightness` (0.5) and locks brightness.
+4. **Homing**: Carriage homes down to the bottom endstop (Z = 0.0 mm).
+5. **Framing Sweep**:
+   - If `manual_z` is given, climbs directly from 0.0 mm to `manual_z`.
+   - If `manual_z is null`: climbs rapidly to `start_z_mm` (180.0 mm), then steps upward by `step_mm` (8.0 mm). At each step, evaluates in-memory lores frames using `StereoFramingAnalyzer` (MediaPipe FaceLandmarker), computing composite vertical centering, size, and cheek profile visibility scores.
+6. **Anti-Backlash Compensation**: If the carriage ended above the optimal height $Z_{\text{best}}$, it descends to $(Z_{\text{best}} - 3.0\text{ mm})$ and climbs $+3.0\text{ mm}$ to $Z_{\text{best}}$, loading the lead screw against gravity.
+7. **Synchronized 12.3MP Capture**: After `settle_s` pause, captures synchronized still photo pair saved to `input_images/rig/0/f_{Z}.jpg` and `input_images/rig/1/f_{Z}.jpg` with photogrammetry EXIF metadata.
+8. **Cloud Upload & Verification**: If `upload_r2` is `true`, dispatches to upload worker, drains queue, and verifies files in the R2 bucket.
+9. **Teardown**: De-energizes Z motor coils, turns off lights, and returns HTTP 200.
+
+### Response Body (`FaceCaptureResponse`, `200 OK`)
+
+```json
+{
+  "status": "success",
+  "message": "Face capture completed successfully",
+  "optimal_z_mm": 240.0,
+  "best_score": 1.85,
+  "photos": [
+    "/home/alin/Desktop/3d-scanner-raspberry-pi/input_images/rig/0/f_240.jpg",
+    "/home/alin/Desktop/3d-scanner-raspberry-pi/input_images/rig/1/f_240.jpg"
+  ],
+  "r2_uploaded": true
+}
+```
+
+### Example `curl`
+
+```bash
+# Autonomous face capture with auto-framing
+curl -X POST http://localhost:8000/scanner/face/capture \
+  -H "Content-Type: application/json" \
+  -d '{"strategy": "sweep_best_score", "illumination_brightness": 0.5}'
+
+# Manual height positioning at 230 mm
+curl -X POST http://localhost:8000/scanner/face/capture \
+  -H "Content-Type: application/json" \
+  -d '{"manual_z": 230.0, "upload_r2": true}'
+```
+
+---
+
 ## Frontend Integration Pattern (JavaScript / TypeScript)
 
 ```typescript

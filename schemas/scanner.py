@@ -465,3 +465,85 @@ class StreamQualityRequest(BaseModel):
         le=100,
         description="JPEG compression quality (1 to 100)."
     )]
+
+
+class FaceCaptureRequest(BaseModel):
+    """Configuration for autonomous facial capture with mechatronic auto-framing."""
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_defaults_as_example)
+
+    strategy: Annotated[Literal["sweep_best_score", "direct_stop"], Field(
+        description="Framing strategy: 'sweep_best_score' (sweep and return to apex) or 'direct_stop' (stop on center)."
+    )] = "sweep_best_score"
+
+    start_z_mm: Annotated[float, Field(
+        ge=100.0,
+        le=350.0,
+        description="Initial carriage climb height in mm before starting auto-framing search."
+    )] = 180.0
+
+    search_range_mm: Annotated[float, Field(
+        ge=10.0,
+        le=250.0,
+        description="Vertical search window in mm above start_z_mm (default: 150.0 mm)."
+    )] = 150.0
+
+    step_mm: Annotated[float, Field(
+        ge=1.0,
+        le=25.0,
+        description="Climb step in mm between MediaPipe framing evaluations (must be whole Z motor steps)."
+    )] = 8.0
+
+    manual_z: Annotated[float | None, Field(
+        ge=200.0,
+        le=Z_DISTANCE_MAX_MM,
+        description="Optional manual target height in mm (>= 200 mm). Skips auto-framing when set."
+    )] = None
+
+    home: Annotated[bool, Field(
+        description="Perform homing to bottom limit switch (GPIO 4) before moving."
+    )] = True
+
+    upload_r2: Annotated[bool, Field(
+        description="Automatically enqueue and verify captured photos in Cloudflare R2 bucket."
+    )] = True
+
+    illumination_brightness: Annotated[float, Field(
+        gt=0.0,
+        le=1.0,
+        description="Chamber LED illumination PWM brightness level (default: 0.5 = 50%)."
+    )] = 0.5
+
+    settle_s: Annotated[float, Field(
+        ge=0.05,
+        le=2.0,
+        description="Mechanical settling delay in seconds before taking the photo."
+    )] = 0.150
+
+    @field_validator("step_mm")
+    @classmethod
+    def _validate_step_mm(cls, value: float) -> float:
+        try:
+            distance_to_steps(value, step_type=Z_STEP_TYPE)
+        except MotorError as e:
+            raise ValueError(f"step_mm is not reachable with Z motor steps: {e}")
+        return value
+
+    @model_validator(mode="after")
+    def _check_travel_bounds(self) -> "FaceCaptureRequest":
+        if self.manual_z is None:
+            if self.start_z_mm + self.search_range_mm > Z_DISTANCE_MAX_MM:
+                raise ValueError(
+                    f"start_z_mm ({self.start_z_mm}) + search_range_mm ({self.search_range_mm}) "
+                    f"exceeds maximum Z travel ({Z_DISTANCE_MAX_MM} mm)."
+                )
+        return self
+
+
+class FaceCaptureResponse(BaseModel):
+    """Response returned upon successful completion of facial capture sequence."""
+    status: str = "success"
+    message: str = "Face capture completed successfully"
+    optimal_z_mm: float | None = None
+    best_score: float | None = None
+    photos: list[str] = []
+    r2_uploaded: bool = False

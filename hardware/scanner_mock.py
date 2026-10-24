@@ -17,14 +17,14 @@ import random
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any, Dict
 
 from hardware.lights import LightLockedError
 from hardware.motor import TURNTABLE_STEP_TYPE, Z_STEP_TYPE, angle_to_steps, distance_to_steps
 # The real states and phases: the routers compare against them, so the mock must not have its own
 from hardware.scanner import (
     ScannerState, ScanPhase, ScannerError, ScannerBusyError, ScannerUploadError,
-    Z_TRAVEL_MAX_MM, Z_START_DEFAULT_MM,
+    Z_TRAVEL_MAX_MM, Z_START_DEFAULT_MM, INPUT_IMAGES_DIR,
 )
 
 log = logging.getLogger(__name__)
@@ -239,6 +239,9 @@ class _FakeCameras:
         self.last_capture_info = {"paths": paths, "cameras": [{}, {}]}
         return paths
 
+    def get_latest_lores_frames(self, timeout=1.0, fresh=False):
+        return None, None
+
     def stop_stream(self):
         pass
 
@@ -276,6 +279,7 @@ class ScannerMock:
         # status data read by GET /scanner/status
         self.stream_urls = None
         self.total_photos = 0
+        self.images_dir = INPUT_IMAGES_DIR
         self._reset_status()
 
     # ── status ────────────────────────────────────────────────────────────────
@@ -435,6 +439,152 @@ class ScannerMock:
             self.state = finish_state
             self._set_phase(ScanPhase.DONE)
         self._teardown()
+
+    def face_scan(
+        self,
+        strategy: str = "sweep_best_score",
+        start_z_mm: float = 180.0,
+        search_range_mm: float = 150.0,
+        step_mm: float = 8.0,
+        manual_z: Optional[float] = None,
+        home: bool = True,
+        upload_r2: bool = True,
+        illumination_brightness: float = 0.5,
+        settle_s: float = 0.150,
+        finish_state: str = ScannerState.IDLE,
+        analyzer: Optional[Any] = None,
+    ) -> dict:
+        """Simulated face scan: homes, sweeps or climbs directly, compensates backlash, and captures mock photos."""
+        with self._lock:
+            if self._stopping:
+                raise ScannerStoppingError("Cannot start face scan. An emergency stop is still in progress.")
+            if self.state in (ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING, ScannerState.DOWNLOADING):
+                raise ScannerBusyError(f"Cannot start face scan. Scanner is currently {self.state}")
+
+            if manual_z is not None:
+                if manual_z < 200.0 or manual_z > Z_TRAVEL_MAX_MM:
+                    raise ValueError(f"manual_z must be between 200.0 mm and {Z_TRAVEL_MAX_MM} mm (got {manual_z})")
+            else:
+                if start_z_mm + search_range_mm > Z_TRAVEL_MAX_MM:
+                    raise ValueError(
+                        f"start_z_mm ({start_z_mm}) + search_range_mm ({search_range_mm}) "
+                        f"exceeds maximum Z travel ({Z_TRAVEL_MAX_MM} mm)"
+                    )
+
+            self.z_axis_motor.distance_to_step_conversion(step_mm)
+            self._cancel_event.clear()
+            self.state = ScannerState.RUNNING
+            self._reset_status()
+            self._set_phase(ScanPhase.SCANNING)
+
+        images_dir = str(self.images_dir)
+        paths = []
+        target_z = 0.0
+        best_score = None
+
+        try:
+            with self.motion_guard():
+                self.lights.set_brightness(illumination_brightness)
+                self.lights.on()
+                self.turntable_motor.disable()
+
+                if self.dual_cameras is None:
+                    self.dual_cameras = _FakeCameras()
+
+                if home:
+                    self.home_z_axis()
+
+                if manual_z is not None:
+                    target_z = float(manual_z)
+                    climb = target_z - self.z_mm
+                    if climb > 0:
+                        self.move_z_up_distance(climb)
+                    best_score = None
+                else:
+                    climb_to_start = start_z_mm - self.z_mm
+                    if climb_to_start > 0:
+                        self.move_z_up_distance(climb_to_start)
+
+                    simulated_apex_z = 240.0
+                    best_score = -1.0
+                    best_z = self.z_mm
+                    max_z = start_z_mm + search_range_mm
+
+                    while self.z_mm <= max_z and not self.up_endstop.is_active:
+                        if self._cancel_event.is_set():
+                            break
+                        dist = abs(self.z_mm - simulated_apex_z)
+                        sim_score = max(0.1, 1.85 - (dist / 40.0) * 1.5)
+                        if analyzer is not None:
+                            try:
+                                frame_l, frame_r = self.dual_cameras.get_latest_lores_frames()
+                                eval_res = analyzer.evaluate_stereo_pair(frame_l, frame_r)
+                                sim_score = eval_res.get("total_score", sim_score)
+                            except Exception:
+                                pass
+
+                        if sim_score > best_score:
+                            best_score = sim_score
+                            best_z = self.z_mm
+
+                        if strategy == "direct_stop" and dist <= 4.0:
+                            best_z = self.z_mm
+                            best_score = sim_score
+                            break
+
+                        if self.z_mm + step_mm > max_z or self.up_endstop.is_active:
+                            break
+                        self.move_z_up_distance(step_mm)
+
+                    if self.z_mm > best_z:
+                        overshoot = 3.0
+                        descent = (self.z_mm - best_z) + overshoot
+                        self.move_z_down_distance(descent)
+                        self.move_z_up_distance(overshoot)
+                    elif self.z_mm < best_z:
+                        self.move_z_up_distance(best_z - self.z_mm)
+
+                    target_z = best_z
+
+                stem = f"f_{int(round(target_z))}"
+                paths = self.dual_cameras.capture_photo(output_prefix=stem, output_dir=images_dir, meshroom_rig=True)
+                self.photos_captured = len(paths)
+                self.total_photos = len(paths)
+                if upload_r2:
+                    self.photos_uploaded = self.photos_captured
+
+        except Exception as e:
+            if not self._cancel_event.is_set():
+                self._set_phase(ScanPhase.ERROR, error=str(e))
+                with self._lock:
+                    self.state = ScannerState.ERROR
+                raise
+        finally:
+            self._teardown()
+
+        if self._cancel_event.is_set():
+            self._set_phase(ScanPhase.CANCELLED)
+            return {
+                "status": "cancelled",
+                "message": "Face scan was cancelled",
+                "optimal_z_mm": float(target_z) if target_z > 0 else None,
+                "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
+                "photos": paths,
+                "r2_uploaded": False
+            }
+
+        self._set_phase(ScanPhase.DONE)
+        with self._lock:
+            self.state = finish_state
+
+        return {
+            "status": "success",
+            "message": "Face capture completed successfully",
+            "optimal_z_mm": float(target_z),
+            "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
+            "photos": paths,
+            "r2_uploaded": bool(upload_r2)
+        }
 
     # ── stop / cleanup ────────────────────────────────────────────────────────
     def _teardown(self):

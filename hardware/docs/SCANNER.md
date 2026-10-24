@@ -307,6 +307,14 @@ Executes full physical scanning and parallel image upload sequence with independ
 * A climb that ends exactly on the top switch now takes the final top ring; a cancel that tears the hardware down under the scan thread ends the scan quietly instead of raising.
 * `move_z_up()` / `move_z_down()` and the `move_z_*_distance()` helpers accept `end_delay` as well (default `None`).
 
+#### `face_scan(strategy: str = "sweep_best_score", start_z_mm: float = 180.0, search_range_mm: float = 150.0, step_mm: float = 8.0, manual_z: Optional[float] = None, home: bool = True, upload_r2: bool = True, illumination_brightness: float = 0.5, settle_s: float = 0.150, finish_state: str = "idle", analyzer: Optional[Any] = None) -> dict`
+Executes autonomous facial scanning with mechatronic auto-framing, backlash compensation, and synchronized 12.3MP stereo photo capture:
+* **Homing & Positioning**: With `home=True`, carriage descends to the bottom limit switch (Z = 0.0 mm). If `manual_z` is provided (must be $\ge 200.0\text{ mm}$ and $\le 475.0\text{ mm}$), climbs directly to `manual_z`. Otherwise, climbs to `start_z_mm` (180.0 mm) and steps upward in increments of `step_mm` (8.0 mm).
+* **MediaPipe Auto-Framing**: Evaluates in-memory preview frames via `get_latest_lores_frames()` using `StereoFramingAnalyzer` without disk I/O. Supports `sweep_best_score` (apex search across `search_range_mm` with decay early exit) or `direct_stop` ($0.45 \le Y_{\text{nose}} \le 0.55$).
+* **Anti-Backlash Compensation**: If stopped above apex $Z_{\text{best}}$, overshoots downward to $(Z_{\text{best}} - 3.0\text{ mm})$, then climbs $+3.0\text{ mm}$ to $Z_{\text{best}}$, loading the lead screw nut against gravity.
+* **Capture & Cloud Upload**: Synchronized 12.3MP still capture saved as `f_{round(z)}.jpg` in `input_images/rig/0/` and `1/` with EXIF camera serials and focal lengths. When `upload_r2=True`, enqueues to the upload pipeline and verifies in R2.
+* Turntable motor is kept disabled/idle throughout the face scan; chamber illumination defaults to 50% PWM (`0.5`) to avoid blinding the subject.
+
 #### `generate_livestream() -> list[str] | None`
 Starts the preview pipeline of the active camera driver and returns its URLs (`/scanner/stream/mjpeg?camera=1|2` for `DualCameraRPISync`).
 

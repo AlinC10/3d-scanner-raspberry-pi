@@ -233,6 +233,14 @@ class BaseDualCamera(ABC):
         """
         return last_id, None
 
+    def get_latest_lores_frames(self, timeout: float = 1.0, fresh: bool = False) -> Tuple[Optional[Any], Optional[Any]]:
+        """
+        Returns the most recent in-memory preview frames (cam1, cam2) as BGR numpy arrays.
+        Used for real-time computer vision (e.g. MediaPipe auto-framing) with zero disk I/O.
+        Default returns (None, None); implemented by continuous stream drivers (DualCameraRPISync).
+        """
+        return None, None
+
     def get_sync_status(self) -> Dict[str, Any]:
         """
         Synchronisation diagnostics (readiness, offsets, drops, fps). Drivers without a continuous sync pipeline return
