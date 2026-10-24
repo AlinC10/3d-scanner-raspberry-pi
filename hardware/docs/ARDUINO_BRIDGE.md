@@ -47,7 +47,7 @@ Because multiple threads (e.g., the web API, a background scanning loop, and saf
 ## 4. Timeouts & The Out-of-Band Abort
 
 ### Dynamic Timeouts
-A standard web API expects responses within milliseconds. However, physical hardware moves at real-world speeds. A command to home the Z-axis (up to 16,500 steps) might literally take 25 to 45 seconds to physically complete.
+A standard web API expects responses within milliseconds. However, physical hardware moves at real-world speeds. A command to home the Z-axis (up to 49,000 steps: 490 mm at 100 steps/mm) takes about a minute at 1 ms per step.
 
 Because the `ROTATE` command is synchronous (the Arduino will not return `0\n` until the final step is taken), the `send_command()` timeout is **dynamically adjusted** based on the kinematics:
 $$ \text{Timeout} = \text{duration} \times 1.5 + 3.0\text{s} + 2 \times \max(\text{start\_us}, \text{end\_us}) / 10^6 $$

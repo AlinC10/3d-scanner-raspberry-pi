@@ -74,7 +74,49 @@ def make_sensor(script=None, **kwargs):
     return tof, fake
 
 
+class RunningMeasurementDriver(FakeDriver):
+    """
+    A sensor that keeps ranging: the result that is ready, and the one that is running when the call starts, are both
+    older than the call; only the result after the second clear_interrupt() was measured entirely afterwards.
+    """
+
+    def __init__(self, i2c):
+        super().__init__(i2c)
+        self.clears = 0
+        self.events = []
+
+    def clear_interrupt(self):
+        self.clears += 1
+        self.events.append("clear")
+
+    @property
+    def data_ready(self):
+        self.events.append("ready")
+        return True
+
+    @property
+    def distance(self):
+        self.events.append("distance")
+        return 50.0 if self.clears < 2 else 30.0   # 50.0 = taken before the call, 30.0 = taken after it
+
+
 class TestReadDistance(unittest.TestCase):
+    def test_the_measurement_running_when_the_call_starts_is_not_the_reading(self):
+        FakeDriver.instances.clear()
+        module = load_tof(RunningMeasurementDriver)
+        with patch("atexit.register"):
+            tof = module.ToFSensor(timing_budget_ms=15)
+        self.assertAlmostEqual(tof.read_distance_mm(), 300.0)
+        events = FakeDriver.instances[-1].events
+        self.assertEqual(events[0], "clear")
+        # clear, wait for the running measurement, clear again, wait for the next one, only then read it
+        self.assertEqual([e for e in events if e != "ready"], ["clear", "clear", "distance", "clear"])
+        self.assertLess(events.index("clear", 1), events.index("distance"))
+
+    def test_a_timeout_while_waiting_for_the_running_measurement_is_none(self):
+        tof, _ = make_sensor(["timeout"])
+        self.assertIsNone(tof.read_distance_mm())
+
     def test_valid_reading_is_millimetres(self):
         tof, _ = make_sensor([40.2])
         self.assertAlmostEqual(tof.read_distance_mm(), 402.0)
@@ -234,6 +276,9 @@ class TestToFEndpoint(unittest.TestCase):
         fake_router_scanner = types.ModuleType("router.scanner")
         fake_router_scanner.scanner = self.scanner
         fake_router_scanner.ScannerState = MagicMock()
+        for _name in ("scanner_stream_mjpeg", "scanner_stream_switch_active", "scanner_stream_set_quality",
+                      "scanner_stream_sync_status"):
+            setattr(fake_router_scanner, _name, lambda *args, **kwargs: None)
         router_pkg = types.ModuleType("router")
         router_pkg.__path__ = []
         fake_hw_scanner = types.ModuleType("hardware.scanner")

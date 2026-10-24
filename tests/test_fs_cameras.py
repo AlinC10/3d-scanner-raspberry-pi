@@ -139,10 +139,10 @@ class FakePicam2:
     def set_controls(self, ctrls):
         self.controls.append(dict(ctrls))
 
-    def capture_metadata(self):
+    def capture_metadata(self, wait=None):
         return dict(self.metadata)
 
-    def capture_request(self):
+    def capture_request(self, wait=None):
         if self.fail_capture:
             raise RuntimeError("no frames")
         time.sleep(0.01)
@@ -238,6 +238,10 @@ def make_sync(ready_timeout=2.0, **kw):
     return DualCameraRPISync(ready_timeout=ready_timeout, auto_start=False, **kw)
 
 
+# The fake cameras deliver tiny 40x30 frames to keep the tests fast, which is not a size the real driver accepts
+ANY_PHOTO_SIZE = patch.object(DualCameraRPISync, "supported_photo_sizes", None)
+
+
 class RealModeCase(unittest.TestCase):
     """Common patches: picamera2 'available', FakeCam as camera class, fake cv2."""
 
@@ -246,6 +250,7 @@ class RealModeCase(unittest.TestCase):
     def setUp(self):
         self.cv2 = FakeCV2(self.payload)
         for p in (
+            ANY_PHOTO_SIZE,
             patch.object(sync_mod, "ArducamIMX477", FakeCam),
             patch.object(sync_mod, "PICAMERA2_AVAILABLE", True),
             patch.object(sync_mod, "OPENCV_AVAILABLE", True),
@@ -301,8 +306,8 @@ class TestCapturePhoto(RealModeCase):
         for cam in drv.cameras:
             orig = cam.picam2.capture_request
 
-            def narrow(orig=orig):
-                req = orig()
+            def narrow(orig=orig, wait=None):
+                req = orig(wait=wait)
                 req._main_shape = (SIZE[1] * 3 // 2, SIZE[0])
                 return req
 
@@ -341,10 +346,34 @@ class TestCapturePhoto(RealModeCase):
             drv.capture_photo(output_prefix="shot", output_dir=self.tmp)
 
 
+class TestSupportedPhotoSizes(unittest.TestCase):
+    def build(self, size):
+        FakeCam.EVENTS = []
+        with patch.object(sync_mod, "ArducamIMX477", FakeCam), patch.object(sync_mod, "PICAMERA2_AVAILABLE", False):
+            drv = DualCameraRPISync(size=size, auto_start=False)
+        self.addCleanup(drv.close)
+        return drv
+
+    def test_the_two_native_sizes_are_accepted(self):
+        for size in ((4056, 3040), (2028, 1520)):
+            self.assertEqual(tuple(self.build(size).size), size)
+
+    def test_any_other_size_is_refused_before_a_camera_is_touched(self):
+        for size in ((640, 480), (1920, 1080), (4056, 3039), (3040, 4056)):
+            with self.assertRaises(ValueError):
+                self.build(size)
+
+    def test_the_default_size_is_a_supported_one(self):
+        self.assertIn(tuple(self.build(None).size), DualCameraRPISync.supported_photo_sizes)
+
+    def test_the_sensor_is_configured_at_the_requested_size_so_the_binned_mode_keeps_the_field_of_view(self):
+        self.assertEqual(DualCameraRPISync.supported_photo_sizes, ((4056, 3040), (2028, 1520)))
+
+
 class TestStubMode(unittest.TestCase):
     def test_stub_mode_writes_placeholders_and_does_not_raise(self):
         FakeCam.EVENTS = []
-        with patch.object(sync_mod, "ArducamIMX477", FakeCam), \
+        with ANY_PHOTO_SIZE, patch.object(sync_mod, "ArducamIMX477", FakeCam), \
                 patch.object(sync_mod, "PICAMERA2_AVAILABLE", False):
             drv = DualCameraRPISync(size=SIZE, auto_start=False)
             self.addCleanup(drv.close)
@@ -363,9 +392,26 @@ class TestStubMode(unittest.TestCase):
 # Contract 4: lock_auto
 # ─────────────────────────────────────────────────────────────────────────────
 class TestPrepareScanLock(RealModeCase):
-    def test_lock_auto_true_locks_and_copies_to_cam2(self):
+    def test_lock_auto_keeps_the_own_colour_gains_of_cam2_by_default(self):
         drv = self.new_driver()
         infos = drv.prepare_scan(lock_auto=True, settle_time=0, exposure_time=None)
+        self.assertTrue(infos[0]["locked"] and infos[1]["locked"])
+        # exposure and gain are shared (cam1's values) ...
+        for info in infos:
+            self.assertEqual(info["exposure_time"], 8000)
+            self.assertEqual(info["analogue_gain"], 1.5)
+        # ... the white balance is not: each camera keeps the gains its own AWB settled on
+        self.assertEqual(infos[0]["colour_gains"], [1.2, 1.4])
+        self.assertEqual(infos[1]["colour_gains"], [2.2, 2.4])
+        last = drv.cam2.picam2.controls[-1]
+        self.assertEqual(last["ExposureTime"], 8000)
+        self.assertEqual(last["AnalogueGain"], 1.5)
+        self.assertNotEqual(last.get("ColourGains"), (1.2, 1.4))
+        self.assertFalse(last["AeEnable"])
+
+    def test_lock_auto_true_locks_and_copies_to_cam2(self):
+        drv = self.new_driver()
+        infos = drv.prepare_scan(lock_auto=True, settle_time=0, exposure_time=None, copy_colour_gains=True)
         self.assertEqual(drv.cam1.lock_calls, [0.0])
         self.assertEqual(drv.cam2.lock_calls, [0.0])
         self.assertTrue(infos[0]["locked"] and infos[1]["locked"])

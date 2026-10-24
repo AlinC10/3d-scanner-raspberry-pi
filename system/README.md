@@ -76,6 +76,8 @@ Associates with a wireless network.
 
 Interacts with the Linux BlueZ stack via `bluetoothctl` and the `bt-obex` daemon.
 
+Every `bluetoothctl` call runs through `run_bluetoothctl()` with a deadline, so a hung adapter or a device that never answers cannot block a request thread: 10 s for `power`, `show`, `devices`, `info` and `trust`, 40 s for `pair`, 30 s for `connect`, and the discovery duration plus 10 s for `scan on`. When the deadline passes the process is killed and `BluetoothConnectionError` is raised (a discovery that overruns, or an `info` that hangs, only shortens the result: the devices found so far are still returned). `bt-obex` (`send_file`) has no timeout yet.
+
 ### `power_on() -> bool` / `power_off() -> bool`
 Turns the Bluetooth controller on or off.
 * **Underlying Command**: `bluetoothctl power on|off`

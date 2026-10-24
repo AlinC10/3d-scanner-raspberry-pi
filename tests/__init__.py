@@ -1,5 +1,9 @@
+import os
 import sys
 from unittest.mock import MagicMock
+
+# No pause after the homing in the tests (the real one is 1 s); the tests of the pause itself patch the constant
+os.environ.setdefault("SCAN_Z_HOME_SETTLE_S", "0")
 
 # Mock hardware, camera, and cloud dependencies for test runs without hardware
 for mod in [
@@ -38,7 +42,7 @@ if not hasattr(mock_p2, "Picamera2") or isinstance(mock_p2.Picamera2, MagicMock)
         def start(self): self.started = True
         def stop(self): self.started = False
         def close(self): self.started = False
-        def capture_request(self):
+        def capture_request(self, wait=None):
             req = MagicMock()
             req.get_metadata.return_value = {"SyncReady": True, "SensorTimestamp": 1000000000}
             return req

@@ -2,7 +2,9 @@
 
 The Scanner router (`../scanner.py`) orchestrates the end-to-end photogrammetry pipeline: camera stream initialization, mechanical positioning, 360° capture synchronization, photo upload to Cloudflare R2 with verification, and (optionally, per request) cloud GPU 3D reconstruction and mesh retrieval.
 
-Interactive OpenAPI documentation is accessible at: `http://<pi-ip>:8000/docs#/Scanner`
+Interactive OpenAPI documentation is accessible at: `http://127.0.0.1:8000/docs#/Scanner`
+
+> **Local access only.** The server listens on `127.0.0.1`: the API and the web page are reachable from the Raspberry Pi itself, not from the network (see the README for the launch commands). Every example uses `http://127.0.0.1:8000`.
 
 ---
 
@@ -21,7 +23,7 @@ stateDiagram-v2
     state PREPARING {
         [*] --> SetupStream: Lights ON & Cameras Start
         SetupStream --> Homing: Carriage moves to bottom endstop
-        Homing --> Positioning: Carriage rises 30mm facing object
+        Homing --> Positioning: Carriage rises z_start_mm (default 30mm) facing object
         Positioning --> CleanR2: Purge old files from R2 bucket
         CleanR2 --> LockFeatures: In-place AE/AWB & Focus calibration
         LockFeatures --> [*]
@@ -34,7 +36,7 @@ stateDiagram-v2
         [*] --> CaptureSlice: Turntable 18° jumps & photo capture
         CaptureSlice --> ClimbZ: Move up z_move_mm
         ClimbZ --> CaptureSlice: Repeat until top limit switch
-        CaptureSlice --> FinalizeUpload: Watchdog verifies R2 uploads
+        CaptureSlice --> FinalizeUpload: Drain uploads, verify them in R2
         FinalizeUpload --> [*]
     }
 
@@ -50,7 +52,7 @@ stateDiagram-v2
     DOWNLOADING --> CANCELLED: POST /scanner/cancel
 
     PREPARING --> ERROR: Mechanical / Cloud failure
-    RUNNING --> ERROR: Photos missing in R2 / Upload stall / Motor error
+    RUNNING --> ERROR: Photos missing in R2 / Motor error
     PROCESSING --> ERROR: RunPod OOM / timeout
     DOWNLOADING --> ERROR: R2 download failure
 ```
@@ -83,48 +85,47 @@ Prepares the scanner for framing and calibration.
    - Powers ON the chamber lights.
    - Runs the preflight (Cloudflare R2 read/write/delete, ToF sensor, free disk space); a failure is a `400` and nothing is touched.
    - Initializes the dual cameras and starts the MJPEG live preview (there is no video encoder and no bitrate).
-   - **Immediately returns HTTP 202** with the MJPEG preview URLs (`/test/stream/mjpeg?camera=1|2`), usable directly as `<img src>`.
+   - **Immediately returns HTTP 202** with the MJPEG preview URLs (`/scanner/stream/mjpeg?camera=1|2`), usable directly as `<img src>`.
 2. **Background Execution**:
    - Drives the carriage down until the bottom limit switch triggers (`home_z_axis`).
-   - Climbs **+30mm** above home to rest directly in front of the illuminated turntable object.
+   - Climbs `z_start_mm` (default **30mm**) above home to rest directly in front of the illuminated turntable object (`0` skips the climb).
    - Cleans up old assets in the Cloudflare R2 bucket.
    - Re-runs camera auto-tuning (`prepare_scan`) in position: settles auto-exposure and auto-white-balance on the illuminated object, then locks them.
    - Transitions state to `PREPARED`.
 
 ### Request Body (`PrepareRequest`)
+Every field is optional. A client may send only the basic fields (photo quality / resolution) and leave the advanced ones out: whatever is missing takes the default declared in the schema (`camera_config` itself may be omitted too). A front-end that prefers to send all values may send the defaults below.
 ```json
 {
   "enable_stream": true,
   "illumination_brightness": 1.0,
+  "z_start_mm": 30.0,
   "camera_config": {
-    "master_id": 0,
-    "slave_id": 1,
     "quality": 95,
     "photo_resolution": [4056, 3040],
-    "preview_resolution": [960, 720],
-    "rotation": 0,
-    "focus": null,
-    "settle_time": 2.0,
-    "exposure_time": null,
-    "analogue_gain": null,
-    "colour_gains": null,
-    "awb_mode": "auto",
-    "brightness": null,
-    "contrast": null,
-    "saturation": null,
-    "sharpness": null
+    "focus": "auto",
+    "copy_colour_gains": false
   }
 }
 ```
 
-Notes on `camera_config`:
-* Leave a manual control `null` (or omit it) to let the camera decide. `[null, null]` for `colour_gains` / `focus` also means "not set".
-* `exposure_time` must be `> 0` (microseconds), `analogue_gain` `1.0`-`16.0`, `colour_gains` each `> 0`, `contrast` `> 0`: **a `0` is rejected with `422`** (a manual exposure of `0` used to give completely black photos).
-* `rotation` (`0/90/180/270`, one value or a `[cam1, cam2]` pair) rotates the saved photos; the live preview is not rotated.
-* `preview_resolution` is the size of the live MJPEG preview (even values, `160x120` up to `photo_resolution`; a larger preview costs CPU).
-* `focus` is a VCM position `0`-`1023` (or a `[cam1, cam2]` pair); `null` restores the saved position (what a plain `/test/stream/start` does too). **`"auto"`** runs a sharpness sweep of both lenses in the recalibration step (carriage in position, object lit): coarse sweep, then a fine pass around each best position. The best position of each lens is left in place and saved, and nothing moves it for the rest of the scan (the focus is locked). The first call of `/prepare` (the framing stream) only restores the saved position, so the stream is usable from the start.
-* How to let the camera decide everything: send `"camera_config": {}`, or leave `exposure_time`, `analogue_gain`, `colour_gains`, `brightness`, `contrast`, `saturation`, `sharpness` as `null`. AE/AWB then run automatically during the stream and are locked once, in the recalibration step, before the first photo.
-* The keys `show_preview`, `keep_running`, `autofocus_step`, `autofocus_roi`, `video_resolution` and the top-level `bitrate` were removed (nothing used them); a client that still sends them is tolerated and they are ignored.
+| Field | Default | Rules |
+|---|---|---|
+| `enable_stream` | `true` | Start the MJPEG live preview. |
+| `illumination_brightness` | `1.0` | **LED** brightness (PWM), `0 < v <= 1` (0 is refused). Not the image brightness below. |
+| `z_start_mm` | `30.0` | Scan start height above the bottom endstop in mm, `0 <= v <= 100`, a whole number of motor steps (multiples of `0.01`; otherwise 422). `0` stays on the endstop. Not part of `camera_config`. |
+| `camera_config.quality` | `95` | JPEG quality of the photos, 10-100. |
+| `camera_config.photo_resolution` | `[4056, 3040]` | `[width, height]`: exactly `[4056, 3040]` (full sensor) or `[2028, 1520]` (2x2 binned, same field of view); any other value is a 422. |
+| `camera_config.focus` | `"auto"` | `"auto"`: sharpness sweep on the lit object, best position per lens, locked for the scan. An integer: both lenses at that position (a value below 0 becomes 0, above 1023 becomes 1023). `[cam1, cam2]`: exactly two integers, clamped the same way (another length is a 422). `null` (or `[null, null]`): the last focus positions saved on the Pi. |
+| `camera_config.preview_resolution` | `[960, 720]` | Live preview size, even numbers, not larger than the photo. |
+| `camera_config.rotation` | `0` | `0/90/180/270`, or a `[cam1, cam2]` pair. |
+| `camera_config.settle_time` | `2.0` | Seconds AE/AWB settle before they are locked. |
+| `camera_config.exposure_time`, `analogue_gain`, `colour_gains`, `awb_mode` | `null`, `null`, `null`, `"auto"` | Manual exposure (µs, `> 0`), gain (`1-16`), `[red, blue]` white-balance gains. Left out = automatic, then locked for the whole scan. |
+| `camera_config.copy_colour_gains` | `false` | When AE/AWB are locked, `false`: each camera keeps the white-balance gains of its own AWB (exposure time and gain are still copied from camera 1). `true`: camera 1's gains are copied to camera 2, which gives it a colour cast when the sensors differ. Default `rpi_sync` mode only. |
+| `camera_config.brightness`, `contrast`, `saturation`, `sharpness` | `null` | **Image** adjustments. |
+| `camera_config.master_id`, `slave_id` | `0`, `1` | Camera ids. |
+
+Unknown keys inside `camera_config` are ignored (older clients keep working).
 
 ### Response (`202 Accepted` - `PrepareResponse`)
 ```json
@@ -133,8 +134,8 @@ Notes on `camera_config`:
   "message": "Live stream started. Rig homing and camera tuning in progress.",
   "state": "preparing",
   "stream_urls": [
-    "/test/stream/mjpeg?camera=1",
-    "/test/stream/mjpeg?camera=2"
+    "/scanner/stream/mjpeg?camera=1",
+    "/scanner/stream/mjpeg?camera=2"
   ]
 }
 ```
@@ -177,7 +178,7 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
      * Synchronously captures photos from both cameras (2 photos per stop).
      * Pushes captured images into a background upload queue (uploads stream to Cloudflare R2 in parallel).
      * Climbs Z-axis by `z_move_mm` (default `100.0mm`) per elevation ring until the top limit switch triggers.
-     * Stalled-upload watchdog guarantees all photos are securely stored in R2.
+     * An upload worker retries failed uploads with backoff; when the scan ends it waits for the uploads to drain (30 minutes without a single success is the limit) and the bucket is verified against the manifest.
      * When the scan ends, the uploads are verified against the list of expected keys in the R2 bucket. Missing photos end the run in `error` (see below) and stay on disk.
    * **Stage 1b (Completion without RunPod - `COMPLETED`)** (`cloud.launch_runpod = false`, the default):
      * The state becomes `COMPLETED` as soon as the photos are verified in R2. `cloud.runpod` is not imported or called, so a missing RunPod key or package does not matter. Download the photos from the bucket for Meshroom.
@@ -236,7 +237,7 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `turntable.angle` | `float` | `18.0` | Turntable rotation angle per slice in degrees. At most `180`, a whole number of microsteps (multiples of `0.1125°`) **and** it must divide a full revolution in whole steps (`3200 % steps == 0`, e.g. `18`, `22.5`, `11.25`; `33.75` is rejected) so a ring of photos closes exactly at 360°. |
-| `z_axis.distance_mm` | `float` | `100.0` | Vertical travel distance in millimeters between rotational slices (`> 0`, at most `150`, the Z travel). |
+| `z_axis.distance_mm` | `float` | `100.0` | Vertical travel distance in millimeters between rotational slices (`> 0`, at most `475`, the Z travel). |
 | `turntable.delay` | `float` | `0.0010` | Cruise pulse delay in seconds (target maximum angular speed), range `0.0001`–`0.05`. Recommended for scans: `>= 0.0005`. |
 | `turntable.acceleration` | `bool` | `true` | Enables trapezoidal velocity ramping to prevent heavy object slippage. |
 | `turntable.ramp_percent` | `float` | `0.2` | Fraction of total steps for acceleration ramp (`0.0` to `1.0`). |
@@ -267,7 +268,7 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
 
 ### Error Responses
 * `400 Bad Request`: If scanner state is not `PREPARED`, or `cloud.launch_runpod` is `true` and RunPod is not configured (`RUNPOD_API_KEY` missing, placeholder image name). Refused before the physical scan starts.
-* `422 Unprocessable Entity`: an unknown key anywhere in the body (e.g. `mechanical.angle`, `mechanical.z_move_mm`); `cloud.resolution_mp` is `0` or above `13.0`; `turntable.angle` is not a whole number of microsteps (multiples of `0.1125°` at 1/16), is above `180`, or does not divide a full revolution in whole steps (`3200 % steps != 0`, e.g. `33.75` or `360`); `z_axis.distance_mm` is above `150` or not a whole number of steps (multiples of `0.01 mm` at 1/4); `delay` / `start_delay` is outside `0.0001`–`0.05` s. Validated up front, so a bad value no longer fails the scan after `prepare`. (The manual `POST /test/turntable/rotate` still accepts up to `360°`, see `TEST_API.md`.)
+* `422 Unprocessable Entity`: an unknown key anywhere in the body (e.g. `mechanical.angle`, `mechanical.z_move_mm`); `cloud.resolution_mp` is `0` or above `13.0`; `turntable.angle` is not a whole number of microsteps (multiples of `0.1125°` at 1/16), is above `180`, or does not divide a full revolution in whole steps (`3200 % steps != 0`, e.g. `33.75` or `360`); `z_axis.distance_mm` is above `475` or not a whole number of steps (multiples of `0.01 mm` at 1/4); `delay` / `start_delay` is outside `0.0001`–`0.05` s. Validated up front, so a bad value no longer fails the scan after `prepare`. (The manual `POST /test/turntable/rotate` still accepts up to `360°`, see `TEST_API.md`.)
 * `409 Conflict`: A previous `POST /scanner/start` was already accepted and its pipeline has not finished yet (prevents two simultaneous scans from a double click).
   ```json
   {"detail": "Cannot start scan from state idle. Must be PREPARED."}
@@ -344,8 +345,8 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
   "state": "running",
   "total_photos": 40,
   "stream_urls": [
-    "/test/stream/mjpeg?camera=1",
-    "/test/stream/mjpeg?camera=2"
+    "/scanner/stream/mjpeg?camera=1",
+    "/scanner/stream/mjpeg?camera=2"
   ],
   "phase": "scanning",
   "phase_message": "Ring 2: capturing",
@@ -422,10 +423,10 @@ Delivers a high-framerate `multipart/x-mixed-replace` MJPEG stream directly cons
 ### Example Usage (HTML)
 ```html
 <!-- Live preview of Camera 1 -->
-<img src="http://<pi-ip>:8000/scanner/stream/mjpeg?camera=1" alt="Camera 1 Live Feed" />
+<img src="http://127.0.0.1:8000/scanner/stream/mjpeg?camera=1" alt="Camera 1 Live Feed" />
 
 <!-- Live preview of Camera 2 -->
-<img src="http://<pi-ip>:8000/scanner/stream/mjpeg?camera=2" alt="Camera 2 Live Feed" />
+<img src="http://127.0.0.1:8000/scanner/stream/mjpeg?camera=2" alt="Camera 2 Live Feed" />
 ```
 
 ### Example `curl`
@@ -493,33 +494,40 @@ curl -X POST "http://localhost:8000/scanner/stream/quality?quality=75"
 
 ## 8. Frame Synchronization Status (`GET /scanner/stream/sync-status`)
 
-Returns real-time telemetry from the dual camera driver, including libcamera `rpi.sync` lock state, per-camera framerates, dropped frame counts, and sub-frame modulo offsets.
+Returns real-time telemetry from the dual camera driver: `rpi.sync` readiness, the newest frame of each camera, dropped frames, the sub-frame shutter offset and what each sensor is using. (Also available as `GET /test/stream/sync-status`: the same function.)
 
 ### Response (`200 OK`)
 ```json
 {
   "ready": true,
-  "status": "SYNC_LOCKED",
-  "camera_1": {
-    "fps": 24.1,
-    "frames_grabbed": 1420,
-    "frames_dropped": 0
-  },
-  "camera_2": {
-    "fps": 24.1,
-    "frames_grabbed": 1420,
-    "frames_dropped": 0
-  },
-  "offset_modulo_ms": 0.028,
-  "active_camera": 1
+  "cam1_ready": true,
+  "cam2_ready": true,
+  "cam1_seq": 1420,
+  "cam2_seq": 1420,
+  "active_camera": 1,
+  "offset_ms": 0.028,
+  "drops": [0, 0],
+  "stream_fps": 10.0,
+  "last_jpeg_kb": 85.0,
+  "quality": 95,
+  "stream_quality": 80,
+  "spectators": [1, 0],
+  "cam1_controls": {"exposure_time": 10000, "analogue_gain": 1.5, "colour_gains": [1.8, 1.6], "sensor_timestamp": 123456789},
+  "cam2_controls": {"exposure_time": 10000, "analogue_gain": 1.5, "colour_gains": [2.0, 1.5], "sensor_timestamp": 123456812}
 }
 ```
+Drivers without a continuous sync pipeline (`xvs`, `staggered`) answer only `{"ready": true, "is_streaming": <bool>, "mode": "<driver class>"}`.
 
-### Telemetry Field Guide
-* `ready`: `true` when both camera sensors are active and the synchronization loop has established frame alignment.
-* `status`: Current synchronization health (`"SYNC_LOCKED"`, `"STAGGERED"`, `"XVS_HARDWARE"`).
-* `offset_modulo_ms`: Inter-camera frame timestamp phase difference modulo the 41.6ms frame interval. In `rpi.sync` mode, this settles to **$<0.05\text{ ms}$ (28 µs)**.
-* `frames_dropped`: Monitored per camera. Verifies that DMA buffers are released rapidly ($<5\text{ ms}$) without exhausting kernel memory.
+### Telemetry Field Guide (`DualCameraRPISync`)
+* `ready`: `true` when both cameras reported `SyncReady` (`cam1_ready`, `cam2_ready` per camera).
+* `cam1_seq`, `cam2_seq`: sequence number of the newest frame of each camera.
+* `active_camera`: the camera of the live preview (1 or 2).
+* `offset_ms`: shutter phase difference between the two cameras, modulo the frame period (100 ms at the default 10 fps). Measured on the rig at about 0.037 ms; `null` until both cameras have delivered a frame.
+* `drops`: frames dropped, per camera `[cam1, cam2]`.
+* `stream_fps`: JPEG frames per second published to the browsers over the last 2 s (0 when nobody watches; the preview encodes only while a viewer is connected).
+* `last_jpeg_kb`: size of the last preview JPEG. `quality` / `stream_quality`: JPEG quality of the photos / of the preview.
+* `spectators`: connected viewers `[cam1, cam2]`.
+* `cam1_controls`, `cam2_controls`: what each sensor is really using now (`exposure_time` in microseconds, `analogue_gain`, `colour_gains`, `sensor_timestamp`); a black picture shows up here as a tiny exposure.
 
 ### Example `curl`
 ```bash
@@ -533,7 +541,7 @@ curl -X GET http://localhost:8000/scanner/stream/sync-status
 ```typescript
 // 1. Prepare Scanner and Display Live MJPEG Stream
 async function prepareScanner() {
-  const res = await fetch("http://<pi-ip>:8000/scanner/prepare", {
+  const res = await fetch("http://127.0.0.1:8000/scanner/prepare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -548,7 +556,7 @@ async function prepareScanner() {
   
   // Option A: Point an <img> tag directly to the native low-latency MJPEG stream
   const imgElement = document.getElementById("live-stream") as HTMLImageElement;
-  imgElement.src = "http://<pi-ip>:8000/scanner/stream/mjpeg?camera=1";
+  imgElement.src = "http://127.0.0.1:8000/scanner/stream/mjpeg?camera=1";
 
   // Option B: use the URLs returned by the server (the same MJPEG endpoints)
   if (data.stream_urls) {
@@ -562,16 +570,16 @@ async function prepareScanner() {
 // 2. Switch Camera View in UI with Zero Latency
 async function switchCamera(cameraId: 1 | 2) {
   // Option A: Call the switch API to flip the default stream
-  await fetch(`http://<pi-ip>:8000/scanner/stream/active?camera_id=${cameraId}`, { method: "POST" });
+  await fetch(`http://127.0.0.1:8000/scanner/stream/active?camera_id=${cameraId}`, { method: "POST" });
   
   // Option B: Or simply update the <img> src query parameter directly!
   const imgElement = document.getElementById("live-stream") as HTMLImageElement;
-  imgElement.src = `http://<pi-ip>:8000/scanner/stream/mjpeg?camera=${cameraId}`;
+  imgElement.src = `http://127.0.0.1:8000/scanner/stream/mjpeg?camera=${cameraId}`;
 }
 
 // 3. Start the Photogrammetry Scan
 async function startScan(jobId: string) {
-  await fetch("http://<pi-ip>:8000/scanner/start", {
+  await fetch("http://127.0.0.1:8000/scanner/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -600,7 +608,7 @@ async function startScan(jobId: string) {
 // 4. Polling helper
 async function pollUntilState(targetState: string) {
   while (true) {
-    const res = await fetch("http://<pi-ip>:8000/scanner/status");
+    const res = await fetch("http://127.0.0.1:8000/scanner/status");
     const status = await res.json();
     
     console.log(`Current state: ${status.state} (${status.phase ?? "-"}), photos: ${status.photos_uploaded}/${status.photos_captured}`);

@@ -2,13 +2,13 @@
 
 This module provides isolated HTTP endpoints to test, calibrate, and verify individual hardware subsystems on the 3D scanner without running a full scan sequence.
 
-Interactive OpenAPI docs are accessible at: `http://<pi-ip>:8000/docs#/Hardware%20Diagnostics%20%26%20Tests`
+Interactive OpenAPI docs are accessible at: `http://127.0.0.1:8000/docs#/Hardware%20Diagnostics%20%26%20Tests`
 
 > [!NOTE]
 > `/test/turntable/rotate` and `/test/motor/z-move` answer `422` when the angle / distance is not a whole number of steps (`0.1125°` multiples on the turntable, `0.01 mm` multiples on Z) and `500` when the move was aborted before it completed (for example by `POST /scanner/cancel`); they no longer report `success` for an aborted move.
 
 > [!NOTE]
-> **Limits** (all rejected with `422`): `delay` and `start_delay` must be within `0.0001`-`0.05` s (also for the `home-bottom` / `move-to-top` query parameters, where `ramp_percent` must be `0.0`-`1.0`); `z-move` `distance_mm` is at most `150` (the Z travel). Below `delay = 0.0004` s the Arduino may not keep the step period during ramps: for manual tests prefer `acceleration=false` there.
+> **Limits** (all rejected with `422`): `delay` and `start_delay` must be within `0.0001`-`0.05` s (also for the `home-bottom` / `move-to-top` query parameters, where `ramp_percent` must be `0.0`-`1.0`); `z-move` `distance_mm` is at most `475` (the Z travel, `Z_TRAVEL_MAX_MM`). Below `delay = 0.0004` s the Arduino may not keep the step period during ramps: for manual tests prefer `acceleration=false` there.
 
 > [!WARNING]
 > **Overlapping motions**: `/test/motor/z-move`, `/test/turntable/rotate`, `/test/motor/home-bottom` and `/test/motor/move-to-top` run inside the scanner motion guard. A second motion request that arrives while another motion is running is answered `409 Conflict` ("Another motion is in progress...") and its motor is not touched; wait for the running move to finish or stop it with `POST /scanner/cancel`.
@@ -78,7 +78,7 @@ Reads the VL53L1X time-of-flight sensor (distance to the subject).
 ## 2. Illumination System
 
 ### `POST /test/lights/enable`
-Powers the LED panels ON at the requested brightness (defaults to full brightness when no body is sent).
+Powers the LED panels ON at the requested brightness (defaults to full brightness when no body is sent). Refused with `409` while a scan owns the rig (state `preparing`, `prepared` or `running`); a manual `/test/stream/start` session does not count.
 
 * **Request Body** (optional): `{"brightness": 0.5}` (`brightness` float, `0.0` to `1.0`).
 * **Response (`200 OK`)**:
@@ -88,7 +88,7 @@ Powers the LED panels ON at the requested brightness (defaults to full brightnes
 * **Error (`409 Conflict`)**: Lights are locked (scan in progress).
 
 ### `POST /test/lights/disable`
-Turns the LED panels OFF (relay cut, PWM to 0).
+Turns the LED panels OFF (relay cut, PWM to 0). Refused with `409` while a scan owns the rig (state `preparing`, `prepared` or `running`) and while the brightness lock is held: the scan's own teardown is the only thing that switches the lights off then.
 
 * **Response (`200 OK`)**: `{"status": "success", "state": "disabled", "message": "Lights disabled."}`
 * **Error (`409 Conflict`)**: Lights are locked (scan in progress).
@@ -186,7 +186,7 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
     "acceleration": false
   }
   ```
-  * `distance_mm` (float, default `100.0`, `> 0` and `<= 150.0`, whole steps: multiples of `0.01` mm): Travel distance. The Z travel is 150 mm.
+  * `distance_mm` (float, default `100.0`, `> 0` and `<= 475.0`, whole steps: multiples of `0.01` mm): Travel distance. The Z travel is 475 mm.
   * `direction` (`"up"` | `"down"`, default `"up"`).
   * `delay` (float, default `0.0010`, range `0.0001`–`0.05`): Step pulse delay.
   * `acceleration` (bool, default `false`): Speed ramp (constant acceleration).
@@ -212,7 +212,7 @@ Moves the Z-axis carriage by a specified distance in millimeters. Automatically 
   ```
 
 * **Error Response (`409 Conflict`)**: A prepare/scan owns the rig, or another motion is already in progress.
-* **Error Response (`422`)**: `distance_mm` above `150` or not a whole number of steps; `delay` / `start_delay` out of range.
+* **Error Response (`422`)**: `distance_mm` above `475` or not a whole number of steps; `delay` / `start_delay` out of range.
 
 * **Example `curl`**:
   ```bash
@@ -270,6 +270,8 @@ Rotates the turntable platter by a specific angle.
 
 ## 5. Camera & Livestream Testing
 
+> `GET /test/stream/mjpeg`, `POST /test/stream/active`, `POST /test/stream/quality` and `GET /test/stream/sync-status` are the **same functions** as `/scanner/stream/mjpeg`, `/scanner/stream/active`, `/scanner/stream/quality` and `/scanner/stream/sync-status` (registered under both prefixes from `router/scanner.py`; see [SCANNER_API.md](SCANNER_API.md)). They behave identically, take the camera / quality as a query parameter or a JSON body, and the preview URLs returned by `/test/stream/start` and `/scanner/prepare` point to `/scanner/stream/mjpeg`. Only `start`, `stop`, `status` and `camera/snap` are specific to `/test`.
+
 ### `POST /test/stream/start`
 Initializes the dual camera array and the lights and starts the MJPEG live preview without moving any motors. It needs no request body (there is no bitrate) and, unlike `POST /scanner/prepare`, it does **not** touch Cloudflare R2, the ToF sensor or the disk-space check, so it works without internet.
 
@@ -278,8 +280,8 @@ Initializes the dual camera array and the lights and starts the MJPEG live previ
   {
     "status": "success",
     "stream_urls": [
-      "/test/stream/mjpeg?camera=1",
-      "/test/stream/mjpeg?camera=2"
+      "/scanner/stream/mjpeg?camera=1",
+      "/scanner/stream/mjpeg?camera=2"
     ],
     "is_streaming": true
   }
@@ -293,6 +295,8 @@ Initializes the dual camera array and the lights and starts the MJPEG live previ
 ---
 
 ### `POST /test/stream/stop`
+> Ends a manual `/test/stream/start` session completely: cameras released, lights off, state back to `idle` (so `/scanner/prepare` is accepted again). It does not end a scan's own preparation: use `POST /scanner/cancel` for that.
+
 Stops the live preview and releases the cameras.
 
 * **Response (`200 OK`)**:
@@ -319,8 +323,8 @@ Returns whether the stream is active and its preview URLs.
   {
     "is_streaming": true,
     "stream_urls": [
-      "/test/stream/mjpeg?camera=1",
-      "/test/stream/mjpeg?camera=2"
+      "/scanner/stream/mjpeg?camera=1",
+      "/scanner/stream/mjpeg?camera=2"
     ]
   }
   ```
@@ -328,7 +332,7 @@ Returns whether the stream is active and its preview URLs.
 ---
 
 ### `GET /test/stream/mjpeg`
-Direct multipart/x-mixed-replace MJPEG video stream directly viewable in browser `<img>` elements.
+Direct multipart/x-mixed-replace MJPEG video stream directly viewable in browser `<img>` elements (the function of `GET /scanner/stream/mjpeg`).
 
 * **Query Parameters**:
   * `camera` (optional `int`, range `1..2`): Selects which camera feed to activate. Defaults to active preview camera.
@@ -383,27 +387,15 @@ Dynamically adjusts the live preview JPEG compression quality without affecting 
 ---
 
 ### `GET /test/stream/sync-status`
-Returns real-time synchronization diagnostics from the active camera driver (`DualCameraRPISync`, `DualCameraXVS`, or `DualCamera`).
+Returns real-time synchronization diagnostics from the active camera driver (the function of `GET /scanner/stream/sync-status`, see [SCANNER_API.md](SCANNER_API.md) section 8 for every field).
 
 * **Response (`200 OK`)**:
   ```json
-  {
-    "ready": true,
-    "status": "SYNC_LOCKED",
-    "camera_1": {
-      "fps": 24.2,
-      "frames_grabbed": 840,
-      "frames_dropped": 0
-    },
-    "camera_2": {
-      "fps": 24.2,
-      "frames_grabbed": 840,
-      "frames_dropped": 0
-    },
-    "offset_modulo_ms": 0.028,
-    "active_camera": 1
-  }
+  {"ready": true, "cam1_ready": true, "cam2_ready": true, "cam1_seq": 840, "cam2_seq": 840, "active_camera": 1,
+   "offset_ms": 0.028, "drops": [0, 0], "stream_fps": 10.0, "last_jpeg_kb": 85.0, "quality": 95,
+   "stream_quality": 80, "spectators": [1, 0], "cam1_controls": {...}, "cam2_controls": {...}}
   ```
+  `DualCameraXVS` and `DualCamera` answer only `{"ready": true, "is_streaming": ..., "mode": "..."}`.
 * **Example `curl`**:
   ```bash
   curl -X GET http://localhost:8000/test/stream/sync-status
@@ -412,15 +404,17 @@ Returns real-time synchronization diagnostics from the active camera driver (`Du
 ---
 
 ### `POST /test/camera/snap`
-Takes a single synchronized test capture from both cameras. If cameras are not currently initialized, it initializes them first.
+Takes a single synchronized test capture from both cameras. If cameras are not currently initialized, it initializes them first and releases them (lights off, state back to `idle`) when the capture is done. Refused with `409` while a scan owns the cameras.
+
+The photos are saved in the `test_snaps/` folder of the project (created on demand), as `snap_<date>_<time>_cam1.jpg` and `snap_<date>_<time>_cam2.jpg`, so they are never mixed with the scan photos (`input_images/`) and a new snap never overwrites an older one.
 
 * **Response (`200 OK`)**:
   ```json
   {
     "status": "success",
     "photo_paths": [
-      "/home/alin/Desktop/3d-scanner-raspberry-pi/input_images/cam0_test.jpg",
-      "/home/alin/Desktop/3d-scanner-raspberry-pi/input_images/cam1_test.jpg"
+      "/home/alin/Desktop/3d-scanner-raspberry-pi/test_snaps/snap_20261018_120000_cam1.jpg",
+      "/home/alin/Desktop/3d-scanner-raspberry-pi/test_snaps/snap_20261018_120000_cam2.jpg"
     ],
     "count": 2
   }
@@ -479,6 +473,6 @@ When first bringing up or troubleshooting the physical rig:
 4. **Verify Z-Axis Homing**:
    - Call `POST /test/motor/home-bottom` -> carriage should move downward until clicking the bottom switch, then stop immediately.
 5. **Verify Camera Stream**:
-   - Call `POST /test/stream/start` -> open `http://<pi-ip>:8000/test/stream/mjpeg?camera=1` in a browser to verify the video feed and focus; `GET /test/stream/sync-status` shows the `cam1_controls` / `cam2_controls` (exposure time and gain each sensor is really using: a black picture shows a tiny exposure there).
+   - Call `POST /test/stream/start` -> open `http://127.0.0.1:8000/test/stream/mjpeg?camera=1` in a browser to verify the video feed and focus; `GET /test/stream/sync-status` shows the `cam1_controls` / `cam2_controls` (exposure time and gain each sensor is really using: a black picture shows a tiny exposure there).
 6. **Verify Clean Shutdown**:
    - Call `POST /test/cleanup` -> lights turn off, video stream terminates, motors release.

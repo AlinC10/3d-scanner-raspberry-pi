@@ -146,15 +146,25 @@ class DimmableLight:
                 self._relay.on()
                 time.sleep(0.05)  # Relay contact bounce settle
 
-            self._is_on = True
             duty = self._target_duty()
             self._pwm.change_duty_cycle(duty)
+            # Only now are the relay and the PWM both set: a failure above leaves the flag False, so the rest of the
+            # system never believes the lights are on when the PWM step did not happen (off() still switches the
+            # relay off, whatever the flag says).
+            self._is_on = True
             log.info("[Lights] ON (Brightness: %.0f%%, Duty: %.1f%%)", self._brightness * 100, duty)
 
-    def off(self):
+    def off(self, force: bool = True):
+        """
+        Turns the lights off. ``force=True`` (default) is for the scanner's own teardown: it also lifts the brightness
+        lock. Outside callers (the /test endpoints) pass ``force=False``: while a scan holds the lock the lights stay
+        on and LightLockedError is raised.
+        """
         with self._lock:
             if self._closed:
                 return
+            if self._locked and not force:
+                raise LightLockedError("Lights are locked (scan in progress).")
 
             # Instantly drop PWM to zero before killing power
             try:

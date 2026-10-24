@@ -26,7 +26,7 @@ schemas/
 #### `MechanicalConfig`
 Spatial movement of the scanning rig (`extra="forbid"`: an unknown key is a `422`).
 * `turntable`: `TurntableScanConfig` — `angle` (default `18.0°`, `0 < angle <= 180`, whole microsteps, must divide a full revolution), `delay`, `acceleration`, `ramp_percent`, `decel_percent`, `start_delay`, `end_delay`.
-* `z_axis`: `ZAxisScanConfig` — `distance_mm` (default `100.0`, `0 < distance_mm <= 150`, whole steps), `delay`, `acceleration`, `ramp_percent`, `decel_percent`, `start_delay`, `end_delay`.
+* `z_axis`: `ZAxisScanConfig` — `distance_mm` (default `100.0`, `0 < distance_mm <= 475` (the Z travel), whole steps), `delay`, `acceleration`, `ramp_percent`, `decel_percent`, `start_delay`, `end_delay`.
 * The scan configs reject unknown keys (`extra="forbid"`), but still accept and ignore the legacy `turntable.clockwise` and `z_axis.direction`. The manual test requests (`TurntableRotateRequest`, `ZMoveRequest`) keep those two fields and their previous behaviour.
 
 #### `DualCameraConfig`
@@ -34,11 +34,12 @@ Complete image capture and optical parameter block.
 * `master_id`: `Literal[0, 1]` (default: `0`) — Camera ID for the master sensor.
 * `slave_id`: `Literal[0, 1]` (default: `1`) — Camera ID for the slave sensor.
 * `quality`: `int` (default: `95`) — Enforced `10 <= quality <= 100` (JPEG compression quality).
-* `photo_resolution`: `tuple[int, int]` (default: `(4056, 3040)`) — Full 12MP sensor capture size.
-* `preview_resolution`: `tuple[int, int]` (default: `(960, 720)`) — size of the live MJPEG preview (even values, `160x120` up to `photo_resolution`).
+* `photo_resolution`: `(4056, 3040)` (default, full 12MP) or `(2028, 1520)` (2x2 binned, same field of view) — nothing else is accepted.
+* `preview_resolution`: `tuple[int, int]` (default: `(960, 720)`) — size of the live MJPEG preview (even values, `160x120` up to `photo_resolution`; with the supported photo sizes the default `960x720` always fits).
 * `rotation`: `Literal[0, 90, 180, 270]` or a `(cam1, cam2)` pair (default: `0`) — rotation of the saved photos (not of the live preview).
 * `focus`: `int | "auto" | tuple | None` — VCM focus position (`0`–`1023`) or independent pair `(300, 450)`; `null` restores the saved position; `"auto"` sweeps in the in-position recalibration and keeps the best position locked for the scan.
-* `settle_time`: `float` (default: `2.0`s) — Time to allow sensor to meter scene before locking.
+* `settle_time`: `float` (default: `2.0`s, `0 <= settle_time <= 10`) — Time to allow sensor to meter scene before locking.
+* `copy_colour_gains`: `bool` (default: `false`) — When AE/AWB are locked, `false`: each camera keeps the white-balance gains of its own AWB (exposure time and gain are still copied from camera 1); `true`: camera 1's gains are copied to camera 2 (which gave it a colour cast). `rpi_sync` mode only.
 * `exposure_time`: `int | None` (`> 0`) — Manual exposure in microseconds. `0` is rejected (it gave black photos).
 * `analogue_gain`: `float | None` (`1.0`–`16.0`) — Manual analog sensor gain.
 * `colour_gains`: `tuple[float, float] | None` (each `> 0`) — Manual red/blue gains; `[null, null]` means not set.
@@ -62,7 +63,11 @@ Controls the optional remote Meshroom photogrammetry on RunPod GPU workers (`ext
 Payload for `POST /scanner/prepare`.
 * `enable_stream`: `bool` (default: `true`) — Whether to start the MJPEG live preview and return its URLs. (There is no `bitrate`: the preview is MJPEG, not H.264.)
 * `illumination_brightness`: `float` (default: `1.0`) — LED brightness, enforced `0.0 < b <= 1.0` (`0` is refused: the scanner cannot scan in the dark).
+* `z_start_mm`: `float` (default: `30.0`, `0 <= z_start_mm <= 100`) — Height above the bottom endstop where the scan starts; `0` stays on the endstop. Must be a whole number of motor steps (multiples of `0.01` mm), validated with the same conversion the motor uses. Not part of `camera_config`.
 * `camera_config`: `DualCameraConfig` — Nested optical configuration block.
+
+#### `StreamActiveRequest` / `StreamQualityRequest`
+Optional JSON bodies of `POST /scanner/stream/active` (`camera_id`, `1`-`2`) and `POST /scanner/stream/quality` (`quality`, `1`-`100`); the same values are accepted as query parameters. The `/test/stream/*` endpoints are the same functions.
 
 #### `StartRequest`
 Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in the body are a `422`).
@@ -80,7 +85,7 @@ Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in th
   "status": "accepted",
   "message": "Live stream started. Rig homing and camera tuning in progress.",
   "state": "preparing",
-  "stream_urls": ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"]
+  "stream_urls": ["/scanner/stream/mjpeg?camera=1", "/scanner/stream/mjpeg?camera=2"]
 }
 ```
 
@@ -89,7 +94,7 @@ Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in th
 {
   "state": "running",
   "total_photos": 40,
-  "stream_urls": ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"],
+  "stream_urls": ["/scanner/stream/mjpeg?camera=1", "/scanner/stream/mjpeg?camera=2"],
   "phase": "scanning",
   "phase_message": "Ring 2: capturing",
   "level": 2,

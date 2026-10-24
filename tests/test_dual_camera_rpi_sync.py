@@ -208,12 +208,12 @@ class TestDualCameraRPISync(unittest.TestCase):
         seq_counter1 = [0]
         seq_counter2 = [0]
 
-        def req_side_effect1():
+        def req_side_effect1(wait=None):
             s = seq_counter1[0]
             seq_counter1[0] += 1
             return make_req(s, 1_000_000_000 + s * 100_000_000)
 
-        def req_side_effect2():
+        def req_side_effect2(wait=None):
             s = seq_counter2[0]
             seq_counter2[0] += 1
             return make_req(s, 1_000_000_000 + s * 100_000_000)

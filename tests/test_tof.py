@@ -146,11 +146,12 @@ class ToFSensorTests(unittest.TestCase):
             t.join()
 
         events = fake.events
-        # one read = clear, ready (polled), dist, clear, all from the same thread
-        self.assertEqual(len(events) % 4, 0)
-        for i in range(0, len(events), 4):
-            group = events[i:i + 4]
-            self.assertEqual([e[0] for e in group], ["clear", "ready", "dist", "clear"])
+        # one read = clear, ready (the running measurement), clear, ready (the next one), dist, clear: all from the
+        # same thread
+        self.assertEqual(len(events) % 6, 0)
+        for i in range(0, len(events), 6):
+            group = events[i:i + 6]
+            self.assertEqual([e[0] for e in group], ["clear", "ready", "clear", "ready", "dist", "clear"])
             self.assertEqual(len({e[1] for e in group}), 1)
 
     def test_close_is_idempotent(self):

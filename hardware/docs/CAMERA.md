@@ -1,6 +1,6 @@
 # Camera Subsystem Overview (`hardware/camera`)
 
-The `hardware/camera` package provides the complete optical imaging and motorized focus pipeline for the 3D scanner. Built on Raspberry Pi's `picamera2` and Linux `libcamera`, it manages individual camera sensor hardware, automated Voice Coil Motor (VCM) lens positioning, live H.264 RTSP video streaming, and stereoscopic capture synchronization.
+The `hardware/camera` package provides the complete optical imaging and motorized focus pipeline for the 3D scanner. Built on Raspberry Pi's `picamera2` and Linux `libcamera`, it manages individual camera sensor hardware, automated Voice Coil Motor (VCM) lens positioning, a live MJPEG preview, and stereoscopic capture synchronization.
 
 This document serves as the high-level architecture overview and navigation index for the camera subsystem. For specific low-level component references, see the specialized guides in [`hardware/camera/docs/`](../camera/docs/).
 
@@ -34,14 +34,15 @@ hardware/
 ## 🏗️ Core Architectural Features
 
 ### 1. Dual-Stream Concurrent Pipeline (`lores` + `main`)
-The camera driver leverages `picamera2` multi-stream output capabilities:
-* **`lores` Stream** ($960 \times 720$ @ 24 FPS, 4 Mbps): Feeds an `H264Encoder` streaming over TCP via FFmpeg directly to MediaMTX (`rtsp://localhost:8554/cam{id}`). Uses a native 4:3 aspect ratio matching the physical IMX477 sensor without vertical cropping, maintaining low CPU usage (~15-20%) on Raspberry Pi 5.
-* **`main` Stream** ($4056 \times 3040$): Kept uncompressed and available. When a scan captures a photo, it grabs the full 12.3MP still directly from the `main` stream without interrupting, reconfiguring, or dropping frames on the live RTSP stream.
+The production driver (`DualCameraRPISync`, see [DUAL_CAMERAS.md](DUAL_CAMERAS.md)) leverages `picamera2` multi-stream output capabilities, both streams in YUV420:
+* **`lores` Stream** (the preview size, default $960 \times 720$, 4:3 like the IMX477 sensor, no cropping): the grab workers keep the newest frame and encode it to JPEG **only while a browser is watching** (`/scanner/stream/mjpeg`). The Raspberry Pi 5 has no hardware H.264 encoder, so there is no H.264/RTSP stream.
+* **`main` Stream** (the photo size: $4056 \times 3040$, or $2028 \times 1520$ in the sensor's 2x2 binned mode, which has the same field of view): when a scan captures a photo, the still is taken from the `main` stream without interrupting, reconfiguring, or dropping frames on the live preview.
+* The single-camera `ArducamIMX477.start_stream()` / `record_video()` still contain the old H.264 + FFmpeg + MediaMTX path; it does not work on the Pi 5 and the scanner does not use it.
 
 ### 2. Re-entrant Preparation & Runtime Auto-Tuning
 In the 4-phase scanning architecture, `prepare_scan()` is called twice:
-1. **Top Position**: Starts the sensor and boots the RTSP livestream for the frontend framing view.
-2. **In Position (Home + 30mm)**: Recalibrates focus and settles AE/AWB in front of the illuminated object.
+1. **Top Position**: Starts the sensor and boots the MJPEG preview for the frontend framing view.
+2. **In Position (Home + `z_start_mm`, default 30 mm)**: Recalibrates focus and settles AE/AWB in front of the illuminated object.
 
 By guarding stream initialization with `if not getattr(self.picam2, "started", False):`, the second call bypasses destructive graph re-configuration. The video stream stays alive while the sensor dynamically updates exposure, meters the scene, and locks settings.
 
@@ -69,7 +70,7 @@ Rather than duplicating low-level specifications, consult the dedicated guides i
 
 | Component / Topic | Primary Guide | Key Topics Covered |
 |---|---|---|
-| **Single Camera API** | [ArducamIMX477.md](../camera/docs/ArducamIMX477.md) | Constructor, still captures, RTSP streaming, rotation, resolution configs. |
+| **Single Camera API** | [ArducamIMX477.md](../camera/docs/ArducamIMX477.md) | Constructor, still captures, rotation, resolution configs (its H.264/RTSP streaming does not work on the Pi 5). |
 | **VCM Motor & I2C** | [Focuser.md](../camera/docs/Focuser.md) | DW9714 10-bit DAC format, I2C bus auto-detection, smooth ramping, state persistence. |
 | **Optics & Focus Guide** | [Focus_Guide.md](../camera/docs/Focus_Guide.md) | Circle of confusion, hyperfocal distance calculations, focus bracketing. |
 | **Stereo Dual Camera** | [DUAL_CAMERAS.md](DUAL_CAMERAS.md) | Polymorphic hierarchy (`BaseDualCamera`), software synchronization via `rpi.sync` (`DualCameraRPISync`), hardware sync (`DualCameraXVS`), and multi-threaded staggered fallback (`DualCamera`). |
@@ -89,8 +90,8 @@ Hardware constants and operational presets are centralized in [`hardware/camera/
 * `VCM_MOVE_DELAY_S = 0.06`: 60 ms mechanical settling time after movement.
 
 ### Capture & Autofocus Defaults (`camera_defaults.py`)
-* `DEFAULT_PHOTO_RESOLUTION = (4056, 3040)`: Full 12.3MP sensor capture resolution.
-* `DEFAULT_VIDEO_RESOLUTION = (1920, 1080)`: 1080p full HD stream resolution.
+* `DEFAULT_PHOTO_RESOLUTION = (4056, 3040)`: Full 12.3MP sensor capture resolution. `SUPPORTED_PHOTO_RESOLUTIONS = ((4056, 3040), (2028, 1520))` are the only sizes the scanner accepts.
+* `DEFAULT_VIDEO_RESOLUTION = (1920, 1080)`: 1080p video size (single-camera `record_video` only).
 * `DEFAULT_PREVIEW_RESOLUTION = (960, 720)`: Native 4:3 720p live preview stream resolution (uncropped).
 * `DEFAULT_QUALITY = 95`: High-quality JPEG compression level.
 * `AF_STEP = 30`: DAC step size during contrast-detection autofocus sweep.
@@ -109,10 +110,8 @@ with ArducamIMX477(camera_id=0) as cam:
     #    Applies Photogrammetry Defaults (CentreWeighted AE + NoiseReductionMode=Off)
     cam.prepare_scan(keep_running=True)
     
-    # 2. Start RTSP live stream to MediaMTX (960x720 @ 24 FPS, 4 Mbps)
-    stream_url = cam.start_stream(bitrate=4_000_000)
-    print(f"RTSP stream active at: {stream_url}")
-    
+    # 2. (The live preview belongs to the dual-camera drivers: DualCameraRPISync serves MJPEG, see DUAL_CAMERAS.md)
+
     # 3. Perform contrast autofocus on object
     sharpest_pos = cam.focus_sweep_autofocus()
     print(f"Optimal focus locked at DAC position: {sharpest_pos}")

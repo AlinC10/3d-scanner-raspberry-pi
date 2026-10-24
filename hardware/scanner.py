@@ -15,7 +15,7 @@ from queue import Queue
 import queue
 
 from hardware.camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY, \
-    DEFAULT_VIDEO_RESOLUTION
+    DEFAULT_VIDEO_RESOLUTION, CAMERA_CALL_TIMEOUT_S
 import os
 from .base_dual_camera import BaseDualCamera
 from .dual_camera import DualCamera
@@ -47,6 +47,11 @@ def _env_backoff(name: str, default: tuple) -> tuple:
         return values or default
     except (KeyError, ValueError):
         return default
+
+# A pair of photos that could not be captured (a missing frame, a file that was not written) is retaken at the same
+# turntable position up to this many times in total before the scan stops with an error: the two cameras must always
+# deliver a complete pair, a half pair would break the rig. The leftovers of a failed attempt are deleted first.
+CAPTURE_ATTEMPTS = max(1, int(_env_float("SCAN_CAPTURE_ATTEMPTS", 3)))
 
 # A photo name carries the shot number in 3 digits, so a ring holds at most 1000 photos per camera (more would make
 # names of different rings collide, e.g. ring 1 shot 1000 and ring 11 shot 0).
@@ -91,21 +96,22 @@ MIN_FREE_DISK_MB = _env_float("SCAN_MIN_FREE_DISK_MB", 2048.0)
 # The attribute exposed in /status keeps only the first entries of the missing list; the manifest keeps all of them.
 MISSING_STATUS_CAP = 50
 
-TOF_BACKGROUND_DISTANCE_MM = 320
-# An object is detected only when the reading is closer than the backdrop by more than this
-# margin, so ToF noise on the empty backdrop does not count as an object. Calibrate on the rig.
-TOF_CLEARANCE_MARGIN_MM = 25
+TOF_BACKGROUND_DISTANCE_MM = 350
 # Minimum pause after each turntable move before the next photo, so the object stops vibrating.
 TURNTABLE_SETTLE_S = 0.2
 # How often the Z-axis watchdog samples the limit switch in the direction of travel while the carriage moves.
 ENDSTOP_POLL_S = 0.005
-# Mechanical travel of the Z axis (specification, to be confirmed by measuring the rig) and the extra distance
-# homing / move-to-top may travel past it before giving up. Their sum is the step budget of those two moves.
-Z_TRAVEL_MAX_MM = 475
-Z_HOMING_MARGIN_MM = 15
+# Mechanical travel of the Z axis and the extra distance homing / move-to-top may travel past it before giving up
+# (see hardware/rig_limits.py). Their sum is the step budget of those two moves.
+from hardware.rig_limits import Z_TRAVEL_MAX_MM, Z_HOMING_MARGIN_MM  # noqa: E402
 # Z moves of the preparation (homing, +30 mm climb, move to top): constant speed, no ramp, at the same step delay as
 # the manual z-move and the scan climb (the profile that runs smoothly on the rig).
 Z_PREPARE_DELAY_S = 0.0010
+# Pause after the carriage has reached the bottom endstop in finish_preparation(), before it climbs to the start position
+# (lets the carriage and the endstop settle; a cancel ends it at once).
+Z_HOME_SETTLE_S = _env_float("SCAN_Z_HOME_SETTLE_S", 1.0)
+# Default height of the scan start position above the bottom endstop (PrepareRequest.z_start_mm overrides it).
+Z_START_DEFAULT_MM = 30.0
 
 class ScannerError(Exception):
     pass
@@ -174,18 +180,26 @@ T8_THREADED_ROD_STEP = 8 # mm
 
 class Scanner:
     def __init__(self, xvs: Optional[bool] = None, camera_mode: Optional[str] = None):
-        self.tof = ToFSensor()
-        self.turntable_motor = Motor(motor_id=0, dir_pin=7, step_pin=6, en_pin=8, step_type=TURNTABLE_STEP_TYPE)
-        self.z_axis_motor = Motor(motor_id=1, dir_pin=4, step_pin=5, en_pin=3, step_type=Z_STEP_TYPE)
+        # A part that fails to open (for example the PWM chip when the overlay is missing) must not leave the parts
+        # opened before it claimed: the pins, the I2C bus and the serial port would stay busy for the next attempt
+        # (the lazy singleton builds the Scanner again on the next request) and only a restart of the server freed them.
+        try:
+            self.tof = ToFSensor()
+            self.turntable_motor = Motor(motor_id=0, dir_pin=7, step_pin=6, en_pin=8, step_type=TURNTABLE_STEP_TYPE)
+            self.z_axis_motor = Motor(motor_id=1, dir_pin=4, step_pin=5, en_pin=3, step_type=Z_STEP_TYPE)
 
-        self.up_endstop = Endstop(pin=22, pull_up=True, bounce_time=0.02)
-        self.down_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
+            self.up_endstop = Endstop(pin=22, pull_up=True, bounce_time=0.02)
+            self.down_endstop = Endstop(pin=4, pull_up=True, bounce_time=0.02)
 
-        # Wire up safety interrupts: Any endstop hit immediately aborts in-flight Z-axis steps
-        self.up_endstop.when_pressed = self._on_top_endstop_hit
-        self.down_endstop.when_pressed = self._on_bottom_endstop_hit
+            # Wire up safety interrupts: Any endstop hit immediately aborts in-flight Z-axis steps
+            self.up_endstop.when_pressed = self._on_top_endstop_hit
+            self.down_endstop.when_pressed = self._on_bottom_endstop_hit
 
-        self.lights = DimmableLight(relay_pin=11, pwm_channel=0, frequency=10000)
+            self.lights = DimmableLight(relay_pin=11, pwm_channel=0, frequency=10000)
+        except Exception as e:
+            log.error("[Scanner] Could not open the hardware (%s); releasing what was already opened.", e)
+            self.close_hardware()
+            raise
 
         self.dual_cameras: Optional[BaseDualCamera] = None
 
@@ -266,7 +280,18 @@ class Scanner:
         self._phase_note: Optional[str] = None   # sticky message (e.g. first-ring ToF remark) kept across phases
         # Whether prepare_scan() of the selected camera driver accepts lock_auto (set by setup_and_stream)
         self._lock_auto_supported = False
+        # True while the cameras/lights were started by a manual /test endpoint (setup_and_stream(preflight=False)),
+        # not by /scanner/prepare: such a session does not own the rig the way a scan does
+        self._manual_session = False
 
+    @property
+    def scan_owns_rig(self) -> bool:
+        """
+        True while a /scanner/prepare or scan owns the rig (state PREPARING / PREPARED / RUNNING): the lights, motors
+        and cameras are then driven by the scan only. A manual /test stream session does not count.
+        """
+        return self.state in (ScannerState.PREPARING, ScannerState.PREPARED, ScannerState.RUNNING) \
+            and not self._manual_session
 
     @property
     def is_streaming(self):
@@ -859,7 +884,7 @@ class Scanner:
         """
         The z-axis motor will rotate until it reaches the bottom (home) endstop.
 
-        The travel is limited to Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM (16500 steps at 1/4 microstepping).
+        The travel is limited to Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM (49000 steps at 1/4 microstepping).
         With ``acceleration=False`` the carriage runs at the constant ``delay`` (``start_delay`` and ``ramp_percent``
         are ignored), like the manual z-move.
 
@@ -895,7 +920,7 @@ class Scanner:
         """
         The z-axis motor will rotate UP until it reaches the top endstop.
 
-        The travel is limited to Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM (16500 steps at 1/4 microstepping).
+        The travel is limited to Z_TRAVEL_MAX_MM + Z_HOMING_MARGIN_MM (49000 steps at 1/4 microstepping).
         With ``acceleration=False`` the carriage runs at the constant ``delay`` (``start_delay`` and ``ramp_percent``
         are ignored), like the manual z-move.
 
@@ -963,7 +988,7 @@ class Scanner:
                 if self._cancel_event.is_set():
                     return 0.0
                 try:
-                    md = cams[0].picam2.capture_metadata()
+                    md = cams[0].picam2.capture_metadata(wait=CAMERA_CALL_TIMEOUT_S)
                     exp = md.get("ExposureTime")
                     gain = md.get("AnalogueGain")
                     if exp and gain and exp > 0 and gain > 0:
@@ -1040,6 +1065,7 @@ class Scanner:
             # An emergency stop is still tearing the previous run down: starting now would clear its cancel flag
             self._check_prepare_allowed()
             self.state = ScannerState.PREPARING
+            self._manual_session = not preflight   # manual /test endpoints pass preflight=False
             self._cancel_event.clear()
             self.stream_urls = None
             self.total_photos = 0
@@ -1102,10 +1128,10 @@ class Scanner:
                 "rotation2": rotation2,
             }
 
-            self._lock_auto_supported = (CameraClass is DualCameraRPISync)
-            if self._lock_auto_supported:
-                # The MJPEG preview of the sync driver is its lores stream: preview_resolution sizes it
-                camera_kwargs["stream_size"] = tuple(preview_resolution)
+            # What the driver can do comes from the BaseDualCamera interface (capability flags), not from its class
+            self._lock_auto_supported = getattr(CameraClass, "supports_lock_auto", False) is True
+            # The MJPEG preview is the lores stream of the sync driver: preview_resolution sizes it (every driver accepts it)
+            camera_kwargs["stream_size"] = tuple(preview_resolution)
             self.dual_cameras = CameraClass(
                 camera_id1=cam1_id,
                 camera_id2=cam2_id,
@@ -1238,10 +1264,13 @@ class Scanner:
                 "needed for a scan."
             )
 
-    def finish_preparation(self, **camera_kwargs):
+    def finish_preparation(self, z_start_mm: float = Z_START_DEFAULT_MM, **camera_kwargs):
         """
-        Phase 2 & 3: Homes carriage, cleans R2, recalibrates cameras in front of the object.
-        Designed to run as a background task.
+        Phase 2 & 3: Homes carriage, climbs to the start position, cleans R2, recalibrates cameras in front of the
+        object. Designed to run as a background task.
+
+        :param z_start_mm: Height of the scan start position above the bottom endstop (0 = stay on the endstop).
+            Must be a whole number of Z steps (MotorError otherwise, before anything moves).
         """
         # This thread now runs the prepare sequence: the Z helpers honour a pending cancel for it (_cancel_applies)
         self._tls.automated = True
@@ -1257,9 +1286,14 @@ class Scanner:
             camera_kwargs.pop("rotation", None)
             camera_kwargs.pop("camera_mode", None)
             camera_kwargs.pop("mode", None)
+            copy_colour_gains = bool(camera_kwargs.pop("copy_colour_gains", False))
 
             # A cancel that landed before the first command must not start the homing at all
             if self._cancel_event.is_set(): return
+
+            # The start height must convert to whole steps: checked before the first command, so a bad value never
+            # leaves the carriage half-way after the homing.
+            self.z_axis_motor.distance_to_step_conversion(distance=z_start_mm)
 
             # home the motor (a cancel during the move makes the homing report "not reached": not an error)
             try:
@@ -1270,14 +1304,19 @@ class Scanner:
                 raise
             if self._cancel_event.is_set(): return
 
-            # Energize explicitly: homing ended with disable(), do not rely on the firmware's auto-enable
-            self.z_axis_motor.enable()
-            if not self.move_z_up_distance(distance=30.0, delay=Z_PREPARE_DELAY_S, acceleration=False):
-                # Never leave the Z driver energized on an abort or a cancel (it is idle now)
-                self.z_axis_motor.disable(settle_delay=0.0)
-                if self._cancel_event.is_set():
-                    return
-                raise ScannerError("The Z-axis move to the scan start position (+30 mm) was aborted.")
+            # The carriage is on the bottom endstop: let it settle before the climb (returns True on a cancel)
+            if self._cancel_event.wait(Z_HOME_SETTLE_S): return
+
+            # z_start_mm == 0: the carriage stays where the homing left it, on the bottom endstop
+            if z_start_mm > 0:
+                # Energize explicitly: homing ended with disable(), do not rely on the firmware's auto-enable
+                self.z_axis_motor.enable()
+                if not self.move_z_up_distance(distance=z_start_mm, delay=Z_PREPARE_DELAY_S, acceleration=False):
+                    # Never leave the Z driver energized on an abort or a cancel (it is idle now)
+                    self.z_axis_motor.disable(settle_delay=0.0)
+                    if self._cancel_event.is_set():
+                        return
+                    raise ScannerError(f"The Z-axis move to the scan start position (+{z_start_mm:g} mm) was aborted.")
             # The lead screw holds the carriage: do not leave the Z driver energized (1.8 A) through the light
             # stabilization and the wait for /scanner/start (the firmware energizes it by itself for every move).
             self.z_axis_motor.disable(interrupt=self._cancel_event)
@@ -1324,7 +1363,10 @@ class Scanner:
                 # prepare_scan of setup_and_stream stays unlocked so the stream can adapt.
                 if self._lock_auto_supported:
                     camera_kwargs["lock_auto"] = True
-                log.info("[Scanner] In-position camera recalibration settings (home + 30mm): %s", camera_kwargs)
+                # Part of the BaseDualCamera interface: every driver accepts it (the ones without support ignore it)
+                camera_kwargs["copy_colour_gains"] = copy_colour_gains
+                log.info("[Scanner] In-position camera recalibration settings (home + %g mm): %s",
+                         z_start_mm, camera_kwargs)
                 recalib_results = self.dual_cameras.prepare_scan(**camera_kwargs)
                 log.info("[Scanner] Applied recalibration settings from prepare_scan: %s", recalib_results)
                 if self._lock_auto_supported:
@@ -1380,7 +1422,11 @@ class Scanner:
             return self.stream_urls
 
     def stop_stream(self):
-        """Stops the live stream and releases the camera devices."""
+        """
+        Stops the live stream and releases the camera devices. When the cameras were started by a manual /test
+        session, that session also ends here: the lights go off and the state returns to IDLE, so a new /prepare is
+        accepted again. A scan's own preparation is never ended by this call (use cancel for that).
+        """
         if self.dual_cameras:
             try:
                 self.dual_cameras.stop_stream()
@@ -1390,6 +1436,14 @@ class Scanner:
             finally:
                 self.dual_cameras = None
                 self.stream_urls = None
+        with self._lock:
+            end_manual_session = self._manual_session and self.state in (ScannerState.PREPARING, ScannerState.PREPARED)
+            if end_manual_session:
+                self._manual_session = False
+                self.state = ScannerState.IDLE
+                self._set_phase(ScanPhase.IDLE)
+        if end_manual_session:
+            self._try_step("lights off after the manual stream", self.lights.off)
 
     def _capture_turntable_slice(
         self,
@@ -1426,7 +1480,8 @@ class Scanner:
         object_seen = False
         backdrop_count = 0
         unknown_count = 0
-        threshold = TOF_BACKGROUND_DISTANCE_MM - TOF_CLEARANCE_MARGIN_MM
+        # A reading below this distance is the object, at or above it the backdrop (no margin: the value is the threshold)
+        threshold = TOF_BACKGROUND_DISTANCE_MM
 
         for shot in range(total_shots):
             if self._cancel_event.is_set():
@@ -1439,15 +1494,28 @@ class Scanner:
                     break
                 raise ScannerError("The camera system is not available.")
 
-            # 1. Capture 2 photos using DualCamera / DualCameraXVS (Master & Slave)
-            try:
-                photo_paths = cameras.capture_photo(
-                    output_prefix=photo_file_stem(level_label, shot),
-                    output_dir=images_dir,
-                    meshroom_rig=True
-                )
-            except CaptureError as e:
-                raise ScannerError(f"Photo capture failed at level {level_label}, shot {shot}: {e}")
+            # 1. Capture 2 photos using DualCamera / DualCameraXVS (Master & Slave). A failed pair is retaken at the
+            # same position (the turntable has not moved); after CAPTURE_ATTEMPTS failures the scan stops.
+            stem = photo_file_stem(level_label, shot)
+            photo_paths = None
+            for attempt in range(1, CAPTURE_ATTEMPTS + 1):
+                try:
+                    photo_paths = cameras.capture_photo(
+                        output_prefix=stem,
+                        output_dir=images_dir,
+                        meshroom_rig=True
+                    )
+                    break
+                except CaptureError as e:
+                    # Never keep half a pair: delete the file of the camera that did succeed
+                    self._discard_partial_pair(images_dir, stem)
+                    if attempt >= CAPTURE_ATTEMPTS or self._cancel_event.is_set():
+                        raise ScannerError(
+                            f"Photo capture failed at level {level_label}, shot {shot} "
+                            f"(attempt {attempt} of {CAPTURE_ATTEMPTS}): {e}"
+                        )
+                    log.warning("[Scanner] Pair %s failed (attempt %d of %d): %s; retaking it.",
+                                stem, attempt, CAPTURE_ATTEMPTS, e)
 
             # 2. Verify both files, record them in the manifest and queue them for upload (never waits for uploads)
             self._register_photos(
@@ -1503,6 +1571,15 @@ class Scanner:
         if backdrop_count > unknown_count:
             return False
         return None if check_tof else False
+
+    @staticmethod
+    def _discard_partial_pair(images_dir: str, stem: str) -> None:
+        """Deletes the file(s) named `stem` left in the camera folders by a capture that did not complete."""
+        for path in Path(images_dir).glob(f"*/{stem}.jpg"):
+            try:
+                path.unlink()
+            except OSError as e:
+                log.warning("[Scanner] Could not delete the leftover %s: %s", path, e)
 
     def _probe_tof(self, threshold: float) -> Optional[bool]:
         """True: object present. False: the backdrop was seen with valid readings. None: no valid reading."""
@@ -1926,6 +2003,7 @@ class Scanner:
         """
         # Only reset to IDLE if we're not already in a terminal state
         with self._lock:
+            self._manual_session = False
             if self.state not in ScannerState.TERMINAL and not self._stopping:
                 self.state = ScannerState.IDLE
 

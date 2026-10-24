@@ -76,6 +76,8 @@ print(json.dumps({
     "nested_z_delay_1": ok(lambda: MechanicalConfig(z_axis={"delay": 1.0})),
     # Z distance
     "z_150": ok(lambda: ZMoveRequest(distance_mm=150.0)),
+    "z_475": ok(lambda: ZMoveRequest(distance_mm=475.0)),
+    "z_476": ok(lambda: ZMoveRequest(distance_mm=476.0)),
     "z_151": ok(lambda: ZMoveRequest(distance_mm=151.0)),
     "z_200": ok(lambda: ZMoveRequest(distance_mm=200.0)),
     "z_33_333": ok(lambda: ZMoveRequest(distance_mm=33.333)),
@@ -140,9 +142,12 @@ class TestSchemasWithRealPydantic(unittest.TestCase):
         self.assertFalse(self.r["nested_z_delay_1"])
 
     def test_z_distance_limit_is_the_travel(self):
+        # the longest move is the whole travel of the rod (475 mm, hardware/rig_limits.py)
         self.assertTrue(self.r["z_150"])
-        self.assertFalse(self.r["z_151"])
-        self.assertFalse(self.r["z_200"])
+        self.assertTrue(self.r["z_151"])
+        self.assertTrue(self.r["z_200"])
+        self.assertTrue(self.r["z_475"])
+        self.assertFalse(self.r["z_476"])
         self.assertFalse(self.r["z_33_333"])
 
     # C4
@@ -202,6 +207,9 @@ class _APIRouter:
         return lambda fn: fn
 
     get = post = put = delete = _decorator
+
+    def add_api_route(self, *args, **kwargs):
+        pass
 
 
 class _QueryInfo:
@@ -263,6 +271,9 @@ def _load_router(scanner):
     router_scanner = types.ModuleType("router.scanner")
     router_scanner.scanner = scanner
     router_scanner.ScannerState = _State
+    for _name in ("scanner_stream_mjpeg", "scanner_stream_switch_active", "scanner_stream_set_quality",
+                  "scanner_stream_sync_status"):
+        setattr(router_scanner, _name, lambda *args, **kwargs: None)
     hw_scanner = types.ModuleType("hardware.scanner")
     hw_scanner.ScannerError = _ScannerError
     hw_scanner.ScannerBusyError = _ScannerBusyError
@@ -333,7 +344,7 @@ class TestRouterMotionGuard(unittest.TestCase):
     def test_stream_start_takes_no_bitrate_and_skips_the_cloud_preflight(self):
         self.scanner.is_streaming = False
         self.scanner.stream_urls = None
-        self.scanner.setup_and_stream.return_value = ["/test/stream/mjpeg?camera=1", "/test/stream/mjpeg?camera=2"]
+        self.scanner.setup_and_stream.return_value = ["/scanner/stream/mjpeg?camera=1", "/scanner/stream/mjpeg?camera=2"]
         self.mod.test_stream_start()
         self.scanner.setup_and_stream.assert_called_once_with(enable_stream=True, preflight=False)
 

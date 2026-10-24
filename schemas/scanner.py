@@ -1,14 +1,38 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 from typing import Annotated, Literal
-from hardware.camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY
+from hardware.camera.config import (
+    DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY, VCM_MAX_POS, VCM_MIN_POS,
+)
 from hardware.motor import (
     END_DELAY_MIN, END_DELAY_MAX, TURNTABLE_END_DELAY_DEFAULT,
     MotorError, angle_to_steps, distance_to_steps, TURNTABLE_STEP_TYPE, Z_STEP_TYPE,
 )
 from hardware.motor import STEP_DELAY_MIN, STEP_DELAY_MAX
+from hardware.rig_limits import Z_TRAVEL_MAX_MM
 
-# Longest Z travel of the rig (decision D3); matches Z_TRAVEL_MAX_MM in hardware/scanner.py
-Z_DISTANCE_MAX_MM = 150.0
+# Longest Z move a request may ask for: the whole travel of the rod (hardware/rig_limits.py)
+Z_DISTANCE_MAX_MM = float(Z_TRAVEL_MAX_MM)
+# Scan start position above the bottom endstop (PrepareRequest.z_start_mm); the default matches Z_START_DEFAULT_MM
+# in hardware/scanner.py
+Z_START_DEFAULT_MM = 30.0
+Z_START_MAX_MM = 100.0
+
+
+def _defaults_as_example(schema: dict, model: type) -> None:
+    """
+    `json_schema_extra` hook of the request bodies: puts the model's own defaults in the schema as its example.
+
+    Without it Swagger (/docs) builds the "Example Value" field by field and shows `0` for every optional number that
+    defaults to null (exposure_time, analogue_gain, ...): "Execute" then sends `exposure_time: 0`, which is refused.
+    With it the example is exactly what a client that sends `{}` gets, minus the fields that default to null.
+    A model with a required field has no such example and is left alone.
+    """
+    try:
+        example = model().model_dump(mode="json", exclude_none=True)
+    except Exception:
+        return
+    schema["examples"] = [example]
+    schema["example"] = example   # older Swagger UI builds read this key
 
 
 class DualCameraConfig(BaseModel):
@@ -22,7 +46,15 @@ class DualCameraConfig(BaseModel):
     slave_id: Annotated[Literal[0, 1], Field(description="Camera ID for the slave camera.")] = 1
 
     quality: Annotated[int, Field(ge=10, le=100, description="JPEG quality for captured photos.")] = DEFAULT_QUALITY
-    photo_resolution: Annotated[tuple[int, int], Field(description="Resolution for still captures (W, H).")] = DEFAULT_PHOTO_RESOLUTION
+    photo_resolution: Annotated[
+        Literal[(4056, 3040), (2028, 1520)],
+        # a JSON array arrives as a list, which a Literal of tuples would not match
+        BeforeValidator(lambda v: tuple(v) if isinstance(v, list) else v),
+        Field(description=(
+            "Resolution for still captures (W, H): [4056, 3040] (full sensor) or [2028, 1520] (2x2 binned, the same "
+            "field of view). No other size is accepted."
+        )),
+    ] = DEFAULT_PHOTO_RESOLUTION
     preview_resolution: Annotated[tuple[int, int], Field(description=(
         "Resolution (W, H) of the live MJPEG preview; both values even, 160x120 up to the photo resolution. "
         "A larger preview costs CPU on the Pi."
@@ -36,15 +68,18 @@ class DualCameraConfig(BaseModel):
         ))
     ] = 0
 
-    focus: Annotated[int | Literal["auto"] | tuple[int, int] | list[int] | None, Field(
+    focus: Annotated[int | Literal["auto"] | tuple[int, int] | None, Field(
         description=(
-            "Focus position (0-1023) of both lenses, or a (cam1, cam2) pair. null keeps the saved position. "
-            "\"auto\" runs a sharpness sweep in front of the lit object (in the recalibration step of the "
-            "preparation) and keeps the best position of each lens locked for the scan."
+            "\"auto\" (default): a sharpness sweep in front of the lit object (in the recalibration step of the "
+            "preparation) finds the best position of each lens and keeps it locked for the scan. "
+            f"An integer sets both lenses to that position ({VCM_MIN_POS}-{VCM_MAX_POS}; a value outside the range is "
+            "moved to the nearest end). A pair [cam1, cam2] sets each lens separately (exactly two integers, "
+            "clamped the same way). null uses the last focus positions saved on the Pi (the ones the previous "
+            "scan, sweep or manual focus left)."
         )
-    )] = None
+    )] = "auto"
 
-    settle_time: Annotated[float, Field(ge=0.0, description="Time in seconds to wait for auto-exposure/auto-white-balance to settle.")] = 2.0
+    settle_time: Annotated[float, Field(ge=0.0, le=10.0, description="Time in seconds (0 to 10) to wait for auto-exposure/auto-white-balance to settle.")] = 2.0
 
     # Manual controls: null (or omitted) leaves the control to the camera. 0 is never a valid exposure or gain
     # (it used to produce completely black photos), so it is rejected instead of being sent to the sensor.
@@ -55,6 +90,12 @@ class DualCameraConfig(BaseModel):
         Field(description="Manual AWB gains (red, blue), each > 0. Disables auto white balance.")
     ] = None
     awb_mode: Annotated[str | None, Field(description="Auto white balance mode.")] = "auto"
+    copy_colour_gains: Annotated[bool, Field(description=(
+        "false (default): when the auto white balance is locked, each camera keeps the colour gains its own AWB "
+        "settled on (exposure and gain are still shared). true: camera 1's colour gains are copied onto camera 2, "
+        "which gives camera 2 a colour cast when the two sensors do not respond alike. Applies to the default "
+        "rpi_sync camera mode only."
+    ))] = False
 
     brightness: Annotated[float | None, Field(ge=-1.0, le=1.0, description="Brightness adjustment.")] = None
     contrast: Annotated[float | None, Field(gt=0.0, le=32.0, description="Contrast (> 0, 1.0 = neutral). 0 would flatten the image.")] = None
@@ -71,11 +112,16 @@ class DualCameraConfig(BaseModel):
 
     @model_validator(mode="after")
     def _preview_not_larger_than_photo(self):
-        if self.preview_resolution[0] > self.photo_resolution[0] or self.preview_resolution[1] > self.photo_resolution[1]:
+        photo_w, photo_h = self.photo_resolution
+        if "preview_resolution" not in self.model_fields_set:
+            # A client that lowers only the photo resolution must not be refused because of the default preview size
+            self.preview_resolution = (min(self.preview_resolution[0], photo_w) // 2 * 2,
+                                       min(self.preview_resolution[1], photo_h) // 2 * 2)
+        if self.preview_resolution[0] > photo_w or self.preview_resolution[1] > photo_h:
             raise ValueError("preview_resolution cannot be larger than photo_resolution")
         return self
 
-    @field_validator("colour_gains", "focus", mode="before")
+    @field_validator("colour_gains", mode="before")
     @classmethod
     def _all_null_pair_means_unset(cls, v):
         # Some clients send an empty pair as [null, null]; that means "not set", like null itself.
@@ -84,8 +130,31 @@ class DualCameraConfig(BaseModel):
             return None
         return v
 
+    @staticmethod
+    def _clamp_focus_position(value):
+        """A lens position outside the VCM range is moved to the nearest end (numbers only; the type check follows)."""
+        if isinstance(value, bool):
+            raise ValueError("focus positions must be integers, not booleans")
+        if isinstance(value, (int, float)):
+            return max(VCM_MIN_POS, min(VCM_MAX_POS, value))
+        return value
+
+    @field_validator("focus", mode="before")
+    @classmethod
+    def _normalise_focus(cls, v):
+        # [null, null] means "not set", like null itself (the last saved positions are used)
+        if isinstance(v, (list, tuple)):
+            if len(v) > 0 and all(item is None for item in v):
+                return None
+            if len(v) != 2:
+                raise ValueError("focus must be \"auto\", an integer, null or a pair [cam1, cam2] of exactly two integers")
+            return tuple(cls._clamp_focus_position(item) for item in v)
+        return cls._clamp_focus_position(v)
+
 
 class PrepareRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_defaults_as_example)
+
     enable_stream: Annotated[bool, Field(
         description="Whether to start the MJPEG live preview during preparation and return its URLs."
     )] = True
@@ -93,12 +162,35 @@ class PrepareRequest(BaseModel):
         gt=0.0,
         le=1.0,
         description=(
-            "Desired LED brightness during the scan (above 0.0, up to 1.0). Defaults to 100%. "
-            "0 is refused: the scanner cannot scan in the dark."
+            "Desired LED brightness (PWM) during the scan (above 0.0, up to 1.0). Defaults to 100%. "
+            "0 is refused: the scanner cannot scan in the dark. Not to be confused with camera_config.brightness, "
+            "which adjusts the image."
         )
     )] = 1.0
+    z_start_mm: Annotated[float, Field(
+        ge=0.0,
+        le=Z_START_MAX_MM,
+        description=(
+            "Height in millimeters of the scan start position above the bottom endstop: after the homing the "
+            f"carriage climbs this far (0 to {Z_START_MAX_MM:g}, default {Z_START_DEFAULT_MM:g}; 0 stays on the "
+            "endstop). Must be a whole number of motor steps (multiples of 0.01 mm at 1/4 microstepping)."
+        )
+    )] = Z_START_DEFAULT_MM
 
-    camera_config: Annotated[DualCameraConfig, Field(description="Configuration block for the dual camera array.")]
+    @field_validator("z_start_mm")
+    @classmethod
+    def _z_start_must_be_whole_steps(cls, value: float) -> float:
+        try:
+            distance_to_steps(value, Z_STEP_TYPE)
+        except MotorError as e:
+            raise ValueError(str(e))
+        return value
+
+    # Optional: a client that sends nothing (or only some fields) gets the defaults declared in DualCameraConfig. The
+    # front-end may send its basic fields (photo quality / resolution) and leave the advanced ones out.
+    camera_config: Annotated[DualCameraConfig, Field(
+        description="Configuration block for the dual camera array (every field has a default)."
+    )] = Field(default_factory=DualCameraConfig)
 
 
 class _TurntableMotion(BaseModel):
@@ -154,6 +246,8 @@ class _TurntableMotion(BaseModel):
 
 class TurntableRotateRequest(_TurntableMotion):
     """Manual rotation (`/test/turntable/rotate`): up to 360° in either direction."""
+    model_config = ConfigDict(json_schema_extra=_defaults_as_example)
+
     clockwise: Annotated[bool, Field(
         description="Rotation direction (True = clockwise, False = counter-clockwise)."
     )] = True
@@ -251,6 +345,8 @@ class _ZMotion(BaseModel):
 
 class ZMoveRequest(_ZMotion):
     """Manual Z move (`/test/motor/z-move`): up or down."""
+    model_config = ConfigDict(json_schema_extra=_defaults_as_example)
+
     direction: Annotated[Literal["up", "down"], Field(
         description="Direction of carriage travel."
     )] = "up"
@@ -314,7 +410,7 @@ class CloudConfig(BaseModel):
 
 
 class StartRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_defaults_as_example)
 
     job_id: Annotated[str, Field(
         description="Unique identifier for this scanning and processing job, used to track RunPod execution."
@@ -351,3 +447,21 @@ class CancelResponse(BaseModel):
 class StartResponse(BaseModel):
     status: str = "accepted"
     message: str = "Scan started"
+
+
+class StreamActiveRequest(BaseModel):
+    """JSON body of `POST /scanner/stream/active` (and `/test/stream/active`); the query parameter works as well."""
+    camera_id: Annotated[int, Field(
+        ge=1,
+        le=2,
+        description="Camera ID to display in preview (1 for cam1, 2 for cam2)."
+    )]
+
+
+class StreamQualityRequest(BaseModel):
+    """JSON body of `POST /scanner/stream/quality` (and `/test/stream/quality`); the query parameter works as well."""
+    quality: Annotated[int, Field(
+        ge=1,
+        le=100,
+        description="JPEG compression quality (1 to 100)."
+    )]
