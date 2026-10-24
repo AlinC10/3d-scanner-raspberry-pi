@@ -179,6 +179,10 @@ class DualCameraRPISync(BaseDualCamera):
         self._af_active = [False, False]
         self._af_frame: List[Optional[Tuple[int, Any]]] = [None, None]  # (seq, lores yuv array)
 
+        # Real-time computer vision / auto-framing: latest lores frames kept here in memory
+        self._framing_active = False
+        self._lores_frames: List[Optional[Tuple[int, Any]]] = [None, None]  # (seq, lores yuv array)
+
         self._lores_slots: List[Optional[Tuple[int, int, int, Any]]] = [None, None]
         self._lores_slot: Optional[Tuple[int, int, int, Any]] = None  # (cam_idx, seq, ts, yuv_array)
         self._still: List[Optional[Tuple[int, int, Any, Dict[str, Any]]]] = [None, None]  # (seq, ts, still_yuv_array, metadata_summary)
@@ -409,7 +413,8 @@ class DualCameraRPISync(BaseDualCamera):
                         has_spec = self._spectators[cam_idx] > 0
                         fallback = (not any(self._spectators)) and (cam_idx == self._active_idx)
                     need_af = self._af_active[cam_idx]
-                    if has_spec or fallback or need_af:
+                    need_framing = getattr(self, "_framing_active", False)
+                    if has_spec or fallback or need_af or need_framing:
                         lores = req.make_array("lores").copy()
 
                     # On-demand Still Capture Check
@@ -455,6 +460,8 @@ class DualCameraRPISync(BaseDualCamera):
                         self._lores_slot = (cam_idx, seq, ts, lores)
                         if self._af_active[cam_idx]:
                             self._af_frame[cam_idx] = (seq, lores)
+                        if getattr(self, "_framing_active", False):
+                            self._lores_frames[cam_idx] = (seq, lores)
 
                     if still is not None and self._still[cam_idx] is None:
                         self._still[cam_idx] = (seq, ts, still, still_meta)
@@ -582,6 +589,66 @@ class DualCameraRPISync(BaseDualCamera):
             ):
                 return lid, None
             return self._jpeg_ids[cam_idx], self._jpegs[cam_idx]
+
+    def get_latest_lores_frames(
+        self, timeout: float = 1.0, fresh: bool = False
+    ) -> Tuple[Optional[Any], Optional[Any]]:
+        """
+        Returns the newest preview frames as BGR numpy arrays (cam1, cam2).
+        Enables in-memory lores copying on both grab workers.
+        If fresh is True, awaits frames captured after this method was invoked.
+        """
+        if not PICAMERA2_AVAILABLE or not self._running:
+            # Stub mode fallback: return placeholder dummy BGR frames for testing
+            import numpy as np
+            w, h = self.stream_size
+            return np.zeros((h, w, 3), dtype=np.uint8), np.zeros((h, w, 3), dtype=np.uint8)
+
+        self._raise_if_a_worker_is_dead()
+        self._framing_active = True
+
+        start_time = time.monotonic()
+        target_seqs = [-1, -1]
+        with self._cond:
+            if fresh:
+                target_seqs = [self._latest[0], self._latest[1]]
+
+            def _ready() -> bool:
+                if not self._running or self._closing:
+                    return True
+                f0 = self._lores_frames[0]
+                f1 = self._lores_frames[1]
+                if f0 is None or f1 is None:
+                    return False
+                if fresh:
+                    return f0[0] > target_seqs[0] and f1[0] > target_seqs[1]
+                return True
+
+            while not _ready():
+                remaining = timeout - (time.monotonic() - start_time)
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=min(remaining, 0.05))
+
+            f0 = self._lores_frames[0]
+            f1 = self._lores_frames[1]
+            yuv0 = f0[1] if f0 is not None else None
+            yuv1 = f1[1] if f1 is not None else None
+
+        def _convert_yuv_to_bgr(yuv: Any) -> Optional[Any]:
+            if yuv is None or not OPENCV_AVAILABLE:
+                return None
+            try:
+                bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+                if isinstance(getattr(bgr, "shape", None), tuple) and len(bgr.shape) >= 2:
+                    if bgr.shape[1] > self.stream_size[0]:
+                        bgr = bgr[:, : self.stream_size[0]]
+                return bgr
+            except Exception as e:
+                log.warning("DualCameraRPISync: Failed converting lores YUV to BGR: %s", e)
+                return None
+
+        return _convert_yuv_to_bgr(yuv0), _convert_yuv_to_bgr(yuv1)
 
     def get_sync_status(self) -> Dict[str, Any]:
         """Returns diagnostic telemetry on sync status, offsets, drops, and stream fps."""
@@ -884,6 +951,8 @@ class DualCameraRPISync(BaseDualCamera):
         log.info("DualCameraRPISync: Stopping stream pipeline...")
         self._running = False
         self._is_streaming = False
+        self._framing_active = False
+        self._lores_frames = [None, None]
 
         with self._cond:
             self._cond.notify_all()

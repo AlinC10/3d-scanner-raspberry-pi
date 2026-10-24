@@ -15,6 +15,7 @@ INTERFACE = (
     "supports_preview_stream", "supports_lock_auto",
     "stream_size", "stream_quality", "autofocus_positions", "last_capture_info",
     "active_camera", "active", "add_spectator", "remove_spectator", "has_spectators", "wait_jpeg", "get_sync_status",
+    "get_latest_lores_frames",
     "prepare_scan", "start_stream", "stop_stream", "capture_photo", "record_video", "close",
     "focus_set", "focus_step", "focus_reset", "focus_sweep_autofocus", "lock_auto_features", "apply_settings",
 )

@@ -8,7 +8,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Any, Dict
 import threading
 import time
 from queue import Queue
@@ -721,6 +721,7 @@ class Scanner:
         level,
         shot: int,
         capture_info: Optional[dict] = None,
+        upload: bool = True,
     ) -> None:
         """
         Validates a freshly captured set of photos (each file must exist and be non-empty), records it in the
@@ -783,8 +784,9 @@ class Scanner:
 
         # Manifest first, then the upload: whatever gets uploaded is always listed
         self._write_manifest()
-        for path, key in zip(paths, keys):
-            self._enqueue_upload(path, key)
+        if upload:
+            for path, key in zip(paths, keys):
+                self._enqueue_upload(path, key)
 
     def _manifest_photo_count(self) -> int:
         with self._manifest_lock:
@@ -1856,6 +1858,318 @@ class Scanner:
         with self._lock:
             if self.state == ScannerState.RUNNING:
                 self.state = finish_state
+
+    def face_scan(
+        self,
+        strategy: str = "sweep_best_score",
+        start_z_mm: float = 180.0,
+        search_range_mm: float = 150.0,
+        step_mm: float = 8.0,
+        manual_z: Optional[float] = None,
+        home: bool = True,
+        upload_r2: bool = True,
+        illumination_brightness: float = 0.5,
+        settle_s: float = 0.150,
+        finish_state: str = ScannerState.IDLE,
+        analyzer: Optional[Any] = None,
+    ) -> dict:
+        """
+        Face capture mode: mechatronic auto-framing and synchronized 12.3MP photo capture.
+
+        Elevates the carriage across the facial region, evaluates stereo face framing
+        using in-memory preview frames (MediaPipe FaceLandmarker), finds the optimal
+        optical elevation, compensates mechanical backlash, and triggers synchronized still captures.
+
+        :param strategy: 'sweep_best_score' (search full range and return to apex) or
+            'direct_stop' (stop as soon as face is vertically centered).
+        :param start_z_mm: Initial rapid climb height in mm before starting search (default 180.0 mm).
+        :param search_range_mm: Window in mm to sweep above start_z_mm (default 150.0 mm).
+        :param step_mm: Climb distance between framing checks (must be whole motor steps).
+        :param manual_z: Optional explicit height in mm (>= 200.0 mm). Skips auto-framing if provided.
+        :param home: Whether to home carriage to bottom limit switch before moving.
+        :param upload_r2: Whether to enqueue and verify captured photos in Cloudflare R2 bucket.
+        :param illumination_brightness: Chamber LED PWM brightness level (0.0 - 1.0, default 0.5).
+        :param settle_s: Mechanical damping pause in seconds before the photo.
+        :param finish_state: State to set upon completion (default IDLE).
+        :param analyzer: Optional StereoFramingAnalyzer instance for dependency injection.
+        :return: Dict containing status, optimal_z_mm, best_score, photos list, and r2_uploaded flag.
+        """
+        with self._lock:
+            if self._stopping:
+                raise ScannerStoppingError("Cannot start face scan. An emergency stop is still in progress.")
+            if self.state in (ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING, ScannerState.DOWNLOADING):
+                raise ScannerBusyError(f"Cannot start face scan. Scanner is currently {self.state}")
+
+            if manual_z is not None:
+                if manual_z < 200.0 or manual_z > Z_TRAVEL_MAX_MM:
+                    raise ValueError(f"manual_z must be between 200.0 mm and {Z_TRAVEL_MAX_MM} mm (got {manual_z})")
+            else:
+                if start_z_mm + search_range_mm > Z_TRAVEL_MAX_MM:
+                    raise ValueError(
+                        f"start_z_mm ({start_z_mm}) + search_range_mm ({search_range_mm}) "
+                        f"exceeds maximum Z travel ({Z_TRAVEL_MAX_MM} mm)"
+                    )
+
+            # Validate mechanical step conversion before moving hardware
+            self.z_axis_motor.distance_to_step_conversion(distance=step_mm)
+
+            self._cancel_event.clear()
+            self.total_photos = 0
+            self.state = ScannerState.RUNNING
+            self._reset_status()
+            self._set_phase(ScanPhase.SCANNING)
+
+        scan_ok = False
+        images_dir = str(self.images_dir)
+        paths = []
+        target_z = 0.0
+        best_score = None
+
+        self._tls.automated = True
+        try:
+            with self.motion_guard():
+                # Chamber illumination setup
+                self.lights.unlock_brightness()
+                self.lights.set_brightness(illumination_brightness)
+                self.lights.lock_brightness()
+                self.lights.on()
+
+                # Turntable is idle during face scanning
+                self.turntable_motor.disable()
+
+                # Initialize cameras if not already available
+                if self.dual_cameras is None:
+                    mode = (self.camera_mode or "rpi_sync").lower()
+                    if mode in ("rpi_sync", "sync", "dual_camera_rpi_sync"):
+                        CameraClass = DualCameraRPISync
+                    elif mode in ("xvs", "dual_camera_xvs"):
+                        CameraClass = DualCameraXVS
+                    elif mode in ("staggered", "dual_camera", "legacy"):
+                        CameraClass = DualCamera
+                    else:
+                        CameraClass = DualCameraRPISync
+                    self.dual_cameras = CameraClass(
+                        stream_size=(960, 720),
+                        preview_size=(960, 720),
+                        size=(4056, 3040),
+                        rotation1=0,
+                        rotation2=0,
+                    )
+                    self.dual_cameras.prepare_scan()
+                else:
+                    if hasattr(self.dual_cameras, "_framing_active"):
+                        self.dual_cameras._framing_active = True
+
+                if self._cancel_applies():
+                    return {"status": "cancelled", "message": "Face scan cancelled before start"}
+
+                # Clean photo directory & manifest
+                try:
+                    fc.create_clean_dir(images_dir)
+                except Exception as e:
+                    raise ScannerError(f"Could not clean local photo directory {images_dir}: {e}")
+
+                self._begin_manifest(images_dir)
+                if upload_r2:
+                    try:
+                        r2.delete_all_files_from_bucket()
+                    except Exception as e:
+                        log.warning("[Scanner] Bucket cleanup warning: %s", e)
+                    self.start_upload_worker()
+
+                # 1. Homing
+                current_z = 0.0
+                if home:
+                    log.info("[Scanner Face] Homing Z axis to bottom endstop...")
+                    self.home_z_axis()
+                    current_z = 0.0
+                    if self._cancel_applies():
+                        raise ScannerError("Face scan cancelled during homing.")
+
+                # 2. Elevation & Auto-framing
+                if manual_z is not None:
+                    target_z = float(manual_z)
+                    climb_dist = target_z - current_z
+                    if climb_dist > 0:
+                        self.z_axis_motor.enable()
+                        self.move_z_up_distance(climb_dist)
+                        current_z = target_z
+                else:
+                    # Climb directly to initial search baseline
+                    climb_to_start = start_z_mm - current_z
+                    if climb_to_start > 0:
+                        self.z_axis_motor.enable()
+                        self.move_z_up_distance(climb_to_start)
+                        current_z = start_z_mm
+
+                    if analyzer is None:
+                        try:
+                            from face_scan.core.framing_analyzer import StereoFramingAnalyzer
+                            from face_scan.face_scanner import FaceScanner, MEDIAPIPE_AVAILABLE
+                        except (ImportError, ValueError):
+                            StereoFramingAnalyzer = None
+                            FaceScanner = None
+                            MEDIAPIPE_AVAILABLE = False
+
+                        if not MEDIAPIPE_AVAILABLE or StereoFramingAnalyzer is None:
+                            raise ScannerError(
+                                "MediaPipe is required for face auto-framing but is not available. "
+                                "Please specify manual_z or install mediapipe."
+                            )
+                        analyzer = StereoFramingAnalyzer(FaceScanner(num_faces=1))
+
+                    max_z = start_z_mm + search_range_mm
+                    best_score = -1.0
+                    best_z = current_z
+                    passed_apex_count = 0
+                    direct_stop_hit = False
+
+                    log.info("[Scanner Face] Starting auto-framing sweep: Z=%.1f mm to %.1f mm (step=%.1f mm, strategy=%s)",
+                             current_z, max_z, step_mm, strategy)
+
+                    while current_z <= max_z and not self.up_endstop.is_active:
+                        if self._cancel_applies():
+                            break
+
+                        # Retrieve in-memory preview frames
+                        frame_left, frame_right = self.dual_cameras.get_latest_lores_frames(fresh=True)
+                        eval_res = analyzer.evaluate_stereo_pair(frame_left, frame_right)
+                        score = eval_res.get("total_score", 0.0)
+                        avg_nose_y = eval_res.get("avg_nose_y")
+
+                        log.info(
+                            "[Scanner Face | Z=%5.1f mm] Score: %4.2f (L: %4.2f, R: %4.2f) | Nose Y: %s",
+                            current_z,
+                            score,
+                            eval_res.get("left", {}).get("score", 0.0),
+                            eval_res.get("right", {}).get("score", 0.0),
+                            f"{avg_nose_y:.3f}" if avg_nose_y is not None else "N/A"
+                        )
+
+                        if strategy == "direct_stop" and eval_res.get("both_detected") and avg_nose_y is not None:
+                            if 0.45 <= avg_nose_y <= 0.55:
+                                log.info("[Scanner Face] Direct stop centered at Z=%.1f mm (Nose Y=%.3f)", current_z, avg_nose_y)
+                                best_score = score
+                                best_z = current_z
+                                direct_stop_hit = True
+                                break
+
+                        if score > best_score:
+                            best_score = score
+                            best_z = current_z
+                            passed_apex_count = 0
+                        else:
+                            if best_score > 1.2:
+                                passed_apex_count += 1
+                                if passed_apex_count >= 5:
+                                    log.info("[Scanner Face] Early exit: passed apex (Best: %.2f at %.1f mm)", best_score, best_z)
+                                    break
+
+                        if current_z + step_mm > max_z or self.up_endstop.is_active:
+                            break
+
+                        try:
+                            self.z_axis_motor.enable()
+                            moved = self.move_z_up_distance(step_mm)
+                            if not moved:
+                                break
+                            current_z += step_mm
+                        except TopEndstopTriggered:
+                            log.info("[Scanner Face] Top endstop switch triggered at Z=%.1f mm", current_z)
+                            break
+
+                    # Anti-backlash positioning to best_z
+                    if not direct_stop_hit and current_z > best_z:
+                        overshoot_mm = 3.0
+                        descent = (current_z - best_z) + overshoot_mm
+                        log.info("[Scanner Face] Backlash compensation: descending %.2f mm then climbing +%.2f mm to Z=%.1f mm",
+                                 descent, overshoot_mm, best_z)
+                        self.move_z_down_distance(descent)
+                        time.sleep(0.05)
+                        self.move_z_up_distance(overshoot_mm)
+                        current_z = best_z
+                    elif current_z < best_z:
+                        climb = best_z - current_z
+                        self.move_z_up_distance(climb)
+                        current_z = best_z
+
+                    target_z = best_z
+
+                # 3. Stabilization pause
+                if settle_s > 0:
+                    time.sleep(settle_s)
+
+                if self._cancel_applies():
+                    raise ScannerError("Face scan cancelled before photo capture.")
+
+                # 4. Synchronized Still Capture
+                stem = f"f_{int(round(target_z))}"
+                log.info("[Scanner Face] Capturing stereo pair at Z=%.1f mm with prefix %s...", target_z, stem)
+                paths = self.dual_cameras.capture_photo(
+                    output_prefix=stem,
+                    output_dir=images_dir,
+                    meshroom_rig=True
+                )
+                self._register_photos(
+                    images_dir=images_dir,
+                    photo_paths=paths,
+                    level="face",
+                    shot=int(round(target_z)),
+                    capture_info=getattr(self.dual_cameras, "last_capture_info", None),
+                    upload=upload_r2
+                )
+                scan_ok = True
+
+        except Exception as e:
+            if self._cancel_event.is_set():
+                log.info("[Scanner Face] Scan stopped by cancellation (%s).", e)
+            else:
+                message = f"Error during face scan: {str(e)}"
+                with self._lock:
+                    if self.state == ScannerState.RUNNING:
+                        self.state = ScannerState.ERROR
+                self._set_phase(ScanPhase.ERROR, error=message)
+                raise ScannerError(message)
+        finally:
+            self._tls.automated = False
+            completed = scan_ok and not self._cancel_event.is_set()
+            if completed:
+                self._teardown_hardware()
+            else:
+                self.cleanup()
+                if upload_r2:
+                    self.stop_upload_worker(wait_for_completion=False)
+
+        if self._cancel_event.is_set() or not scan_ok:
+            self._set_phase(ScanPhase.CANCELLED)
+            return {
+                "status": "cancelled",
+                "message": "Face scan was cancelled",
+                "optimal_z_mm": float(target_z) if target_z > 0 else None,
+                "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
+                "photos": paths,
+                "r2_uploaded": False
+            }
+
+        if upload_r2:
+            try:
+                self._drain_and_verify()
+            finally:
+                self.stop_upload_worker(wait_for_completion=False)
+
+        self._set_phase(ScanPhase.DONE)
+        with self._lock:
+            if self.state == ScannerState.RUNNING:
+                self.state = finish_state
+
+        return {
+            "status": "success",
+            "message": "Face capture completed successfully",
+            "optimal_z_mm": float(target_z),
+            "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
+            "photos": paths,
+            "r2_uploaded": bool(upload_r2)
+        }
 
     def _drain_and_verify(self) -> None:
         """

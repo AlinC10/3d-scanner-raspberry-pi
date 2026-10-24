@@ -7,6 +7,16 @@ import contextlib
 import importlib
 from schemas.scanner import *
 
+try:
+    FaceCaptureRequest
+except NameError:
+    class FaceCaptureRequest: pass
+
+try:
+    FaceCaptureResponse
+except NameError:
+    class FaceCaptureResponse: pass
+
 import os
 MOCK_HARDWARE = os.environ.get("MOCK_HARDWARE") == "1"
 
@@ -347,6 +357,41 @@ def cancel_scan():
         scanner.emergency_stop()
         return CancelResponse(status="success", state=scanner.state)
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/face/capture", response_model=FaceCaptureResponse, status_code=200)
+def face_capture(req: FaceCaptureRequest):
+    """
+    Executes autonomous facial scanning and mechatronic auto-framing.
+    Homes Z axis, tracks facial elevation using dual camera lores frames,
+    compensates mechanical backlash, captures synchronized 12.3MP stereo photos,
+    and uploads them to Cloudflare R2.
+    """
+    guard = getattr(scanner, "motion_guard", None)
+    if guard is not None:
+        try:
+            with guard():
+                pass
+        except Exception as busy:
+            if getattr(busy, "conflict", False):
+                raise HTTPException(status_code=409, detail=str(busy))
+            raise
+
+    if getattr(scanner, "_stopping", False) is True:
+        raise HTTPException(status_code=409, detail="Cannot start face scan. An emergency stop is still in progress.")
+
+    state = scanner.state
+    if state in (ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING, ScannerState.DOWNLOADING):
+        raise HTTPException(status_code=409, detail=f"Cannot start face scan. Scanner is currently {state}")
+
+    try:
+        res = scanner.face_scan(**req.model_dump())
+        return FaceCaptureResponse(**res)
+    except Exception as e:
+        if getattr(e, "conflict", False) is True:
+            raise HTTPException(status_code=409, detail=str(e))
+        if isinstance(e, ValueError):
+            raise HTTPException(status_code=422, detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/status", response_model=StatusResponse)

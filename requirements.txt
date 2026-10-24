@@ -86,6 +86,7 @@ markdown-it-py
 MarkupSafe
 marshmallow
 mdurl
+mediapipe>=0.10.14
 mmh3
 mpmath
 multidict
