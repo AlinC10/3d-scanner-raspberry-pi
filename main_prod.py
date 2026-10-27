@@ -10,7 +10,7 @@ import router.test
 
 from app_paths import frontend_directory
 from system.exception import SystemConnectionError
-
+from fastapi.staticfiles import StaticFiles
 log = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -58,6 +58,7 @@ else:
     log.warning("Front-end folder %s does not exist: serving the API only (set FRONTEND_DIR to its location).",
                 _frontend_dir)
 
+app.mount("/docs", StaticFiles(directory="ai/ai-docs"), name="docs")
 
 if __name__ == "__main__":
     # `python main_prod.py`: the scanner is meant to be reached only from the Pi itself, so the server listens on the

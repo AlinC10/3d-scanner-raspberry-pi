@@ -5,7 +5,6 @@ from database import db
 
 def delete_document_from_db(filename, delete_physically=True):
     print(f"\n--- [DELETE] Starting deletion for: {filename} ---")
-    
     if delete_physically:
         file_path = os.path.join("uploads", filename)
         if os.path.exists(file_path):
@@ -27,10 +26,9 @@ def delete_document_from_db(filename, delete_physically=True):
         
     return False
 
-
-def process_document(file_path):
+def process_document(file_path, doc_type="general"):
     filename = os.path.basename(file_path)
-    print(f"\n--- [UPLOAD] Starting processing for: {filename} ---")
+    print(f"\n--- [UPLOAD] Starting processing for: {filename} (Type: {doc_type}) ---")
 
     delete_document_from_db(filename, delete_physically=False)
 
@@ -43,7 +41,7 @@ def process_document(file_path):
     elif extension == 'docx':
         loader = Docx2txtLoader(file_path)
         documents = loader.load()
-    elif extension == 'txt':
+    elif extension in ['txt', 'md']:
         loader = TextLoader(file_path, encoding='utf-8')
         documents = loader.load()
     else:
@@ -52,19 +50,35 @@ def process_document(file_path):
     if not documents or all(len(doc.page_content.strip()) == 0 for doc in documents):
         raise Exception("Could not extract text from document (it is completely empty or an unreadable image).")
 
+    # Add metadata
+    for doc in documents:
+        doc.metadata['doc_type'] = doc_type
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_documents(documents)
 
-    # ---> FILTRUL NOU ADAUGAT <---
-    # Eliminam orice fragment gol, cu tip gresit (None) sau care contine doar spatii libere
-    valid_chunks = [chunk for chunk in chunks if
-                    chunk.page_content and isinstance(chunk.page_content, str) and chunk.page_content.strip()]
+    valid_chunks = [chunk for chunk in chunks if chunk.page_content and isinstance(chunk.page_content, str) and chunk.page_content.strip()]
 
     if not valid_chunks:
-        raise Exception("Nu am putut genera fragmente de text valide din acest document.")
+        raise Exception("Failed to generate valid text chunks.")
 
-    # Adaugam in baza de date doar fragmentele validate
     db.add_documents(valid_chunks)
-    print(f"[SUCCESS] Saved {len(valid_chunks)} fresh chunks!\n")
-
+    print(f"[SUCCESS] Saved {len(valid_chunks)} fresh chunks for {filename}!\n")
     return len(valid_chunks)
+
+def process_directory(directory_path, doc_type="general"):
+    print(f"\n--- [UPLOAD] Starting directory processing: {directory_path} (Type: {doc_type}) ---")
+    total_chunks = 0
+    if not os.path.exists(directory_path):
+        raise Exception(f"Directory {directory_path} does not exist!")
+        
+    for filename in os.listdir(directory_path):
+        if filename.endswith(('.md', '.txt', '.pdf', '.docx')):
+            file_path = os.path.join(directory_path, filename)
+            try:
+                chunks = process_document(file_path, doc_type)
+                total_chunks += chunks
+            except Exception as e:
+                print(f"[ERROR] Failed at {filename}: {str(e)}")
+                
+    return total_chunks
