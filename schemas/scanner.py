@@ -425,8 +425,22 @@ class PrepareResponse(BaseModel):
     state: str = "preparing"
     stream_urls: list[str] | None = None
 
+class FaceCaptureResult(BaseModel):
+    """Outcome of the last face scan, in `GET /scanner/status` (`face_result`) once it completed."""
+    optimal_z_mm: float | None = None
+    best_score: float | None = None
+    # Whether the height search found a face (None: no search, manual_z or strategy "none"). False is a warning, not
+    # an error: the photo was taken at the start height
+    face_detected: bool | None = None
+    warning: str | None = None
+    photos: list[str] = []
+    r2_uploaded: bool = False
+
+
 class StatusResponse(BaseModel):
     state: str
+    # What the last prepare readied the rig for: "object" (/scanner/prepare), "face" (/scanner/face/prepare), or null
+    mode: str | None = None
     total_photos: int = 0
     stream_urls: list[str] | None = None
 
@@ -439,6 +453,11 @@ class StatusResponse(BaseModel):
     missing: list[str] = []             # R2 keys that could not be verified in the bucket
     error: str | None = None            # why the scan ended in `error`
     tof_warnings: list[str] = []
+    face_result: FaceCaptureResult | None = None   # set when a face scan completed (POST /scanner/face/capture)
+    # Upload progress (E2): seconds since the last successful upload (or since the drain started), null when no upload
+    # is running; the drain gives up after upload_drain_timeout_s without one
+    seconds_since_last_upload: float | None = None
+    upload_drain_timeout_s: float | None = None
 
 class CancelResponse(BaseModel):
     status: str = "success"
@@ -467,24 +486,73 @@ class StreamQualityRequest(BaseModel):
     )]
 
 
-class FaceCaptureRequest(BaseModel):
-    """Configuration for autonomous facial capture with mechatronic auto-framing."""
+def _whole_z_steps_check(value: float | None, field_name: str) -> float | None:
+    # Every height and distance of the face scan becomes a Z move: a value that is not a whole number of motor steps
+    # would otherwise fail only after the carriage moved (FACE-9)
+    if value is None:
+        return value
+    try:
+        distance_to_steps(value, step_type=Z_STEP_TYPE)
+    except MotorError as e:
+        raise ValueError(f"{field_name} is not reachable with Z motor steps: {e}")
+    return value
+
+
+class FacePrepareRequest(BaseModel):
+    """
+    Body of `POST /scanner/face/prepare`: homing, climb to the start height, lights, cameras streaming. The rig then
+    waits (state `prepared`, mode `face`) for `POST /scanner/face/capture`.
+    """
     model_config = ConfigDict(extra="forbid", json_schema_extra=_defaults_as_example)
 
-    strategy: Annotated[Literal["sweep_best_score", "direct_stop"], Field(
-        description="Framing strategy: 'sweep_best_score' (sweep and return to apex) or 'direct_stop' (stop on center)."
-    )] = "sweep_best_score"
-
+    enable_stream: Annotated[bool, Field(
+        description="Whether to start the MJPEG live preview and return its URLs."
+    )] = True
+    illumination_brightness: Annotated[float, Field(
+        gt=0.0,
+        le=1.0,
+        description="Chamber LED brightness (PWM), above 0 up to 1 (default 0.5: not to blind the subject)."
+    )] = 0.5
     start_z_mm: Annotated[float, Field(
         ge=100.0,
         le=350.0,
-        description="Initial carriage climb height in mm before starting auto-framing search."
+        description="Height in mm above the bottom endstop where the carriage waits and the face search starts."
     )] = 180.0
+    upload_r2: Annotated[bool, Field(
+        description="Upload the photo pair to Cloudflare R2 and verify it (the bucket is cleaned by this prepare)."
+    )] = True
+    camera_config: Annotated[DualCameraConfig, Field(
+        description=(
+            "Camera settings. focus \"auto\" (default): the lenses stay on the saved position during the search and "
+            "an autofocus sweep runs on the face at the height found; an integer or a pair: that position, no "
+            "autofocus. exposure_time / analogue_gain / colour_gains: used as given, otherwise AE/AWB settle on the "
+            "face and are locked before the photo."
+        )
+    )] = Field(default_factory=DualCameraConfig)
+
+    @field_validator("start_z_mm")
+    @classmethod
+    def _whole_z_steps(cls, value: float, info) -> float:
+        return _whole_z_steps_check(value, info.field_name)
+
+
+class FaceCaptureRequest(BaseModel):
+    """
+    Body of `POST /scanner/face/capture` (after `POST /scanner/face/prepare`): how to find the height, then the photo.
+    """
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_defaults_as_example)
+
+    strategy: Annotated[Literal["sweep_best_score", "direct_stop", "none"], Field(
+        description=(
+            "'sweep_best_score' (search the range, go back to the best height), 'direct_stop' (stop as soon as the "
+            "face is vertically centered) or 'none' (photo at the prepared height, no search)."
+        )
+    )] = "sweep_best_score"
 
     search_range_mm: Annotated[float, Field(
         ge=10.0,
         le=250.0,
-        description="Vertical search window in mm above start_z_mm (default: 150.0 mm)."
+        description="How far above the prepared start height the search goes (the end must stay in the Z travel)."
     )] = 150.0
 
     step_mm: Annotated[float, Field(
@@ -496,22 +564,8 @@ class FaceCaptureRequest(BaseModel):
     manual_z: Annotated[float | None, Field(
         ge=200.0,
         le=Z_DISTANCE_MAX_MM,
-        description="Optional manual target height in mm (>= 200 mm). Skips auto-framing when set."
+        description="Optional explicit height in mm (>= 200 mm). Skips the search when set."
     )] = None
-
-    home: Annotated[bool, Field(
-        description="Perform homing to bottom limit switch (GPIO 4) before moving."
-    )] = True
-
-    upload_r2: Annotated[bool, Field(
-        description="Automatically enqueue and verify captured photos in Cloudflare R2 bucket."
-    )] = True
-
-    illumination_brightness: Annotated[float, Field(
-        gt=0.0,
-        le=1.0,
-        description="Chamber LED illumination PWM brightness level (default: 0.5 = 50%)."
-    )] = 0.5
 
     settle_s: Annotated[float, Field(
         ge=0.05,
@@ -519,31 +573,15 @@ class FaceCaptureRequest(BaseModel):
         description="Mechanical settling delay in seconds before taking the photo."
     )] = 0.150
 
-    @field_validator("step_mm")
+    @field_validator("step_mm", "search_range_mm", "manual_z")
     @classmethod
-    def _validate_step_mm(cls, value: float) -> float:
-        try:
-            distance_to_steps(value, step_type=Z_STEP_TYPE)
-        except MotorError as e:
-            raise ValueError(f"step_mm is not reachable with Z motor steps: {e}")
-        return value
-
-    @model_validator(mode="after")
-    def _check_travel_bounds(self) -> "FaceCaptureRequest":
-        if self.manual_z is None:
-            if self.start_z_mm + self.search_range_mm > Z_DISTANCE_MAX_MM:
-                raise ValueError(
-                    f"start_z_mm ({self.start_z_mm}) + search_range_mm ({self.search_range_mm}) "
-                    f"exceeds maximum Z travel ({Z_DISTANCE_MAX_MM} mm)."
-                )
-        return self
+    def _whole_z_steps(cls, value: float | None, info) -> float | None:
+        return _whole_z_steps_check(value, info.field_name)
 
 
 class FaceCaptureResponse(BaseModel):
-    """Response returned upon successful completion of facial capture sequence."""
-    status: str = "success"
-    message: str = "Face capture completed successfully"
-    optimal_z_mm: float | None = None
-    best_score: float | None = None
-    photos: list[str] = []
-    r2_uploaded: bool = False
+    """`POST /scanner/face/capture` (202): the face scan was accepted and runs in the background; poll /scanner/status."""
+    status: str = "accepted"
+    message: str = "Face scan started. Poll GET /scanner/status until the state is completed."
+    state: str = "running"
+

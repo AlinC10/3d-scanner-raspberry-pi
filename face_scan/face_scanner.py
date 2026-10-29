@@ -72,14 +72,52 @@ KEY_LANDMARK_INDICES = {
 }
 
 
+DEFAULT_MODEL_PATH = "assets/face_landmarker.task"
+
+
+def _resolve_model_path(model_path: str) -> Path:
+    """The model file: `model_path` itself, or the same name next to this module (or in `assets/`)."""
+    p = Path(model_path)
+    if not p.is_file():
+        candidates = [
+            Path(__file__).parent / "assets" / p.name,
+            Path(__file__).parent / p.name,
+            Path(__file__).parent.parent / "face_scan" / p.name,
+            Path("face_scan") / p.name,
+            Path("face_scan") / "assets" / p.name,
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                p = candidate
+                break
+    return p.resolve()
+
+
+def face_detection_problem(model_path: str = DEFAULT_MODEL_PATH) -> Optional[str]:
+    """
+    Why face detection cannot run here (None when it can): MediaPipe or OpenCV missing, or no model file.
+    Cheap (no detector is built), so it is checked before the carriage moves.
+    """
+    if not MEDIAPIPE_AVAILABLE:
+        return "MediaPipe is not installed (pip install mediapipe); face auto-framing needs it."
+    if getattr(cv2, "cvtColor", None) is None:
+        return "OpenCV (cv2) is not available; face auto-framing needs it."
+    if not _resolve_model_path(model_path).is_file():
+        return f"The MediaPipe face model '{Path(model_path).name}' was not found next to face_scan/."
+    return None
+
+
 class FaceScanner:
     """
     High-performance facial landmark detector and 3D mesh extractor.
+
+    Holds a MediaPipe detector (model and inference threads): use it as a context manager, or call close(), so it
+    does not stay in memory after the scan.
     """
 
     def __init__(
         self,
-        model_path: str = "assets/face_landmarker.task",
+        model_path: str = DEFAULT_MODEL_PATH,
         num_faces: int = 1,
         min_face_detection_confidence: float = 0.5,
         min_face_presence_confidence: float = 0.5,
@@ -92,20 +130,7 @@ class FaceScanner:
                 "MediaPipe is not installed. Face scanning requires mediapipe (pip install mediapipe)."
             )
 
-        p = Path(model_path)
-        if not p.is_file():
-            candidates = [
-                Path(__file__).parent / "assets" / p.name,
-                Path(__file__).parent / p.name,
-                Path(__file__).parent.parent / "face_scan" / p.name,
-                Path("face_scan") / p.name,
-                Path("face_scan") / "assets" / p.name,
-            ]
-            for candidate in candidates:
-                if candidate.is_file():
-                    p = candidate
-                    break
-        self.model_path = str(p.resolve())
+        self.model_path = str(_resolve_model_path(model_path))
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(
                 f"Model file '{self.model_path}' not found. Please provide a valid face_landmarker.task model."

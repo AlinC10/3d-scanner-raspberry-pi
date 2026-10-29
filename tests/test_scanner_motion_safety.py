@@ -199,25 +199,46 @@ class TestCancelDuringClimb(unittest.TestCase):
         # one ring that always "sees" the object so the scan wants to climb
         self.s._capture_turntable_slice = lambda **kwargs: True
 
-    def test_cancel_during_turntable_settle_does_not_lift_z(self):
-        def turntable_disable(*args, **kwargs):
-            self.s._cancel_event.set()  # the user cancels while the 0.5 s settle pause is running
+    def test_cancel_after_the_ring_does_not_lift_z(self):
+        def ring(**kwargs):
+            self.s._cancel_event.set()  # the user cancels while the last photo of the ring is taken
+            return True
 
-        self.s.turntable_motor.disable.side_effect = turntable_disable
+        self.s._capture_turntable_slice = ring
         self.s.scan()
         self.s.z_axis_motor.enable.assert_not_called()
         self.s.z_axis_motor.rotate.assert_not_called()
 
-    def test_settle_pauses_are_interruptible(self):
+    def test_the_z_settle_pause_is_interruptible(self):
         calls = []
 
-        def turntable_disable(*args, **kwargs):
+        def z_disable(*args, **kwargs):
             calls.append(kwargs.get("interrupt"))
-            self.s._cancel_event.set()
+            if kwargs.get("interrupt") is not None:   # the settle after the climb (not the release at the start)
+                self.s._cancel_event.set()
 
-        self.s.turntable_motor.disable.side_effect = turntable_disable
+        self.s.z_axis_motor.rotate.return_value = True
+        self.s.z_axis_motor.disable.side_effect = z_disable
         self.s.scan()
-        self.assertIs(calls[0], self.s._cancel_event)
+        self.assertIn(self.s._cancel_event, calls)
+
+    def test_the_turntable_stays_energized_through_the_climb(self):
+        # M9 / E4: released during the climb, the platter could move and the next ring would start at another angle
+        events = []
+        rings = []
+
+        def ring(**kwargs):
+            rings.append(1)
+            events.append("ring")
+            if len(rings) == 2:
+                self.s._cancel_event.set()
+            return True
+
+        self.s._capture_turntable_slice = ring
+        self.s.z_axis_motor.rotate.side_effect = lambda **kwargs: events.append("climb") or True
+        self.s.turntable_motor.disable.side_effect = lambda *a, **k: events.append("turntable off")
+        self.s.scan()
+        self.assertEqual(events[:3], ["ring", "climb", "ring"])
 
     def test_aborted_climb_without_cancel_is_an_error(self):
         self.s.z_axis_motor.rotate.return_value = False

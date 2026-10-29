@@ -49,12 +49,16 @@ out = {
     "devices_hangs": run_with(lambda: bt.scan_devices(duration=5), hang),
     "scan": run_with(
         lambda: [d.mac_address for d in bt.scan_devices(duration=5)],
-        lambda cmd: ok("Device AA:BB:CC:DD:EE:FF Phone") if cmd[1] == "devices" else ok("Icon: phone\nPaired: yes"),
+        lambda cmd: ok("Device AA:BB:CC:DD:EE:FF Phone") if cmd[1] == "devices"
+        else ok("[NEW] Device AA:BB:CC:DD:EE:FF Phone") if "scan" in cmd
+        else ok("Icon: phone\nPaired: yes"),
     ),
-    # discovery overruns and `info` hangs, `devices` answers: the device is still listed
+    # discovery overruns (after seeing the device) and `info` hangs, `devices` answers: the device is still listed
     "scan_discovery_and_info_hang": run_with(
         lambda: [d.mac_address for d in bt.scan_devices(duration=5)],
-        lambda cmd: ok("Device AA:BB:CC:DD:EE:FF Phone") if cmd[1] == "devices" else hang(cmd),
+        lambda cmd: ok("Device AA:BB:CC:DD:EE:FF Phone") if cmd[1] == "devices"
+        else TimeoutExpired(cmd, 1, output="[CHG] Device AA:BB:CC:DD:EE:FF RSSI: -50") if "scan" in cmd
+        else hang(cmd),
     ),
     "constants": [bt.BLUETOOTHCTL_TIMEOUT_S, bt.PAIR_TIMEOUT_S, bt.CONNECT_TIMEOUT_S, bt.SCAN_GRACE_S],
 }

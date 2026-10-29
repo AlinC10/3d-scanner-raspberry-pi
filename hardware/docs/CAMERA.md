@@ -46,11 +46,13 @@ In the 4-phase scanning architecture, `prepare_scan()` is called twice:
 
 By guarding stream initialization with `if not getattr(self.picam2, "started", False):`, the second call bypasses destructive graph re-configuration. The video stream stays alive while the sensor dynamically updates exposure, meters the scene, and locks settings.
 
+> **Reconstruction.** The photos are reconstructed by **Turntable Studio** (`../template_meshroom/turntable_studio`), which replaced Meshroom: it still starts from AliceVision's `CameraInit` on the `rig/0` + `rig/1` folders, computes the intrinsics from the EXIF `FocalLength` and the full sensor width (6.287 mm), and locks the camera poses from the AprilTag disc instead of solving them with structure-from-motion. The rules below exist for that pipeline (they applied to Meshroom the same way).
+
 ### 3. Strict "No Digital Zoom" Policy
-Digital zoom or Region of Interest (ROI) cropping alters the effective focal length and shifts the lens's optical principal point $(c_x, c_y)$. This breaks Meshroom's mathematical distortion solver. The driver enforces zero-crop capture; framing adjustments must be made physically via the Z-axis lead screw or turntable distance.
+Digital zoom or Region of Interest (ROI) cropping alters the effective focal length and shifts the lens's optical principal point $(c_x, c_y)$. This breaks the intrinsics of the reconstruction (computed from the focal length and the full sensor width). `2028x1520` is the 2x2 binned mode of the whole sensor, not a crop, so it keeps the field of view (to be confirmed on the rig, V10). The driver enforces zero-crop capture; framing adjustments must be made physically via the Z-axis lead screw or turntable distance.
 
 ### 4. EXIF Serial Number Injection
-To prevent Meshroom's Bundle Adjustment node from averaging out subtle manufacturing differences between the two physical lenses (e.g. slight focal length or optical center variations), `camera.py` injects unique EXIF serial numbers (`cam0` and `cam1`). This causes Meshroom to automatically calibrate them as separate optical intrinsic groups.
+To keep the reconstruction from averaging out subtle manufacturing differences between the two physical lenses (e.g. slight focal length or optical center variations), `camera.py` injects unique EXIF serial numbers (`cam0` and `cam1`). AliceVision's `CameraInit` (Meshroom before, Turntable Studio now) then treats them as separate optical intrinsic groups.
 
 ### 4b. Controls, Focus and Release Semantics
 * **`apply_settings` only touches what is passed.** `brightness`/`contrast`/`saturation`/`sharpness` no longer re-enable AE, so a locked exposure stays locked. `exposure_time` or `analogue_gain` disable AE (a gain-only call locks the exposure at the latest known metadata value; if none is known yet AE is left as is and may override the gain). `awb_mode` presets keep AWB enabled; manual `colour_gains` disable it.
@@ -58,9 +60,9 @@ To prevent Meshroom's Bundle Adjustment node from averaging out subtle manufactu
 * **`close()` releases the camera**: stops recording/preview/stream, `Picamera2.close()` (so the next `Picamera2(id)` does not report "device busy") and the focuser bus. It is idempotent and each step is guarded.
 
 ### 5. Photogrammetry Sensor Defaults
-To optimize raw capture fidelity for AliceVision Meshroom, `prepare_scan()` automatically enforces two optical defaults:
+To optimize raw capture fidelity for the photogrammetry pipeline, `prepare_scan()` automatically enforces two optical defaults:
 * **`AeMeteringMode: CentreWeighted`**: Unlike standard matrix metering which averages dark empty backgrounds and severely overexposes centrally placed objects, center-weighted metering calculates exposure strictly from the central region where the object sits.
-* **`NoiseReductionMode: Off`**: Disables `libcamera`'s automatic spatial denoising filter. Denoising filters smear micro-textures (wood grain, fabric weave, 3D print layer lines). Preserving raw sensor high-frequency detail allows Meshroom to extract significantly denser SIFT keypoints.
+* **`NoiseReductionMode: Off`**: Disables `libcamera`'s automatic spatial denoising filter. Denoising filters smear micro-textures (wood grain, fabric weave, 3D print layer lines). Preserving raw sensor high-frequency detail gives the dense reconstruction (OpenMVS in Turntable Studio) more texture to match.
 
 ---
 

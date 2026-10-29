@@ -10,7 +10,9 @@ These schemas govern incoming HTTP request payloads, enforce hardware safety bou
 
 ```
 schemas/
-├── scanner.py          # Core scanning, mechanical, camera, and cloud configurations
+├── scanner.py          # Core scanning, mechanical, camera, face scan and cloud configurations
+├── library.py          # /library: finished 3D objects (ModelRequest normalizes the format), see router/docs/LIBRARY_API.md
+├── ai.py               # AI assistant: ChatRequest / ChatResponse / AiStatusResponse
 └── system/             # Operating system & networking models
     ├── wifi.py         # Wi-Fi network characteristics
     ├── bluetooth.py    # Bluetooth device discovery & file transfer schemas
@@ -48,7 +50,7 @@ Complete image capture and optical parameter block.
 * Removed (nothing used them; still tolerated if a client sends them): `show_preview`, `keep_running`, `autofocus_step`, `autofocus_roi`, `video_resolution`.
 
 #### `CloudConfig`
-Controls the optional remote Meshroom photogrammetry on RunPod GPU workers (`extra="forbid"`).
+Controls the optional, legacy remote Meshroom photogrammetry on RunPod GPU workers (`extra="forbid"`). The reconstruction is now done by Turntable Studio (a separate project, see `router/docs/SCANNER_API.md`); leave `launch_runpod` off.
 * `launch_runpod`: `bool` (default: `false`) — When `false` the scan stops (`completed`) once the photos are verified in R2; when `true` the RunPod pipeline runs afterwards (and `/start` is refused with `400` if RunPod is not configured).
 * `resolution_mp`: `float` (default: `12.0`) — Image resolution in MP. Enforced `0.0 < resolution_mp <= 13.0` (12.0 nominal, 12.33 real sensor value).
 * `mode`: `Literal["single", "rig", "two-sides"]` (default: `"rig"`).
@@ -75,6 +77,23 @@ Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in th
 * `mechanical`: `MechanicalConfig` — Mechanical motion settings.
 * `cloud`: `CloudConfig` — RunPod switch (`launch_runpod`) and computing parameters.
 
+#### `FacePrepareRequest`
+Payload for `POST /scanner/face/prepare` (`extra="forbid"`).
+* `enable_stream`: `bool` (default `true`).
+* `illumination_brightness`: `float` (default `0.5`, `0 < b <= 1`).
+* `start_z_mm`: `float` (default `180.0`, `100 <= v <= 350`, whole Z steps): where the carriage waits and the search starts.
+* `upload_r2`: `bool` (default `true`): upload and verify the pair (the bucket is cleaned by the prepare).
+* `camera_config`: `DualCameraConfig`. `focus: "auto"` = saved position during the search, autofocus on the face at the height found; an integer or a pair = that position, no autofocus. Manual `exposure_time` / `analogue_gain` / `colour_gains` are used for the photo; otherwise AE/AWB are locked on the face.
+
+#### `FaceCaptureRequest`
+Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`, `upload_r2`, `illumination_brightness` moved to the prepare and are refused here).
+* `strategy`: `"sweep_best_score"` (default), `"direct_stop"` or `"none"` (photo at the prepared height).
+* `search_range_mm`: `float` (default `150.0`, `10 <= v <= 250`); prepared height + range `<= 475` is checked by the scanner (422).
+* `step_mm`: `float` (default `8.0`, `1 <= v <= 25`).
+* `manual_z`: `float | null` (default `null`, `200 <= v <= 475`): skips the search.
+* `settle_s`: `float` (default `0.15`, `0.05 <= v <= 2`).
+* Every distance must be a whole number of Z motor steps (multiples of `0.01` mm): `422` before anything moves.
+
 ---
 
 ### 📤 Response Payloads
@@ -93,6 +112,7 @@ Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in th
 ```json
 {
   "state": "running",
+  "mode": "object",
   "total_photos": 40,
   "stream_urls": ["/scanner/stream/mjpeg?camera=1", "/scanner/stream/mjpeg?camera=2"],
   "phase": "scanning",
@@ -102,10 +122,13 @@ Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in th
   "photos_uploaded": 22,
   "missing": [],
   "error": null,
-  "tof_warnings": []
+  "tof_warnings": [],
+  "face_result": null,
+  "seconds_since_last_upload": 3.2,
+  "upload_drain_timeout_s": 300.0
 }
 ```
-The progress fields are optional with safe defaults (`phase`/`phase_message`/`error`: `null`, counters: `0`, lists: `[]`). `missing` lists the R2 keys not found at the final verification; `error` carries the reason of an `error` state. See `router/docs/SCANNER_API.md`.
+`mode` is what the last prepare readied the rig for (`"object"`, `"face"`, `null`). `face_result` (`FaceCaptureResult`: `optimal_z_mm`, `best_score`, `face_detected`, `warning`, `photos`, `r2_uploaded`) is set once a face scan completed. `seconds_since_last_upload` / `upload_drain_timeout_s` show the upload progress (`null` when no upload runs). The progress fields are optional with safe defaults (`phase`/`phase_message`/`error`: `null`, counters: `0`, lists: `[]`). `missing` lists the R2 keys not found at the final verification; `error` carries the reason of an `error` state. See `router/docs/SCANNER_API.md`.
 
 #### `StartResponse` (`202 Accepted`)
 ```json
@@ -114,6 +137,16 @@ The progress fields are optional with safe defaults (`phase`/`phase_message`/`er
   "message": "Pipeline started."
 }
 ```
+
+#### `FaceCaptureResponse` (`202 Accepted`)
+```json
+{
+  "status": "accepted",
+  "message": "Face scan started. Poll GET /scanner/status until the state is completed.",
+  "state": "running"
+}
+```
+The face scan runs in the background; its result is `StatusResponse.face_result`.
 
 #### `CancelResponse` (`200 OK`)
 ```json
@@ -125,7 +158,15 @@ The progress fields are optional with safe defaults (`phase`/`phase_message`/`er
 
 ---
 
-## 2. System & Networking Models (`schemas/system/`)
+## 2. AI Assistant Models (`schemas/ai.py`)
+
+* `ChatRequest`: `question` (`str`, required), `history` (`[{"role": "user" | "assistant", "text": str}]`, default `[]`).
+* `ChatResponse`: `response` (`str`).
+* `AiStatusResponse`: `on` (`bool`), `loading` (`bool`), `reason` (`str | null`). See `router/docs/AI_API.md`.
+
+---
+
+## 3. System & Networking Models (`schemas/system/`)
 
 ### `NetworkCredentials` (`schemas/system/network.py`)
 Used for Wi-Fi and 802.1X Ethernet associations.

@@ -279,7 +279,7 @@ class TestModuleDefaults(unittest.TestCase):
             self.skipTest("SCAN_* overrides present in the environment")
         self.assertEqual(scanner_module.UPLOAD_ATTEMPTS_PER_FILE, 8)
         self.assertEqual(scanner_module.UPLOAD_PARK_RETRY_S, 60.0)
-        self.assertEqual(scanner_module.UPLOAD_DRAIN_TIMEOUT_S, 1800.0)
+        self.assertEqual(scanner_module.UPLOAD_DRAIN_TIMEOUT_S, 300.0)   # 5 min without a successful upload (E2)
         self.assertEqual(scanner_module.UPLOAD_BACKOFF_S, (2.0, 5.0, 10.0, 20.0, 30.0))
         self.assertEqual(scanner_module.MIN_FREE_DISK_MB, 2048.0)
 
@@ -336,6 +336,66 @@ class TestDrain(ScannerTestCase):
         path, key = self.add_file()
         self.s._enqueue_upload(path, key)
         self.assertEqual(self.s._drain_uploads(0.3), "worker_dead")
+
+    def test_upload_progress_reports_the_seconds_since_the_last_success(self):
+        # E2: GET /status shows how long the uplink has made no progress, and the drain limit
+        self.assertEqual(self.s.upload_progress(),
+                         {"seconds_since_last_upload": None, "upload_drain_timeout_s": scanner_module.UPLOAD_DRAIN_TIMEOUT_S})
+        self.s.start_upload_worker()
+        try:
+            self.s._last_upload_time = time.monotonic() - 42.0
+            seconds = self.s.upload_progress()["seconds_since_last_upload"]
+            self.assertGreaterEqual(seconds, 42.0)
+            self.assertLess(seconds, 45.0)
+            # a drain that started later is the reference while nothing has succeeded since
+            self.s._drain_started_at = time.monotonic() - 3.0
+            self.assertLess(self.s.upload_progress()["seconds_since_last_upload"], 5.0)
+        finally:
+            self.s._drain_started_at = None
+            self.s.stop_upload_worker(wait_for_completion=False)
+        self.assertIsNone(self.s.upload_progress()["seconds_since_last_upload"])
+
+    def test_the_drain_gives_up_after_the_limit_without_progress_and_a_success_restarts_it(self):
+        # A fake clock drives _drain_uploads: every poll advances it by 0.1 s, and `on_poll` plays the uploads
+        clock = {"now": 1000.0, "polls": 0}
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"])
+
+        class Polls:
+            def __init__(self, on_poll):
+                self.on_poll = on_poll
+
+            def is_set(self):
+                return False
+
+            def wait(self, _timeout):
+                clock["now"] += 0.1
+                clock["polls"] += 1
+                self.on_poll(clock["polls"])
+
+        real_event = self.s._cancel_event
+        self.addCleanup(setattr, self.s, "_cancel_event", real_event)
+        self.addCleanup(setattr, self.s, "_upload_thread", None)
+        self.s._upload_thread = types.SimpleNamespace(is_alive=lambda: True, join=lambda timeout=None: None)
+        self.s._last_upload_time = clock["now"] - 100.0     # the last success is long gone
+        self.s._pending = {"/photos/never-resolves.jpg"}
+        with patch.object(scanner_module, "time", fake_time), \
+                patch.object(scanner_module, "UPLOAD_DRAIN_TIMEOUT_S", 0.3):
+            self.s._cancel_event = Polls(lambda n: None)
+            self.assertEqual(self.s._drain_uploads(), "timeout")
+            self.assertLessEqual(clock["polls"], 5)               # 0.3 s from the start of the drain, not more
+            self.assertIsNone(self.s._drain_started_at)
+
+            # a success every 0.2 s keeps a 0.3 s limit from expiring for 2 s, then the backlog is resolved
+            def uploads(n):
+                if n % 2 == 0:
+                    self.s._last_upload_time = clock["now"]
+                if n == 20:
+                    self.s._pending.clear()
+
+            clock["polls"] = 0
+            self.s._cancel_event = Polls(uploads)
+            self.assertEqual(self.s._drain_uploads(), "done")
+            self.assertEqual(clock["polls"], 20)
 
     def test_cancel_during_the_drain_aborts_it_promptly(self):
         self.verdicts = {1: False}
@@ -969,6 +1029,32 @@ class TestPreflight(ScannerTestCase):
     def test_missing_tof_sensor_leaves_the_state_idle(self):
         self.s.tof.available = False
         self.assert_refused("ToF")
+
+    def test_a_missing_tof_sensor_is_reinitialised_once_before_the_refusal(self):
+        # PERI-10: a sensor that was absent at boot (or stopped answering) gets one more chance
+        self.s.tof.available = False
+        self.s.tof.reinitialize.reset_mock()
+        self.assert_refused("ToF")
+        self.s.tof.reinitialize.assert_called_once()
+
+    def test_a_tof_sensor_that_comes_back_after_reinitialisation_lets_the_prepare_run(self):
+        self.s.tof.available = False
+
+        def comes_back():
+            self.s.tof.available = True
+            return True
+
+        self.s.tof.reinitialize.side_effect = comes_back
+        self.s.tof.read_distance_mm.return_value = 300.0
+        self.s.setup_and_stream(enable_stream=False)
+        self.assertEqual(self.s.state, ScannerState.PREPARING)
+
+    def test_require_tof_is_the_check_of_scanner_start(self):
+        self.s.tof.read_distance_mm.return_value = 300.0
+        self.s.require_tof()
+        self.s.tof.read_distance_mm.return_value = None
+        with self.assertRaises(ScannerPreflightError):
+            self.s.require_tof()
 
     def test_tof_without_a_valid_test_reading_leaves_the_state_idle(self):
         self.s.tof.read_distance_mm.return_value = None

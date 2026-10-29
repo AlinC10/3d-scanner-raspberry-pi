@@ -338,5 +338,37 @@ class TestToFEndpoint(unittest.TestCase):
         json.dumps(self.mod.get_tof_distance(), allow_nan=False)
 
 
+
+class ReinitializeTest(unittest.TestCase):
+    """PERI-10: a sensor that failed at boot (or stopped answering) can be opened again without a server restart."""
+
+    def test_a_sensor_that_failed_at_boot_comes_back(self):
+        attempts = []
+
+        class FlakyDriver(FakeDriver):
+            def __init__(self, i2c):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise OSError("No I2C device at address: 0x29")
+                super().__init__(i2c)
+
+        module = load_tof(driver_cls=FlakyDriver)
+        with patch("atexit.register") as register:
+            tof = module.ToFSensor(timing_budget_ms=15)
+            self.assertFalse(tof.available)
+            self.assertTrue(tof.reinitialize())
+        self.assertTrue(tof.available)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(register.call_count, 1)   # the exit hook is registered once, not per open
+
+    def test_reinitialize_releases_the_old_driver_first(self):
+        tof, first = make_sensor()
+        with patch("atexit.register"):
+            self.assertTrue(tof.reinitialize())
+        self.assertTrue(first.stopped)
+        self.assertIsNot(tof.sensor, first)
+        self.assertTrue(tof.available)
+
+
 if __name__ == "__main__":
     unittest.main()

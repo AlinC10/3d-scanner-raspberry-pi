@@ -17,6 +17,15 @@ try:
 except NameError:
     class FaceCaptureResponse: pass
 
+try:
+    FacePrepareRequest
+except NameError:
+    class FacePrepareRequest: pass
+
+# What a prepare readies the rig for (hardware.scanner.ScanMode); plain strings so the mock scanner needs nothing more
+MODE_OBJECT = "object"
+MODE_FACE = "face"
+
 import os
 MOCK_HARDWARE = os.environ.get("MOCK_HARDWARE") == "1"
 
@@ -157,13 +166,36 @@ def _set_state_unless_cancelled(new_state) -> bool:
         return True
 
 
+def _unavailable(error: BaseException) -> bool:
+    """A missing device (ArduinoUnavailableError: `unavailable` is set) is a 503, not a server fault."""
+    return getattr(error, "unavailable", False) is True
+
+
+def require_arduino() -> None:
+    """
+    503 when the Arduino (motor controller) does not answer. Called before every request that moves a motor; the
+    scanner reconnects first, so it also detects an Arduino plugged in after the server started (API-21).
+    """
+    check = getattr(scanner, "require_motors", None)
+    if not callable(check):
+        return
+    try:
+        check()
+    except Exception as e:
+        if _unavailable(e):
+            raise HTTPException(status_code=503, detail=str(e))
+        raise
+
+
 def _finish_preparation_worker(kwargs: dict):
     scanner.finish_preparation(**kwargs)
 
-@router.post("/prepare", response_model=PrepareResponse, status_code=202)
-def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
+
+def _start_preparation(background_tasks: BackgroundTasks, brightness: float, enable_stream: bool,
+                       camera_config: dict, finish_kwargs: dict, **setup_kwargs) -> PrepareResponse:
     """
-    Safely triggers the homing, lighting, and camera initializations for the frontend framing.
+    Common part of /prepare and /face/prepare: refuses a busy rig or a wrong state before anything is touched, starts
+    the lights and the cameras, and leaves the homing and the climb to a background task.
     """
     # A manual /test move (or any motion still in flight) owns the rig: do not start preparing on top of it.
     # Entering and leaving the guard is only a non-blocking probe; `conflict` is duck-typed for the mock scanner.
@@ -187,18 +219,13 @@ def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=f"Cannot prepare. Scanner is currently {state}")
 
     try:
-        scanner.lights.set_brightness(req.illumination_brightness)
-        
-        urls = scanner.setup_and_stream(
-            enable_stream=req.enable_stream,
-            **req.camera_config.model_dump()
-        )
-        
+        scanner.lights.set_brightness(brightness)
+
+        urls = scanner.setup_and_stream(enable_stream=enable_stream, **setup_kwargs, **camera_config)
+
         # z_start_mm is not a camera setting: it must not reach prepare_scan(**kwargs) through camera_config
-        background_tasks.add_task(
-            _finish_preparation_worker, {**req.camera_config.model_dump(), "z_start_mm": req.z_start_mm}
-        )
-        
+        background_tasks.add_task(_finish_preparation_worker, {**camera_config, **finish_kwargs})
+
         return PrepareResponse(
             status="accepted", 
             message="Live stream started. Rig homing and camera tuning in progress.", 
@@ -211,11 +238,44 @@ def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
         status = 409 if getattr(e, "conflict", False) else 400
         raise HTTPException(status_code=status, detail=str(e))
     except Exception as e:
+        # No Arduino: scanning is unavailable until it answers again (503)
+        if _unavailable(e):
+            raise HTTPException(status_code=503, detail=str(e))
         # A busy rig (ScannerBusyError, a locked light) is a temporary refusal, not a server fault: 409
         if getattr(e, "conflict", False) is True:
             raise HTTPException(status_code=409, detail=str(e))
         # Hardware errors, S3 bucket cleanup errors, etc.
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/prepare", response_model=PrepareResponse, status_code=202)
+def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
+    """
+    Prepares an object scan: lights, cameras and live stream at once; homing, climb to `z_start_mm` and camera lock in
+    the background. Poll /status until `prepared` (mode `object`), then POST /scanner/start.
+    """
+    return _start_preparation(
+        background_tasks, req.illumination_brightness, req.enable_stream, req.camera_config.model_dump(),
+        {"z_start_mm": req.z_start_mm}, scan_mode=MODE_OBJECT,
+    )
+
+
+@router.post("/face/prepare", response_model=PrepareResponse, status_code=202)
+def prepare_face_scan(req: FacePrepareRequest, background_tasks: BackgroundTasks):
+    """
+    Prepares a face scan: lights, cameras and live stream at once; homing and climb to `start_z_mm` in the background.
+    Poll /status until `prepared` (mode `face`), then POST /scanner/face/capture. MediaPipe and its model are checked
+    first (400 when missing): a face scan cannot frame without them.
+    """
+    problem_check = getattr(scanner, "_face_detection_problem", None)
+    problem = problem_check() if callable(problem_check) else None
+    if isinstance(problem, str) and problem:
+        raise HTTPException(status_code=400, detail=problem)
+    return _start_preparation(
+        background_tasks, req.illumination_brightness, req.enable_stream, req.camera_config.model_dump(),
+        {"z_start_mm": req.start_z_mm, "upload_r2": req.upload_r2}, scan_mode=MODE_FACE, check_cloud=req.upload_r2,
+    )
+
 
 def _orchestrate_pipeline(req: StartRequest):
     """
@@ -341,6 +401,20 @@ def start_scan(req: StartRequest, background_tasks: BackgroundTasks):
     with _start_lock:
         if scanner.state != ScannerState.PREPARED:
             raise HTTPException(status_code=400, detail=f"Cannot start scan from state {scanner.state}. Must be PREPARED.")
+        if getattr(scanner, "mode", MODE_OBJECT) == MODE_FACE:
+            raise HTTPException(
+                status_code=400,
+                detail="The scanner is prepared for a face scan; call POST /scanner/prepare for an object scan.",
+            )
+        if not _start_state["pending"]:
+            require_arduino()   # the USB link may have dropped since /prepare
+            # The object scan needs the ToF sensor (end of the object); it is reinitialised once if it stopped
+            require_tof = getattr(scanner, "require_tof", None)
+            if callable(require_tof):
+                try:
+                    require_tof()
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=str(e))
         if _start_state["pending"]:
             raise HTTPException(status_code=409, detail="A scan start was already accepted and is in progress.")
         _start_state["pending"] = True
@@ -359,13 +433,34 @@ def cancel_scan():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/face/capture", response_model=FaceCaptureResponse, status_code=200)
-def face_capture(req: FaceCaptureRequest):
+def _face_scan_worker(params: dict):
     """
-    Executes autonomous facial scanning and mechatronic auto-framing.
-    Homes Z axis, tracks facial elevation using dual camera lores frames,
-    compensates mechanical backlash, captures synchronized 12.3MP stereo photos,
-    and uploads them to Cloudflare R2.
+    Background part of POST /face/capture. face_scan() publishes the outcome itself (COMPLETED with `face_result`,
+    ERROR with `error`, or CANCELLED); here a failure is only logged.
+    """
+    try:
+        scanner.face_scan(**params, begun=True, finish_state=ScannerState.COMPLETED)
+    except Exception as e:
+        log.error("Face scan failed: %s", e)
+        # A failure before face_scan() changed the state (e.g. a /test move grabbed the rig in between) must not leave
+        # the scanner RUNNING with nobody behind it
+        if scanner.state == ScannerState.RUNNING:
+            _set_state_unless_cancelled(ScannerState.ERROR)
+    finally:
+        with _start_lock:
+            _start_state["pending"] = False
+
+
+@router.post("/face/capture", response_model=FaceCaptureResponse, status_code=202)
+def face_capture(req: FaceCaptureRequest, background_tasks: BackgroundTasks):
+    """
+    Starts the face capture in the background, after POST /scanner/face/prepare: the height (search with MediaPipe on
+    fresh preview frames, `manual_z`, or none), the camera lock on the face, the synchronized stereo pair and the
+    verified upload to R2.
+
+    Answers 202 once the request is validated and the scanner is RUNNING; poll `GET /scanner/status` until the state
+    is `completed` (the result is in `face_result`), `error` or `cancelled`. 400 when the scanner is not prepared for
+    a face scan.
     """
     guard = getattr(scanner, "motion_guard", None)
     if guard is not None:
@@ -377,22 +472,44 @@ def face_capture(req: FaceCaptureRequest):
                 raise HTTPException(status_code=409, detail=str(busy))
             raise
 
-    if getattr(scanner, "_stopping", False) is True:
-        raise HTTPException(status_code=409, detail="Cannot start face scan. An emergency stop is still in progress.")
+    params = req.model_dump()
+    with _start_lock:
+        if _start_state["pending"]:
+            raise HTTPException(status_code=409, detail="A scan was already accepted and is still running.")
+        try:
+            scanner.begin_face_scan(**params)
+        except Exception as e:
+            if _unavailable(e):
+                raise HTTPException(status_code=503, detail=str(e))
+            if getattr(e, "conflict", False) is True:
+                raise HTTPException(status_code=409, detail=str(e))
+            if isinstance(e, ValueError):
+                raise HTTPException(status_code=422, detail=str(e))
+            if isinstance(e, RuntimeError) or type(e).__name__.startswith("Scanner"):
+                raise HTTPException(status_code=400, detail=str(e))   # preflight refused, scanner refused
+            raise HTTPException(status_code=500, detail=str(e))
+        _start_state["pending"] = True
 
-    state = scanner.state
-    if state in (ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING, ScannerState.DOWNLOADING):
-        raise HTTPException(status_code=409, detail=f"Cannot start face scan. Scanner is currently {state}")
+    background_tasks.add_task(_face_scan_worker, params)
+    return FaceCaptureResponse(state=scanner.state)
 
+def _face_result() -> dict | None:
+    """Outcome of the last completed face scan (None when there is none)."""
+    value = getattr(scanner, "face_result", None)
+    return value if isinstance(value, dict) else None
+
+
+def _upload_progress() -> dict:
+    """`seconds_since_last_upload` / `upload_drain_timeout_s` of the scanner (missing on older scanner objects)."""
+    progress = getattr(scanner, "upload_progress", None)
+    if not callable(progress):
+        return {}
     try:
-        res = scanner.face_scan(**req.model_dump())
-        return FaceCaptureResponse(**res)
-    except Exception as e:
-        if getattr(e, "conflict", False) is True:
-            raise HTTPException(status_code=409, detail=str(e))
-        if isinstance(e, ValueError):
-            raise HTTPException(status_code=422, detail=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        value = progress()
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
 
 @router.get("/status", response_model=StatusResponse)
 def get_status():
@@ -414,8 +531,10 @@ def get_status():
         items = [str(item) for item in value]
         return items[:limit] if limit else items
 
+    mode = getattr(scanner, "mode", None)
     return StatusResponse(
         state=scanner.state,
+        mode=mode if isinstance(mode, str) else None,
         total_photos=_count("total_photos"),
         stream_urls=getattr(scanner, "stream_urls", None),
         phase=_text("phase"),
@@ -426,6 +545,8 @@ def get_status():
         missing=_texts("missing", _MISSING_KEYS_REPORTED),
         error=_text("error"),
         tof_warnings=_texts("tof_warnings"),
+        face_result=_face_result(),
+        **_upload_progress(),
     )
 
 

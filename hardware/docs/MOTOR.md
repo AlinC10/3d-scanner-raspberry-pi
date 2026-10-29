@@ -165,7 +165,11 @@ Motor(
 * `step_type`: Mathematical microstepping mode string.
 * `port`: Optional override for the `ArduinoBridge` singleton connection.
 
+The constructor sends `CONFIG` through `configure()` and **never raises** for it: when the Arduino is missing (the server starts anyway, API-21) or refuses the configuration, `configured` is `False` and `config_error` says why. `configure()` sends it again (`Scanner.require_motors()` does so before a motor request); the bridge also replays it on every reconnect.
+
 ### Core Methods
+
+> **Default speed profile.** `rotate()` and `rotate_angle()` (the turntable) default to `acceleration=True`. `rotate_distance()` (the Z axis) defaults to `acceleration=False`, like `Scanner.move_z_up/down`: the Z axis runs at constant speed unless a caller asks for the ramp (decision 2026-10-28, Z-ACC-2).
 
 #### `rotate(clockwise: bool = True, steps: int = 200, delay: float = 0.002, acceleration: bool = True, ramp_percent: float = 0.2, decel_percent: float = None, start_delay: float = None, end_delay: float = None, **kwargs) -> bool`
 Rotates the motor using a constant-acceleration speed ramp (see *Speed Ramp & Slow Stop*).
@@ -211,7 +215,7 @@ z_axis = Motor(motor_id=1, step_pin=5, dir_pin=4, en_pin=3, step_type="1/4")
 
 z_axis.enable()
 try:
-    # Climb 30.0 mm up (3000 steps at 1/4 microstepping, 100 steps/mm)
+    # Climb 30.0 mm up (3000 steps at 1/4 microstepping, 100 steps/mm), at constant speed (the default here)
     z_axis.rotate_distance(clockwise=True, distance=30.0, delay=0.0010)
 finally:
     z_axis.disable()

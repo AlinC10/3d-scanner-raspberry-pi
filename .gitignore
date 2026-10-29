@@ -29,3 +29,6 @@ PROBLEME_RAMASE.md
 PRE_TEST_CHECKLIST.md
 test_snaps/
 .mcp.json
+
+results/
+state/

@@ -48,6 +48,7 @@ When the user types a message and hits send:
 2.  **Payload Assembly:** The frontend builds a JSON object containing the current `question` and the `history` array.
 3.  **Fetch Request:** A `POST` request is sent to `http://127.0.0.1:8000/api/ai/chat`.
 4.  **Response Handling:** Upon receiving a successful response (HTTP 200), the "Thinking..." bubble is removed, and the actual AI text is injected. The new exchange is pushed to `sessionStorage`.
+5.  **Assistant off:** when the server has no `GROQ_API_KEY` (or the AI libraries failed to load) the server still runs, `GET /api/ai/status` answers `{"on": false, "reason": "..."}` and `POST /api/ai/chat` answers **503** with the reason in `detail`. The front-end should check the status before enabling the chat and show `detail` on a non-2xx answer. See `router/docs/AI_API.md`.
 
 ---
 

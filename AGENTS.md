@@ -4,7 +4,7 @@ Instructions for AI coding agents working in this repository. Read this first; i
 
 ## What this is
 
-A photogrammetry scanner with a turntable. A **Raspberry Pi 5 (Trixie OS)** runs a FastAPI server, two Arducam IMX477 cameras (libcamera `rpi.sync`, motorized focus), a VL53L1X ToF sensor, relay + PWM lights and two endstops. An **Arduino Uno** generates the step pulses of two NEMA 17 motors (turntable, vertical Z axis) through TB6600 drivers, over serial. Photos are uploaded to Cloudflare R2 and verified there; 3D reconstruction (Meshroom on RunPod) is optional and **off by default**.
+A photogrammetry scanner with a turntable. A **Raspberry Pi 5 (Trixie OS)** runs a FastAPI server, two Arducam IMX477 cameras (libcamera `rpi.sync`, motorized focus), a VL53L1X ToF sensor, relay + PWM lights and two endstops. An **Arduino Uno** generates the step pulses of two NEMA 17 motors (turntable, vertical Z axis) through TB6600 drivers, over serial. Photos are uploaded to Cloudflare R2 and verified there. The 3D reconstruction is done by **Turntable Studio** (`../template_meshroom/turntable_studio`, a separate project with its own `AGENTS.md`); the scanner's own RunPod launch (`cloud.launch_runpod`, the old Meshroom image) is **off by default** and kept only until the hand-over to Turntable Studio is decided. A face scan (`POST /scanner/face/prepare`, then `POST /scanner/face/capture`) uses MediaPipe auto-framing. An optional AI assistant answers from `ai/ai-docs/` (`/api/ai/*`).
 
 The owner works in Romanian. `PROBLEME_RAMASE.md` is written in Romanian without diacritics; the documentation under `*/docs/` and the code are in English.
 
@@ -36,21 +36,24 @@ Python 3.13. All tests must pass before you finish; the suite takes about 30 sec
 |---|---|
 | Scanner state machine, prepare / scan phases, upload and verification, cancel and emergency stop | `hardware/docs/SCANNER.md` |
 | HTTP API of the scan (`/scanner/*`) and of the manual tests (`/test/*`) | `router/docs/SCANNER_API.md`, `router/docs/TEST_API.md` |
+| Finished 3D objects from `results/` (`/library/*`) | `router/docs/LIBRARY_API.md`, `storage/results.py` |
+| AI assistant (`/api/ai/*`), its service state and documentation database | `router/docs/AI_API.md`, `ai/service.py` |
 | Request / response models and their validation | `schemas/README.md`, `schemas/scanner.py` |
 | Dual camera drivers (`rpi_sync` is the production one), the `BaseDualCamera` interface and its capability flags | `hardware/docs/DUAL_CAMERAS.md`, `hardware/docs/CAMERA.md` |
 | Motors, Arduino bridge and serial protocol, firmware | `hardware/docs/MOTOR.md`, `hardware/docs/ARDUINO_BRIDGE.md`, `hardware/docs/ARDUINO_PROTOCOL.md`, `hardware/arduino_control/README.md` |
 | ToF sensor and the object / backdrop threshold, lights | `hardware/docs/TOF.md`, `hardware/docs/LIGHTS.md` |
-| Wi-Fi / Bluetooth / Ethernet | `system/README.md`, `router/docs/SYSTEM_API.md` |
+| Wi-Fi / Bluetooth / Ethernet (status, saved networks, guard during a scan, restore at startup) | `system/README.md`, `router/docs/SYSTEM_API.md` |
+| What changed for the front-end (keep it updated when an endpoint changes) | `router/docs/FRONTEND_CHANGES.md` |
 | Mechanical limits of the rig | `hardware/rig_limits.py` |
 | Open problems by priority, decisions already taken, what was fixed and what is unconfirmed | `PROBLEME_RAMASE.md` |
 | Procedure before testing the motors on the rig | `PRE_TEST_CHECKLIST.md` |
 | Plans (done and future) | `plans/` |
 
-The files `.cursorrules`, `.github/copilot-instructions.md`, `.agents/skills/rules.md` and `.aiassistant/rules/*` describe an older architecture and are **obsolete**; ignore them.
+The old instruction files (`.cursorrules`, `.github/copilot-instructions.md`, `.agents/`, `.aiassistant/`) were removed; if a copy turns up, it describes an older architecture: ignore it.
 
 ## Architecture in five lines
 
-* `router/*.py` are thin: validate with the schemas, call `Scanner`, map errors to HTTP codes (409 = busy or stopping, 400 = refused state or configuration, 422 = invalid body). The preview endpoints exist once (`router/scanner.py`) and are also registered under `/test/stream/*`.
+* `router/*.py` are thin: validate with the schemas, call `Scanner`, map errors to HTTP codes (409 = busy or stopping, 400 = refused state or configuration, 422 = invalid body, 503 = a device is missing: the Arduino, or the AI assistant is off). The preview endpoints exist once (`router/scanner.py`) and are also registered under `/test/stream/*`.
 * `hardware/scanner.py` (`Scanner`) owns the rig: state machine, exclusive motion (`motion_guard`), cooperative cancel (`_cancel_event`), the background upload pipeline (retry, parking, drain, verification against a manifest).
 * A request is validated by the same functions the hardware uses (`angle_to_steps`, `distance_to_steps`), so a bad value is a 422 before anything moves.
 * New request fields go through four places: the schema, the router, `Scanner` (and the camera interface if it concerns the cameras), and the docs; add tests for each.

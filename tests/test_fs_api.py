@@ -132,9 +132,10 @@ class TestRequestSchemas(unittest.TestCase):
 
     def test_status_response_defaults_and_fields(self):
         self.assertEqual(self.r["status"], {
-            "state": "idle", "total_photos": 0, "stream_urls": None, "phase": None, "phase_message": None,
+            "state": "idle", "mode": None, "total_photos": 0, "stream_urls": None, "phase": None, "phase_message": None,
             "level": 0, "photos_captured": 0, "photos_uploaded": 0, "missing": [], "error": None,
-            "tof_warnings": [],
+            "tof_warnings": [], "face_result": None, "seconds_since_last_upload": None,
+            "upload_drain_timeout_s": None,
         })
         full = self.r["status_full"]
         self.assertEqual((full["phase"], full["level"], full["photos_uploaded"], full["missing"], full["error"]),

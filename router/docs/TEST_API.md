@@ -14,6 +14,8 @@ Interactive OpenAPI docs are accessible at: `http://127.0.0.1:8000/docs#/Hardwar
 > **Overlapping motions**: `/test/motor/z-move`, `/test/turntable/rotate`, `/test/motor/home-bottom` and `/test/motor/move-to-top` run inside the scanner motion guard. A second motion request that arrives while another motion is running is answered `409 Conflict` ("Another motion is in progress...") and its motor is not touched; wait for the running move to finish or stop it with `POST /scanner/cancel`.
 
 > [!WARNING]
+> **Without the Arduino**: `/test/motor/enable`, `/test/motor/disable`, `/test/motor/home-bottom`, `/test/motor/move-to-top`, `/test/motor/z-move` and `/test/turntable/rotate` first check that the Arduino answers (the bridge reconnects if needed) and answer `503 Service Unavailable` with a message naming the Arduino when it does not. `/test/cleanup`, the sensors, lights and cameras keep working.
+>
 > **Busy guard**: the endpoints that move or (de)energize the motors (`/test/motor/*`, `/test/turntable/rotate`, `/test/cleanup`) answer `409 Conflict` unless the scanner is `idle`, `completed`, `cancelled` or `error`. During `preparing`, `prepared`, `running`, `processing` and `downloading` use `POST /scanner/cancel` first. Read-only endpoints (endstops, ToF, status) are always available.
 
 ---

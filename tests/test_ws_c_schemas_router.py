@@ -272,7 +272,7 @@ def _load_router(scanner):
     router_scanner.scanner = scanner
     router_scanner.ScannerState = _State
     for _name in ("scanner_stream_mjpeg", "scanner_stream_switch_active", "scanner_stream_set_quality",
-                  "scanner_stream_sync_status"):
+                  "scanner_stream_sync_status", "require_arduino"):
         setattr(router_scanner, _name, lambda *args, **kwargs: None)
     hw_scanner = types.ModuleType("hardware.scanner")
     hw_scanner.ScannerError = _ScannerError

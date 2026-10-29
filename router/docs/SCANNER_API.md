@@ -1,6 +1,10 @@
 # Scanner Core API Documentation (`/scanner`)
 
-The Scanner router (`../scanner.py`) orchestrates the end-to-end photogrammetry pipeline: camera stream initialization, mechanical positioning, 360° capture synchronization, photo upload to Cloudflare R2 with verification, and (optionally, per request) cloud GPU 3D reconstruction and mesh retrieval.
+The Scanner router (`../scanner.py`) orchestrates the end-to-end photogrammetry capture: camera stream initialization, mechanical positioning, 360° capture synchronization, photo upload to Cloudflare R2 with verification, the face scan, and (optionally, per request, off by default) the legacy cloud reconstruction on RunPod.
+
+> **3D reconstruction.** The reconstruction of the photos is done by **Turntable Studio** (`../template_meshroom/turntable_studio`, a separate project: OpenMVS on camera poses locked from the AprilTag disc, multi-LOD `output.zip`, one RunPod pod per scan with the R2 layout `jobs/<id>/input/rig/0|1/*.jpg`). It replaced Meshroom. The scanner's own `cloud.launch_runpod` path below still launches the old Meshroom image and is kept only until it is decided how the scanner hands its photos to Turntable Studio (the scanner uploads them as `rig/<camera>/<file>`); leave it off.
+
+> **Without the Arduino** every request that moves a motor (`/prepare`, `/start`, `/face/prepare`, `/face/capture`, the `/test` motor endpoints) answers **503** with a message naming the Arduino; the rest of the server works. The Arduino is checked (and reconnected) at every such request, so plugging it back in is enough.
 
 Interactive OpenAPI documentation is accessible at: `http://127.0.0.1:8000/docs#/Scanner`
 
@@ -45,6 +49,10 @@ stateDiagram-v2
     PROCESSING --> DOWNLOADING: RunPod photogrammetry completes
     DOWNLOADING --> COMPLETED: 3D output.zip extracted
 
+    IDLE --> PREPARING: POST /scanner/face/prepare (mode face)
+    PREPARED --> RUNNING: POST /scanner/face/capture (mode face only)
+    RUNNING --> COMPLETED: Face scan done (face_result in /status)
+
     PREPARING --> CANCELLED: POST /scanner/cancel
     PREPARED --> CANCELLED: POST /scanner/cancel
     RUNNING --> CANCELLED: POST /scanner/cancel
@@ -65,6 +73,8 @@ stateDiagram-v2
 |---|---|---|---|
 | `POST` | `/scanner/prepare` | `202 Accepted` | Starts live stream immediately, homes carriage, and auto-tunes cameras in background |
 | `POST` | `/scanner/start` | `202 Accepted` | Launches the physical scan and the verified upload to R2; the RunPod pipeline only when `cloud.launch_runpod` is `true` |
+| `POST` | `/scanner/face/prepare` | `202 Accepted` | Prepares a face scan (mode `face`): lights, stream, homing and climb to `start_z_mm`; poll `/status` until `prepared` |
+| `POST` | `/scanner/face/capture` | `202 Accepted` | After the face prepare: finds the height, locks the cameras on the face, takes the stereo pair, verified upload; poll `/status` until `completed` |
 | `POST` | `/scanner/cancel` | `200 OK` | Emergency stop: cuts motor power, kills lights, closes streams, terminates cloud pods |
 | `GET` | `/scanner/status` | `200 OK` | Polls current state, phase, photo counters (captured / uploaded / missing), failure reason, and active stream URLs |
 | `GET` | `/scanner/stream/mjpeg` | `200 OK` | Direct multipart MJPEG stream for browser `<img>` tags (`?camera=1\|2`) with on-demand encoding |
@@ -143,12 +153,14 @@ Unknown keys inside `camera_config` are ignored (older clients keep working).
 ### Error Responses
 * `400 Bad Request`: If scanner is currently in an invalid state (e.g. `RUNNING` or `PROCESSING`), or the scanner refuses to prepare with a message (preflight refusal). The state is checked **before** anything is touched, so a refused `/prepare` does not change the LED brightness.
 * `409 Conflict`: A temporary refusal: an emergency stop is still tearing the previous run down, or another motion (manual `/test` move, homing) is in progress. Retry shortly.
+* `503 Service Unavailable`: the Arduino (motor controller) does not answer; nothing was touched.
+* `400 Bad Request` also when the ToF sensor is missing or gives no valid reading after one reinitialisation (`ToFSensor.reinitialize()`).
 * `422 Unprocessable Entity`: Invalid body, e.g. `illumination_brightness` is `0` (the range is `0 < b <= 1.0`: the scanner cannot scan in the dark) or a request key is unknown.
 * `500 Internal Server Error`: Hardware initialization failure.
 
 ### Example `curl`
 ```bash
-curl -X POST http://localhost:8000/scanner/prepare \
+curl -X POST http://127.0.0.1:8000/scanner/prepare \
      -H "Content-Type: application/json" \
      -d '{
        "enable_stream": true,
@@ -167,7 +179,7 @@ curl -X POST http://localhost:8000/scanner/prepare \
 Starts the automated scanning workflow: physical scan, photo upload to R2 and verification of the uploaded set. The cloud 3D generation (RunPod) is **optional** and off by default (`cloud.launch_runpod`).
 
 ### Pre-conditions
-* Scanner state **must** be `PREPARED` (obtained by polling `GET /scanner/status` after calling `/prepare`).
+* Scanner state **must** be `PREPARED` with `mode: "object"` (obtained by polling `GET /scanner/status` after calling `/prepare`). After a `/scanner/face/prepare` it answers `400`.
 
 ### Behavior
 1. Validates `scanner.state == ScannerState.PREPARED`.
@@ -178,11 +190,11 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
      * Synchronously captures photos from both cameras (2 photos per stop).
      * Pushes captured images into a background upload queue (uploads stream to Cloudflare R2 in parallel).
      * Climbs Z-axis by `z_move_mm` (default `100.0mm`) per elevation ring until the top limit switch triggers.
-     * An upload worker retries failed uploads with backoff; when the scan ends it waits for the uploads to drain (30 minutes without a single success is the limit) and the bucket is verified against the manifest.
+     * An upload worker retries failed uploads with backoff (one attempt of one file lasts at most 5 minutes); when the scan ends it waits for the uploads to drain (**5 minutes without a single success** is the limit) and the bucket is verified against the manifest.
      * When the scan ends, the uploads are verified against the list of expected keys in the R2 bucket. Missing photos end the run in `error` (see below) and stay on disk.
    * **Stage 1b (Completion without RunPod - `COMPLETED`)** (`cloud.launch_runpod = false`, the default):
-     * The state becomes `COMPLETED` as soon as the photos are verified in R2. `cloud.runpod` is not imported or called, so a missing RunPod key or package does not matter. Download the photos from the bucket for Meshroom.
-   * **Stage 2 (Cloud Meshroom Photogrammetry - `PROCESSING`)** (only when `cloud.launch_runpod = true`):
+     * The state becomes `COMPLETED` as soon as the photos are verified in R2. `cloud.runpod` is not imported or called, so a missing RunPod key or package does not matter. Download the photos from the bucket for the reconstruction (Turntable Studio).
+   * **Stage 2 (legacy cloud Meshroom photogrammetry - `PROCESSING`)** (only when `cloud.launch_runpod = true`; Meshroom was replaced by Turntable Studio, see the note at the top):
      * Transitions state to `PROCESSING`.
      * Launches a cloud GPU pod on RunPod (e.g., RTX 4090 / RTX 5090).
      * Runs Meshroom pipeline: Feature Extraction (SIFT), Structure-from-Motion (SfM), DepthMap, Meshing, Texturing.
@@ -267,7 +279,8 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
 ```
 
 ### Error Responses
-* `400 Bad Request`: If scanner state is not `PREPARED`, or `cloud.launch_runpod` is `true` and RunPod is not configured (`RUNPOD_API_KEY` missing, placeholder image name). Refused before the physical scan starts.
+* `400 Bad Request`: If scanner state is not `PREPARED`, the scanner was prepared for a face scan (`mode: "face"`), `cloud.launch_runpod` is `true` and RunPod is not configured (`RUNPOD_API_KEY` missing, placeholder image name), or the ToF sensor is missing / gives no valid reading after one reinitialisation (it ends the scan at the top of the object). Refused before the physical scan starts.
+* `503 Service Unavailable`: the Arduino does not answer (the USB link may have dropped since `/prepare`).
 * `422 Unprocessable Entity`: an unknown key anywhere in the body (e.g. `mechanical.angle`, `mechanical.z_move_mm`); `cloud.resolution_mp` is `0` or above `13.0`; `turntable.angle` is not a whole number of microsteps (multiples of `0.1125°` at 1/16), is above `180`, or does not divide a full revolution in whole steps (`3200 % steps != 0`, e.g. `33.75` or `360`); `z_axis.distance_mm` is above `475` or not a whole number of steps (multiples of `0.01 mm` at 1/4); `delay` / `start_delay` is outside `0.0001`–`0.05` s. Validated up front, so a bad value no longer fails the scan after `prepare`. (The manual `POST /test/turntable/rotate` still accepts up to `360°`, see `TEST_API.md`.)
 * `409 Conflict`: A previous `POST /scanner/start` was already accepted and its pipeline has not finished yet (prevents two simultaneous scans from a double click).
   ```json
@@ -276,7 +289,7 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
 
 ### Example `curl`
 ```bash
-curl -X POST http://localhost:8000/scanner/start \
+curl -X POST http://127.0.0.1:8000/scanner/start \
      -H "Content-Type: application/json" \
      -d '{
        "job_id": "scan-sample-01",
@@ -326,7 +339,7 @@ Instantly aborts all physical movements and cloud computing.
 
 ### Example `curl`
 ```bash
-curl -X POST http://localhost:8000/scanner/cancel
+curl -X POST http://127.0.0.1:8000/scanner/cancel
 ```
 
 ---
@@ -343,6 +356,7 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
 ```json
 {
   "state": "running",
+  "mode": "object",
   "total_photos": 40,
   "stream_urls": [
     "/scanner/stream/mjpeg?camera=1",
@@ -355,13 +369,17 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
   "photos_uploaded": 22,
   "missing": [],
   "error": null,
-  "tof_warnings": []
+  "tof_warnings": [],
+  "face_result": null,
+  "seconds_since_last_upload": 3.2,
+  "upload_drain_timeout_s": 300.0
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `state` | `string` | State machine state (table below). |
+| `mode` | `string \| null` | What the last prepare readied the rig for: `object` (`/scanner/prepare`), `face` (`/scanner/face/prepare`), `null` (none, or a manual `/test` session). Stays set after the run. |
 | `total_photos` | `int` | Photos captured so far (kept for backward compatibility). |
 | `phase` | `string \| null` | Finer progress inside a state, e.g. `preparing`, `scanning`, `uploading`, `verifying`, `done`. `null` when the scanner does not report it. |
 | `phase_message` | `string \| null` | Human readable detail of the phase. |
@@ -371,6 +389,9 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
 | `missing` | `string[]` | R2 keys not found at the final verification (at most 50 are returned). Non-empty only with `state: "error"`. |
 | `error` | `string \| null` | Why the run ended in `error`. |
 | `tof_warnings` | `string[]` | Time-of-flight sensor warnings (e.g. invalid readings) raised during the scan. |
+| `face_result` | `object \| null` | Set when a face scan completed: `optimal_z_mm`, `best_score` (`null` without a search or when no face was found), `face_detected` (`null` without a search, `false` = no face found, the photo was taken at the start height), `warning`, `photos` (paths on the Pi), `r2_uploaded`. Reset by the next prepare or face scan. |
+| `seconds_since_last_upload` | `float \| null` | Seconds since the last successful upload to R2 (or since the upload or the drain started, whichever is later). `null` when no upload is running. |
+| `upload_drain_timeout_s` | `float \| null` | After the physical scan, the run ends in `error` when no upload succeeds for this long (300 s). With the field above a client can show "no upload progress for 2 min of 5". |
 
 All new fields have safe defaults (`null`, `0`, `[]`), so a client written for the old response keeps working.
 
@@ -383,16 +404,16 @@ When `scan()` finishes the physical scan but the verification finds photos missi
 | `idle` | Scanner is powered on and waiting for commands | Indefinite |
 | `preparing` | Cameras streaming, carriage homing, cloud sanitizing | 15–30 seconds |
 | `prepared` | Carriage in position, AE/AWB locked, ready to scan | Until `/start` |
-| `running` | Turntable rotating, taking photos, uploading to R2 | 2–5 minutes |
+| `running` | Turntable rotating, taking photos, uploading to R2; or a face capture in progress | 2–5 minutes (face capture: under a minute plus the upload) |
 | `processing` | Finalising after the scan; with `cloud.launch_runpod = true` the RunPod GPU pipeline is executing | seconds (3–10 minutes with RunPod) |
 | `downloading` | Downloading completed 3D model from R2 (RunPod only) | 10–30 seconds |
-| `completed` | Photos verified in R2 (default) or, with RunPod, 3D model ready in output folder | Finished |
+| `completed` | Photos verified in R2 (default), a face scan done (`face_result`), or, with RunPod, 3D model ready in output folder | Finished |
 | `cancelled` | Aborted by user via `/cancel` | Finished |
 | `error` | Hardware, upload verification (`missing` photos) or cloud failure occurred; see `error` | Finished |
 
 ### Example `curl`
 ```bash
-curl -X GET http://localhost:8000/scanner/status
+curl -X GET http://127.0.0.1:8000/scanner/status
 ```
 
 ---
@@ -431,7 +452,7 @@ Delivers a high-framerate `multipart/x-mixed-replace` MJPEG stream directly cons
 
 ### Example `curl`
 ```bash
-curl -N http://localhost:8000/scanner/stream/mjpeg?camera=1 > /dev/null
+curl -N http://127.0.0.1:8000/scanner/stream/mjpeg?camera=1 > /dev/null
 ```
 
 ---
@@ -459,7 +480,7 @@ Instantly toggles the active preview camera between Camera 1 (upper) and Camera 
 
 ### Example `curl`
 ```bash
-curl -X POST "http://localhost:8000/scanner/stream/active?camera_id=2"
+curl -X POST "http://127.0.0.1:8000/scanner/stream/active?camera_id=2"
 ```
 
 ---
@@ -487,7 +508,7 @@ Dynamically adjusts the live preview JPEG compression quality on the fly without
 
 ### Example `curl`
 ```bash
-curl -X POST "http://localhost:8000/scanner/stream/quality?quality=75"
+curl -X POST "http://127.0.0.1:8000/scanner/stream/quality?quality=75"
 ```
 
 ---
@@ -531,85 +552,94 @@ Drivers without a continuous sync pipeline (`xvs`, `staggered`) answer only `{"r
 
 ### Example `curl`
 ```bash
-curl -X GET http://localhost:8000/scanner/stream/sync-status
+curl -X GET http://127.0.0.1:8000/scanner/stream/sync-status
 ```
 
 ---
 
-## 9. Autonomous Facial Capture (`POST /scanner/face/capture`)
+## 9. Face Scan (`POST /scanner/face/prepare`, then `POST /scanner/face/capture`)
 
-Executes autonomous facial scanning, mechatronic auto-framing, vibration damping, synchronized 12.3MP stereo photo capture, and Cloudflare R2 cloud upload.
+A face scan has the same two steps as an object scan: a **prepare** that readies the rig and waits with the live stream on, then a **capture** sent by the front-end when the subject is in place. Both answer `202` at once; poll `GET /scanner/status`. `POST /scanner/cancel` stops either step.
 
-### Request Body (`FaceCaptureRequest`)
+### 9.1 Prepare (`POST /scanner/face/prepare`, body `FacePrepareRequest`)
+
+```json
+{
+  "enable_stream": true,
+  "illumination_brightness": 0.5,
+  "start_z_mm": 180.0,
+  "upload_r2": true,
+  "camera_config": {"focus": "auto"}
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `enable_stream` | `true` | Start the MJPEG preview. |
+| `illumination_brightness` | `0.5` | LED brightness, `0 < b <= 1` (50 % not to blind the subject). |
+| `start_z_mm` | `180.0` | Where the carriage waits and the search starts, `100..350` mm, whole Z steps. |
+| `upload_r2` | `true` | Upload and verify the photo pair; the bucket is cleaned by this prepare. |
+| `camera_config` | defaults of `DualCameraConfig` | As for `/scanner/prepare`. `focus: "auto"`: the lenses stay on the saved position during the search and an autofocus sweep runs **on the face** at the height found. An integer or a pair: that position, no autofocus. `exposure_time` / `analogue_gain` / `colour_gains`: used for the photo; otherwise AE/AWB settle on the face and are locked before it. |
+
+What it does: checks that MediaPipe, OpenCV and the face model are there (`400` otherwise: nothing has moved), the preflight (Arduino, cloud only with `upload_r2`, disk space; **not** the ToF sensor), lights and cameras, then in the background: homing, climb to `start_z_mm`, light stabilisation, the cameras left **unlocked** (AE/AWB follow the subject). The state becomes `prepared` with `mode: "face"`. Errors: like `/scanner/prepare` (`400`, `409`, `422`, `503`).
+
+### 9.2 Capture (`POST /scanner/face/capture`, body `FaceCaptureRequest`)
 
 ```json
 {
   "strategy": "sweep_best_score",
-  "start_z_mm": 180.0,
   "search_range_mm": 150.0,
   "step_mm": 8.0,
   "manual_z": null,
-  "home": true,
-  "upload_r2": true,
-  "illumination_brightness": 0.5,
   "settle_s": 0.150
 }
 ```
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `strategy` | `string` | `"sweep_best_score"` | `"sweep_best_score"` (sweeps full range and returns to apex) or `"direct_stop"` (stops as soon as face is vertically centered). |
-| `start_z_mm` | `float` | `180.0` | Initial rapid carriage climb height in mm (100.0 to 350.0) before starting framing evaluations. |
-| `search_range_mm` | `float` | `150.0` | Vertical search window in mm (10.0 to 250.0) above `start_z_mm`. Total travel must not exceed 475.0 mm. |
-| `step_mm` | `float` | `8.0` | Vertical climb increment between evaluations (must be whole Z motor steps). |
-| `manual_z` | `float \| null` | `null` | Optional manual target height in mm (`200.0` to `475.0`). Skips auto-framing search when provided. |
-| `home` | `bool` | `true` | Performs homing to bottom limit switch (GPIO 4, Z=0.0 mm) before moving. |
-| `upload_r2` | `bool` | `true` | Enqueues captured photo pair to Cloudflare R2 background upload queue and verifies against the bucket. |
-| `illumination_brightness` | `float` | `0.5` | Chamber LED PWM brightness level (0.0 to 1.0; 0.5 = 50% duty cycle to avoid blinding subject). |
-| `settle_s` | `float` | `0.150` | Damping settle time in seconds before taking the 12.3MP photo pair. |
+| Field | Default | Description |
+|---|---|---|
+| `strategy` | `"sweep_best_score"` | `sweep_best_score`: climbs through the range and returns to the best height; `direct_stop`: stops as soon as both cameras see the face vertically centred; `none`: photo at the prepared height, no search. |
+| `search_range_mm` | `150.0` | How far above the prepared height the search goes (`10..250`); prepared height + range must stay `<= 475` mm (`422`). |
+| `step_mm` | `8.0` | Climb between two evaluations (`1..25`). |
+| `manual_z` | `null` | Explicit height (`200..475` mm); skips the search. |
+| `settle_s` | `0.150` | Pause before the photo (`0.05..2`). |
 
-### Mechanical & Auto-Framing Workflow
+Every distance must be a whole number of Z steps (multiples of `0.01 mm`). Unknown keys are refused (`422`), including `home`, `start_z_mm`, `upload_r2` and `illumination_brightness` (they belong to the prepare; the carriage is always homed by the prepare).
 
-1. **Safety & Motion Guard**: Validates that no overlapping motion is active (`motion_guard()`). Checks that scanner is in an allowed state (`idle`, `completed`, `cancelled`, `error`, `prepared`).
-2. **Turntable**: Remained disabled / unenergized throughout facial scanning.
-3. **Lighting**: Sets LED brightness to `illumination_brightness` (0.5) and locks brightness.
-4. **Homing**: Carriage homes down to the bottom endstop (Z = 0.0 mm).
-5. **Framing Sweep**:
-   - If `manual_z` is given, climbs directly from 0.0 mm to `manual_z`.
-   - If `manual_z is null`: climbs rapidly to `start_z_mm` (180.0 mm), then steps upward by `step_mm` (8.0 mm). At each step, evaluates in-memory lores frames using `StereoFramingAnalyzer` (MediaPipe FaceLandmarker), computing composite vertical centering, size, and cheek profile visibility scores.
-6. **Anti-Backlash Compensation**: If the carriage ended above the optimal height $Z_{\text{best}}$, it descends to $(Z_{\text{best}} - 3.0\text{ mm})$ and climbs $+3.0\text{ mm}$ to $Z_{\text{best}}$, loading the lead screw against gravity.
-7. **Synchronized 12.3MP Capture**: After `settle_s` pause, captures synchronized still photo pair saved to `input_images/rig/0/f_{Z}.jpg` and `input_images/rig/1/f_{Z}.jpg` with photogrammetry EXIF metadata.
-8. **Cloud Upload & Verification**: If `upload_r2` is `true`, dispatches to upload worker, drains queue, and verifies files in the R2 bucket.
-9. **Teardown**: De-energizes Z motor coils, turns off lights, and returns HTTP 200.
+Workflow (background, `Scanner.face_scan`):
+1. **Height**: `manual_z`, the search (MediaPipe FaceLandmarker on **fresh** preview frames: a frame exposed during the move is never used; no fresh frame in 3 s is an `error`), or none. Every Z move at constant speed (`acceleration=False`), arriving from below (anti-backlash). Only the endstop in the direction of the move counts; at the top switch the search ends with an `error` (the position is no longer known).
+2. **No face**: not an error. The photo is taken at the start height and `face_result` has `face_detected: false`, `best_score: null` and a `warning` (also in `phase_message`). The score of a height adds the centering, the size, the cheek profile and the share of the face landmarks inside the frame.
+3. **Camera lock on the face**: autofocus sweep on the face box of each camera (with `focus: "auto"`), then AE/AWB settle and lock; the subject should hold still for about 10 s.
+4. **Capture**: after `settle_s`, the synchronized pair `input_images/rig/0/f_{Z}.jpg` and `input_images/rig/1/f_{Z}.jpg`; with the prepare's `upload_r2`, uploaded and verified like the object scan.
+5. **Teardown**: motors released, lights off, cameras closed; the state becomes `completed` with `face_result`. Another capture needs another face prepare.
 
-### Response Body (`FaceCaptureResponse`, `200 OK`)
+Errors before the `202`: `400` the scanner is not `prepared` with `mode: "face"` (call `/scanner/face/prepare`), or MediaPipe is missing for a search; `409` another run or an emergency stop; `422` invalid body or a search beyond the travel; `503` the Arduino does not answer.
+
+### Result (in `GET /scanner/status` once `completed`)
 
 ```json
 {
-  "status": "success",
-  "message": "Face capture completed successfully",
-  "optimal_z_mm": 240.0,
-  "best_score": 1.85,
-  "photos": [
-    "/home/alin/Desktop/3d-scanner-raspberry-pi/input_images/rig/0/f_240.jpg",
-    "/home/alin/Desktop/3d-scanner-raspberry-pi/input_images/rig/1/f_240.jpg"
-  ],
-  "r2_uploaded": true
+  "state": "completed",
+  "mode": "face",
+  "phase": "done",
+  "face_result": {
+    "optimal_z_mm": 240.0,
+    "best_score": 1.85,
+    "face_detected": true,
+    "warning": null,
+    "photos": ["<project>/input_images/rig/0/f_240.jpg", "<project>/input_images/rig/1/f_240.jpg"],
+    "r2_uploaded": true
+  }
 }
 ```
 
 ### Example `curl`
 
 ```bash
-# Autonomous face capture with auto-framing
-curl -X POST http://localhost:8000/scanner/face/capture \
-  -H "Content-Type: application/json" \
-  -d '{"strategy": "sweep_best_score", "illumination_brightness": 0.5}'
-
-# Manual height positioning at 230 mm
-curl -X POST http://localhost:8000/scanner/face/capture \
-  -H "Content-Type: application/json" \
-  -d '{"manual_z": 230.0, "upload_r2": true}'
+curl -X POST http://127.0.0.1:8000/scanner/face/prepare -H "Content-Type: application/json" -d '{"start_z_mm": 180.0}'
+curl http://127.0.0.1:8000/scanner/status          # until "state": "prepared", "mode": "face"
+curl -X POST http://127.0.0.1:8000/scanner/face/capture -H "Content-Type: application/json" \
+     -d '{"strategy": "sweep_best_score"}'
+curl http://127.0.0.1:8000/scanner/status          # until "completed"; the result is in face_result
 ```
 
 ---
@@ -683,7 +713,21 @@ async function startScan(jobId: string) {
   await pollUntilState("completed");
 }
 
-// 4. Polling helper
+// 4. Face scan: prepare (wait with the stream on), then capture when the subject is in place
+async function faceScan() {
+  const post = (url, body) => fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  });
+  let res = await post("http://127.0.0.1:8000/scanner/face/prepare", { start_z_mm: 180.0 });
+  if (res.status !== 202) throw new Error((await res.json()).detail);
+  await pollUntilState("prepared");                 // mode === "face"
+  res = await post("http://127.0.0.1:8000/scanner/face/capture", { strategy: "sweep_best_score" });
+  if (res.status !== 202) throw new Error((await res.json()).detail);  // 400 not prepared, 409 busy, 422 invalid
+  const status = await pollUntilState("completed");
+  return status.face_result;  // { optimal_z_mm, best_score, face_detected, warning, photos, r2_uploaded }
+}
+
+// 5. Polling helper
 async function pollUntilState(targetState: string) {
   while (true) {
     const res = await fetch("http://127.0.0.1:8000/scanner/status");

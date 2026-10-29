@@ -27,15 +27,6 @@ print("Running in DEV MODE: simulated rig, no hardware is touched.")
 
 # 3. The production app (routers, lifespan, front-end)
 from main_prod import app  # noqa: E402
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import time
 import uuid
 import zipfile
 
@@ -46,6 +47,14 @@ def _build_r2_config() -> Config:
 
 
 R2_CONFIG = _build_r2_config()
+
+# Longest time one upload attempt may take in total (s). read_timeout only catches a connection that stalls completely;
+# a transfer that keeps trickling a few bytes at a time is cut here and retried by the scanner's upload worker.
+UPLOAD_ATTEMPT_TIMEOUT_S = float(os.environ.get("SCAN_UPLOAD_ATTEMPT_TIMEOUT_S", "300"))
+
+
+class UploadAttemptTimeout(Exception):
+    """An upload attempt ran longer than its time limit (raised from the transfer's progress callback)."""
 
 s3 = boto3.client(
     service_name="s3",
@@ -236,7 +245,8 @@ def preflight(bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> None:
                 ) from e
 
 
-def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_name: str | None = None) -> bool:
+def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_name: str | None = None,
+                timeout_s: float | None = None) -> bool:
     """
     Upload a file to an S3 bucket. Never raises: every failure is logged and reported as False.
     :param file_name: File to upload
@@ -245,6 +255,9 @@ def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_
     :type bucket: str
     :param object_name: S3 object name. If not specified then file_name is used
     :type object_name: str | None
+    :param timeout_s: Total time limit of this attempt in seconds (default UPLOAD_ATTEMPT_TIMEOUT_S; 0 or less
+        disables it). Checked whenever bytes are sent; a connection that sends nothing ends at the read timeout.
+    :type timeout_s: float | None
     :return: True if file was uploaded, else False
     :rtype: bool
     """
@@ -266,12 +279,24 @@ def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_
         logging.error("[R2] Not uploading %s: file is empty (0 bytes)", file_name)
         return False
 
+    limit = UPLOAD_ATTEMPT_TIMEOUT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + limit
+
+    def _check_deadline(_bytes_sent: int) -> None:
+        if time.monotonic() > deadline:
+            raise UploadAttemptTimeout(f"upload attempt longer than {limit:.0f} s")
+
     # Upload the file
     try:
-        s3.upload_file(file_name, bucket, object_name)
-    except (ClientError, BotoCoreError, S3UploadFailedError, OSError) as e:
+        if limit > 0:
+            s3.upload_file(file_name, bucket, object_name, Callback=_check_deadline)
+        else:
+            s3.upload_file(file_name, bucket, object_name)
+    except (ClientError, BotoCoreError, S3UploadFailedError, OSError, UploadAttemptTimeout) as e:
         logging.error("[R2] Upload of %s as %s failed: %s", file_name, object_name, e)
         return False
+    if limit > 0 and time.monotonic() > deadline:
+        logging.warning("[R2] Upload of %s took longer than %.0f s but completed.", file_name, limit)
     return True
 
 

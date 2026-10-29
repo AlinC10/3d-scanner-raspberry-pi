@@ -58,6 +58,13 @@ def clamp_framerate(resolution: Tuple[int, int], requested_fps: int) -> int:
         return min(max(requested_fps, 1), 40)
 
 
+def _camera_roi(roi: Any, cam_idx: int) -> tuple:
+    """The autofocus box of one camera: `roi` is one (x, y, w, h) box for both, or a (cam1, cam2) pair of boxes."""
+    if isinstance(roi, (tuple, list)) and len(roi) == 2 and all(isinstance(r, (tuple, list)) for r in roi):
+        return tuple(roi[cam_idx])
+    return tuple(roi)
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -591,12 +598,14 @@ class DualCameraRPISync(BaseDualCamera):
             return self._jpeg_ids[cam_idx], self._jpegs[cam_idx]
 
     def get_latest_lores_frames(
-        self, timeout: float = 1.0, fresh: bool = False
+        self, timeout: float = 1.0, fresh: bool = False, strict: bool = False
     ) -> Tuple[Optional[Any], Optional[Any]]:
         """
         Returns the newest preview frames as BGR numpy arrays (cam1, cam2).
         Enables in-memory lores copying on both grab workers.
-        If fresh is True, awaits frames captured after this method was invoked.
+        If fresh is True, awaits frames that started after this method was invoked: the frame in flight at the call
+        may have been exposed during the move that just ended, so the frame after it is the first one used. With
+        ``strict`` a timeout returns (None, None) instead of the older frames (FACE-16).
         """
         if not PICAMERA2_AVAILABLE or not self._running:
             # Stub mode fallback: return placeholder dummy BGR frames for testing
@@ -611,7 +620,8 @@ class DualCameraRPISync(BaseDualCamera):
         target_seqs = [-1, -1]
         with self._cond:
             if fresh:
-                target_seqs = [self._latest[0], self._latest[1]]
+                # Newer than the frame in flight now (latest + 1)
+                target_seqs = [self._latest[0] + 1, self._latest[1] + 1]
 
             def _ready() -> bool:
                 if not self._running or self._closing:
@@ -629,6 +639,9 @@ class DualCameraRPISync(BaseDualCamera):
                 if remaining <= 0:
                     break
                 self._cond.wait(timeout=min(remaining, 0.05))
+            if fresh and strict and not _ready():
+                log.warning("DualCameraRPISync: no fresh preview pair within %.1f s.", timeout)
+                return None, None
 
             f0 = self._lores_frames[0]
             f1 = self._lores_frames[1]
@@ -842,11 +855,14 @@ class DualCameraRPISync(BaseDualCamera):
                 frame = self._wait_af_frame(c, self._latest[c] + 2)
                 if frame is None:
                     raise RuntimeError(f"Autofocus: no fresh frame from camera {c + 1} at position {positions[c][i]}.")
-                scores[c][positions[c][i]] = ArducamIMX477._sharpness(frame, roi)
+                scores[c][positions[c][i]] = ArducamIMX477._sharpness(frame, _camera_roi(roi, c))
         return scores
 
     def focus_sweep_autofocus(self, step: int = AF_STEP, roi: tuple = AF_ROI) -> List[int]:
         """
+        ``roi`` is one (x, y, w, h) frame-fraction box for both cameras, or a pair of boxes (cam1, cam2), e.g. the face
+        as each camera sees it.
+
         Software autofocus over the RUNNING pipeline: both lenses sweep the VCM range (coarse step, then a fine pass
         around each best position), scoring the Laplacian sharpness of the ROI in the lores frames the grab workers
         already deliver (the cameras cannot be read twice). Each lens is left on its sharpest position, which is also

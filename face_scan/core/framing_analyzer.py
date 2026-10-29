@@ -22,6 +22,10 @@ except (ImportError, ValueError):
     from face_scanner import FaceScanner
 
 
+# Weight of the share of face landmarks inside the frame in the score of one camera (0..1 -> 0..VISIBILITY_WEIGHT)
+VISIBILITY_WEIGHT = 0.25
+
+
 class StereoFramingAnalyzer:
     """
     Evaluates face framing across both cameras simultaneously.
@@ -44,6 +48,7 @@ class StereoFramingAnalyzer:
                 "nose_y": None,
                 "nose_x": None,
                 "lateral_visible": False,
+                "visible_ratio": 0.0,
                 "cam_label": cam_label
             }
 
@@ -57,6 +62,7 @@ class StereoFramingAnalyzer:
                 "nose_y": None,
                 "nose_x": None,
                 "lateral_visible": False,
+                "visible_ratio": 0.0,
                 "cam_label": cam_label
             }
 
@@ -71,6 +77,7 @@ class StereoFramingAnalyzer:
                 "nose_y": None,
                 "nose_x": None,
                 "lateral_visible": False,
+                "visible_ratio": 0.0,
                 "cam_label": cam_label
             }
 
@@ -105,7 +112,23 @@ class StereoFramingAnalyzer:
 
         lateral_bonus = 0.15 if lateral_visible else 0.0
 
-        composite_cam_score = max(0.0, (centering_score * 0.65 + size_score * 0.20 + lateral_bonus) - h_penalty)
+        # 5. Share of the face mesh inside the frame. MediaPipe returns all 478 landmarks whenever it finds a face (the
+        # ones outside the picture are extrapolated), so this is what "how many facial points were found" means here:
+        # it drops when the forehead or the chin is cut by the edge of the frame.
+        visible = sum(1 for lm in norm_landmarks if 0.0 <= lm["x"] <= 1.0 and 0.0 <= lm["y"] <= 1.0)
+        visible_ratio = visible / float(len(norm_landmarks)) if norm_landmarks else 0.0
+        visibility_bonus = VISIBILITY_WEIGHT * visible_ratio
+
+        composite_cam_score = max(
+            0.0, (centering_score * 0.65 + size_score * 0.20 + lateral_bonus + visibility_bonus) - h_penalty
+        )
+
+        # Face box as frame fractions (x, y, w, h): the autofocus scores the sharpness there
+        w_frame = frame_bgr.shape[1]
+        bbox_norm = (
+            bbox["xmin"] / float(w_frame), bbox["ymin"] / float(h_frame),
+            (bbox["xmax"] - bbox["xmin"]) / float(w_frame), face_height_ratio,
+        )
 
         return {
             "detected": True,
@@ -113,7 +136,9 @@ class StereoFramingAnalyzer:
             "nose_y": float(norm_y),
             "nose_x": float(norm_x),
             "lateral_visible": lateral_visible,
+            "visible_ratio": float(visible_ratio),
             "bbox": bbox,
+            "bbox_norm": bbox_norm,
             "cam_label": cam_label
         }
 
@@ -127,6 +152,7 @@ class StereoFramingAnalyzer:
         right_eval = self.evaluate_frame(frame_right, 1)
 
         both_detected = left_eval["detected"] and right_eval["detected"]
+        any_detected = left_eval["detected"] or right_eval["detected"]
 
         if not both_detected:
             score = 0.5 * (left_eval["score"] + right_eval["score"])
@@ -141,6 +167,7 @@ class StereoFramingAnalyzer:
 
         return {
             "both_detected": both_detected,
+            "any_detected": any_detected,
             "total_score": float(score),
             "avg_nose_y": avg_nose_y,
             "left": left_eval,

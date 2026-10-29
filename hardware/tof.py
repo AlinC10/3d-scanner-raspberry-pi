@@ -29,11 +29,31 @@ class ToFSensor:
         """
         self.available = False
         self._timing_budget_ms = timing_budget_ms
+        self._settings = (distance_mode, roi_size, roi_center)
+        self._atexit_registered = False
         # Ranging is a multi-step I2C sequence (flush, poll, read, clear), so concurrent
         # callers (scan loop and /test/tof) must not interleave.
         self._lock = threading.Lock()
         self.i2c = None
         self.sensor = None
+        self._open()
+
+    def reinitialize(self) -> bool:
+        """
+        Releases the sensor and opens it again with the same settings: a sensor that was missing when the server
+        started, or stopped answering, can come back without a restart (PERI-10).
+
+        :return: True when the sensor is available afterwards.
+        """
+        self.close()
+        with self._lock:
+            self._open()
+        return self.available
+
+    def _open(self) -> None:
+        """Opens the I2C bus and configures the sensor; on failure `available` stays False and the bus is released."""
+        distance_mode, roi_size, roi_center = self._settings
+        timing_budget_ms = self._timing_budget_ms
         if _IMPORT_ERROR is not None:
             log.warning(f"VL53L1X ToF sensor unavailable, driver libraries missing: {_IMPORT_ERROR}")
             return
@@ -56,8 +76,10 @@ class ToFSensor:
                 self.sensor.distance_mode, self.sensor.timing_budget, self.sensor.roi_xy, self.sensor.roi_center,
             )
 
-            import atexit
-            atexit.register(self.close)
+            if not self._atexit_registered:
+                import atexit
+                atexit.register(self.close)
+                self._atexit_registered = True
         except Exception as e:
             log.warning(f"Failed to initialize VL53L1X ToF sensor: {e}")
             self.available = False

@@ -189,28 +189,31 @@ class ArduinoBridge:
         :return: The status code or response returned by the Arduino.
         :rtype: str
         """
-        if not self.serial:
-            raise RuntimeError("Arduino is not connected. Cannot send command.")
-            
         clean_cmd = cmd.strip() + "\n"
         is_config = clean_cmd.startswith(str(ArduinoCommand.CONFIG.value) + " ")
         # Moves are the only commands that can still be running on the Arduino after a timeout
         is_move = clean_cmd.split()[0] in ("5", "16", "r", "R", "a", "A")
-        
-        # Intercept and store CONFIG commands for auto-healing
+
+        # Intercept and store CONFIG commands for auto-healing (also while disconnected: they are replayed on connect)
         if is_config:
             cmd_no_nl = cmd.strip()
             if cmd_no_nl not in self._configs:
                 self._configs.append(cmd_no_nl)
-        
+
+        if not self.serial:
+            raise RuntimeError("Arduino is not connected. Cannot send command.")
+
         # Acquire transaction lock so no other normal command can interleave
         with self._response_lock:
-            # Temporarily mutate the underlying pyserial timeout for this specific transaction
-            old_timeout = self.serial.timeout
-            if timeout is not None:
-                self.serial.timeout = timeout
-                
+            old_timeout = None
             try:
+                # Temporarily mutate the underlying pyserial timeout for this specific transaction. Inside the try:
+                # setting it reconfigures the port, which is the first thing to fail when the USB device is gone
+                # (R-4), and that failure must reach the reconnect below.
+                old_timeout = self.serial.timeout
+                if timeout is not None:
+                    self.serial.timeout = timeout
+
                 # Whatever is still in the input buffer is stale (a late answer of a timed-out command, the boot
                 # banner of an Arduino that reset on its own): drop it, otherwise it would be taken for the answer
                 # to this command and every later one would be off by one.
@@ -240,11 +243,77 @@ class ArduinoBridge:
             except serial.SerialException as e:
                 log.error(f"[ArduinoBridge] Serial connection lost during send_command: {e}. Attempting to reconnect...")
                 self._connect()
+                # Reopening the port resets the Arduino (every driver disabled, configuration replayed by _connect).
+                # A command that does the same thing twice is retried once; a move is never repeated blindly.
+                if (not _after_replay and self._is_idempotent(clean_cmd)
+                        and self.serial is not None and self.serial.is_open):
+                    log.warning(f"[ArduinoBridge] Retrying '{cmd.strip()}' once after the reconnect.")
+                    return self.send_command(cmd, timeout=timeout, _after_replay=True)
                 return str(ArduinoStatus.ERR_ABORTED.value) # Pretend it aborted so caller can handle safely
             finally:
-                # Restore the default timeout for the next command
-                if self.serial and self.serial.is_open:
-                    self.serial.timeout = old_timeout
+                # Restore the default timeout for the next command (the port may be gone or replaced meanwhile)
+                if old_timeout is not None:
+                    try:
+                        if self.serial and self.serial.is_open:
+                            self.serial.timeout = old_timeout
+                    except (serial.SerialException, OSError, ValueError) as e:
+                        log.warning(f"[ArduinoBridge] Could not restore the serial timeout: {e}")
+
+    @staticmethod
+    def _is_idempotent(clean_cmd: str) -> bool:
+        """PING, CONFIG, ENABLE and DISABLE leave the Arduino in the same state when sent twice."""
+        opcode = clean_cmd.split()[0] if clean_cmd.split() else ""
+        return opcode in {str(c.value) for c in (ArduinoCommand.PING, ArduinoCommand.CONFIG,
+                                                  ArduinoCommand.ENABLE, ArduinoCommand.DISABLE)}
+
+    @property
+    def is_connected(self) -> bool:
+        """True while the serial port is open (says nothing about the Arduino answering: see `ensure_connected`)."""
+        return self.serial is not None and bool(getattr(self.serial, "is_open", False))
+
+    def ensure_connected(self) -> bool:
+        """
+        Checks that the Arduino answers, reconnecting first when the port is closed or was never opened (the server
+        may have started without the Arduino, API-21). A reconnect resets the board and replays the motor
+        configuration.
+
+        A command already in flight (a move of another thread) proves the link is alive: then nothing is sent.
+
+        :return: True when the Arduino answered a PING (or a transaction is in flight), False otherwise. Never raises.
+        """
+        if not self._response_lock.acquire(blocking=False):
+            return self.is_connected   # another thread is mid-transaction: do not queue a PING behind a long move
+        try:
+            if not self.is_connected:
+                self._connect()
+                if not self.is_connected:
+                    return False
+            try:
+                reply = self.send_command(f"{ArduinoCommand.PING.value}", timeout=2.0)
+            except Exception as e:
+                log.warning(f"[ArduinoBridge] PING failed: {e}")
+                return False
+            return reply == str(ArduinoStatus.OK.value)
+        finally:
+            self._response_lock.release()
+
+    def _reset_by_reopen(self) -> None:
+        """
+        Closes and reopens the port without the boot handshake. Opening the port toggles DTR, which resets the Arduino
+        and stops whatever it was stepping: the last resort when a 0xFF cannot be written.
+        """
+        try:
+            target = self.serial.port if self.serial is not None else self.port
+            if self.serial is not None:
+                try:
+                    self.serial.close()
+                except Exception:
+                    pass
+            self.serial = serial.Serial(target, self.baudrate, timeout=3.0)
+            self.connection_epoch += 1
+            log.warning(f"[ArduinoBridge] Port {target} reopened: the Arduino was reset to stop the motors.")
+        except Exception as e:
+            log.error(f"[ArduinoBridge] Could not reopen the serial port to reset the Arduino: {e}")
 
     def _read_status_line(self, max_lines: int = 5) -> str:
         """
@@ -314,7 +383,10 @@ class ArduinoBridge:
                         self.serial.write(bytes([ArduinoCommand.EMERGENCY_STOP.value])) # 0xFF
                         self.serial.flush()
                     except serial.SerialException as e:
+                        # The 0xFF cannot be delivered: reset the board instead (reopening the port toggles DTR), so a
+                        # move it may still be stepping ends anyway (R-4)
                         log.error(f"[ArduinoBridge] Serial connection lost during send_stop: {e}")
+                        self._reset_by_reopen()
                         break
                     if i < repeat - 1 and gap_s > 0:
                         time.sleep(gap_s)

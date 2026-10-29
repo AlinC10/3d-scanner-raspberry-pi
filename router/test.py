@@ -180,6 +180,7 @@ def test_motor_enable(target: MotorTarget = MotorTarget.ALL):
     Useful to verify wiring and check if the motor locks up.
     """
     _require_motors_free()
+    scanner_api.require_arduino()   # 503 without the Arduino
     try:
         with scanner.motion_guard():
             if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
@@ -197,6 +198,7 @@ def test_motor_disable(target: MotorTarget = MotorTarget.ALL):
     Manually releases motor torque (holding torque OFF / free wheel).
     """
     _require_motors_free()
+    scanner_api.require_arduino()   # 503 without the Arduino
     try:
         with scanner.motion_guard():
             if target in (MotorTarget.TURNTABLE, MotorTarget.ALL):
@@ -223,6 +225,7 @@ def test_home_bottom(
     Stops and releases torque upon reaching the switch.
     """
     _require_motors_free()
+    scanner_api.require_arduino()   # 503 without the Arduino
     try:
         with scanner.motion_guard():
             test_motor_enable(MotorTarget.Z_AXIS)
@@ -253,6 +256,7 @@ def test_move_to_top(
     Stops and releases torque upon reaching the switch.
     """
     _require_motors_free()
+    scanner_api.require_arduino()   # 503 without the Arduino
     try:
         with scanner.motion_guard():
             test_motor_enable(MotorTarget.Z_AXIS)
@@ -279,6 +283,7 @@ def test_z_move(req: ZMoveRequest):
     Automatically blocked if the target limit switch is active.
     """
     _require_motors_free()
+    scanner_api.require_arduino()   # 503 without the Arduino
     try:
         with scanner.motion_guard():
             scanner.z_axis_motor.enable()
@@ -332,6 +337,7 @@ def test_turntable_rotate(req: TurntableRotateRequest):
     Rotates the turntable by a specific angle in degrees (e.g. 18°).
     """
     _require_motors_free()
+    scanner_api.require_arduino()   # 503 without the Arduino
     try:
         with scanner.motion_guard():
             scanner.turntable_motor.enable()

@@ -85,6 +85,10 @@ def __init__(
 
 `prepare_scan` has two interface arguments besides the camera settings: `lock_auto` and `copy_colour_gains` (default `False`: after the AE/AWB lock cam2 keeps the white-balance gains of its own AWB, exposure time and analogue gain are still copied from cam1). Every driver accepts both; `DualCamera` and `DualCameraXVS` ignore them (they always copy cam1's values, colour gains included, see `PROBLEME_RAMASE.md`).
 
+**Preview frames for computer vision.** `get_latest_lores_frames(timeout, fresh, strict)` is part of the interface (the base returns `(None, None)`). In `DualCameraRPISync`, `fresh=True` waits for a pair that started after the call (newer than the frame in flight, which may have been exposed during the Z move that just ended) and `strict=True` returns `(None, None)` on a timeout instead of the older frames: the face search uses both. Only `rpi_sync` implements it.
+
+**Autofocus box.** `prepare_scan(..., autofocus_roi=...)` / `focus_sweep_autofocus(roi=...)` take one `(x, y, w, h)` frame-fraction box for both cameras or a `(cam1, cam2)` pair of boxes (the face capture passes the face as each camera sees it).
+
 **Still sizes.** The scanner accepts only `4056x3040` and `2028x1520` (`SUPPORTED_PHOTO_RESOLUTIONS` in `camera_defaults.py`, `Literal` in `schemas/scanner.py`). `DualCameraRPISync` configures the sensor directly at the requested size: `2028x1520` is the 2x2 binned mode of the IMX477, which has the same field of view as the full readout (no crop, 4x fewer pixels, up to 40 fps instead of 10), so the photo is not captured at full size and shrunk afterwards.
 
 When a driver gains a feature that the scanner or a router uses, declare it in `base_dual_camera.py` first (default / `pass` in the base, capability flag if behaviour differs) and note what remains to be ported in `../../plans/FUTURE_WORK.md`. `tests/test_base_dual_camera_interface.py` checks that every driver has every interface member.

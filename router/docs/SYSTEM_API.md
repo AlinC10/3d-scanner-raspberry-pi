@@ -1,316 +1,211 @@
 # System & Network Management API (`/system`)
 
-The System Router (`../system`) provides REST APIs to configure and manage the Raspberry Pi's host-level network interfaces and connectivity: **Wi-Fi**, **Bluetooth**, and **Ethernet**.
+The System Router (`../system`) manages the Raspberry Pi's network connections: **Wi-Fi**, **Bluetooth** and **Ethernet**, through NetworkManager (`nmcli`) and BlueZ (`bluetoothctl`). The drivers are in `../../system/` (see `../../system/README.md`).
 
-Interactive OpenAPI documentation is accessible at: `http://127.0.0.1:8000/docs`
-
----
-
-## Architecture & Mounting
-
-The root router is defined in `../system/__init__.py` with prefix `/system` and bundles three sub-routers:
+Interactive OpenAPI documentation: `http://127.0.0.1:8000/docs`
 
 ```
 FastAPI App (/main_prod.py)
- └── /system (router/system/__init__.py)
+ └── /system (router/system/__init__.py)        GET /system/status
       ├── /wifi       -> router/system/wifi.py
       ├── /bluetooth  -> router/system/bluetooth.py
       └── /ethernet   -> router/system/ethernet.py
+     router/system/guard.py: network_change_allowed() (409 while a scan runs)
 ```
 
 ---
 
-## Quick Reference Table
+## Quick Reference
 
-| Subsystem | Method | Endpoint | Description |
-|---|---|---|---|
-| **Wi-Fi** | `GET` | `/system/wifi/status` | Read Wi-Fi radio power status (`enabled: true/false`) |
-| **Wi-Fi** | `GET` | `/system/wifi/power/{state}` | Turn Wi-Fi radio `on` or `off` |
-| **Wi-Fi** | `GET` | `/system/wifi/scan` | Scan and list available Wi-Fi access points |
-| **Wi-Fi** | `POST` | `/system/wifi/connect` | Connect to a Wi-Fi network using credentials |
-| **Bluetooth** | `GET` | `/system/bluetooth/status` | Read Bluetooth controller power status |
-| **Bluetooth** | `GET` | `/system/bluetooth/power/{state}` | Turn Bluetooth controller `on` or `off` |
-| **Bluetooth** | `GET` | `/system/bluetooth/scan` | Discover nearby Bluetooth devices |
-| **Bluetooth** | `POST` | `/system/bluetooth/connect` | Pair and connect to a Bluetooth device |
-| **Bluetooth** | `POST` | `/system/bluetooth/send-file` | Push a file to a connected device via OBEX |
-| **Ethernet** | `GET` | `/system/ethernet/status` | Check physical cable link and assigned IP |
-| **Ethernet** | `POST` | `/system/ethernet/connect` | Connect to enterprise 802.1X wired network |
+| Subsystem | Method | Endpoint | Refused during a scan | Description |
+|---|---|---|---|---|
+| **All** | `GET` | `/system/status` | no | Every connection in one call (poll it) |
+| **Wi-Fi** | `GET` | `/system/wifi/status` | no | Radio on/off |
+| **Wi-Fi** | `POST` (or `GET`) | `/system/wifi/power/{on\|off}` | yes | Radio on or off |
+| **Wi-Fi** | `GET` | `/system/wifi/scan?rescan=false` | yes | Networks in range |
+| **Wi-Fi** | `GET` | `/system/wifi/saved` | no | Saved networks (no passwords) |
+| **Wi-Fi** | `DELETE` | `/system/wifi/saved/{name}` | yes | Forget a saved network |
+| **Wi-Fi** | `POST` | `/system/wifi/connect` | yes | Connect (no password needed for a saved network) |
+| **Bluetooth** | `GET` | `/system/bluetooth/status` | no | Adapter powered |
+| **Bluetooth** | `POST` (or `GET`) | `/system/bluetooth/power/{on\|off}` | yes | Adapter on or off |
+| **Bluetooth** | `GET` | `/system/bluetooth/scan?duration=8` | yes | Named devices in range now |
+| **Bluetooth** | `POST` | `/system/bluetooth/connect` | yes | Pair (if needed) and connect |
+| **Bluetooth** | `POST` | `/system/bluetooth/send-file` | yes | OBEX file push |
+| **Ethernet** | `GET` | `/system/ethernet/status` | no | Cable, state, profile, IP |
+| **Ethernet** | `POST` | `/system/ethernet/connect` | yes | 802.1X wired network |
 
 ---
 
-## 1. Wi-Fi API (`/system/wifi`)
+## Rules that apply to every endpoint
 
-Manages the Raspberry Pi's `wlan0` wireless interface using Linux NetworkManager / `nmcli`.
+### During a scan (`409`)
+While the scanner is `preparing`, `running`, `processing` or `downloading`, or still uploading photos, every endpoint that **scans the radio or changes a connection** answers `409` (`router/system/guard.py`). Wi-Fi and Bluetooth share the antenna of the Pi 5: a radio scan slows the upload, and a power or connection change can cut it. **Reading** (`GET /system/status`, the `.../status` endpoints, `GET /system/wifi/saved`) is always allowed and never disturbs the network.
+
+### Error codes
+Every network error is `{"detail": "<message>"}` with:
+
+| Code | Meaning |
+|---|---|
+| `400` | The command failed (message from NetworkManager / BlueZ) |
+| `401` | `wifi/connect`: the network refused the password, or a saved password is no longer valid: ask the user for it |
+| `404` | `wifi/saved/{name}`: no such saved network |
+| `409` | A scan is running (see above) |
+| `422` | Invalid body or query (e.g. `duration` above 20) |
+| `503` | The tool is missing (`nmcli`, `bluetoothctl`, `bt-obex`) or NetworkManager is not running |
+| `504` | The command did not finish in time (every command has a deadline) |
+
+The commands run in the C locale, so the success checks work whatever the language of the system is.
+
+### Deadlines
+
+| Command | Deadline |
+|---|---|
+| status, radio, profile listing | 15 s |
+| `wifi/scan?rescan=true` | 25 s |
+| `wifi/connect` | 50 s (NetworkManager may take 40 s) |
+| `bluetooth/scan` | `duration` + 10 s for the discovery, + 10 s for all the device details |
+| `bluetooth/connect` | pair 40 s, connect 30 s |
+| `bluetooth/send-file` | 300 s |
+
+### Connections made again at startup
+Every successful connection (`wifi/connect`, `ethernet/connect`, `bluetooth/connect`) and every power switch is remembered in `state/network.json` (only *which* profiles and devices; the passwords stay in NetworkManager, the pairings in BlueZ). When the server starts, a background task makes them again: a connection already up is left alone, a failure is only logged, and the server works as before. The outcome is in `GET /system/status` → `restore`. Forgetting a network removes it from the list. Nothing is restored in development mode (`MOCK_HARDWARE=1`).
+
+---
+
+## `GET /system/status`
+
+Everything the front-end needs to show the connections, in one request. It only reads what the system already knows (no radio scan), so it can be polled every 5-15 s, also during a scan. A part whose tool fails is `{"error": "..."}`; the others are still filled.
+
+```json
+{
+  "ethernet": {
+    "interface": "eth0",
+    "cable_plugged": true,
+    "state": "connected",
+    "connection": "Wired connection 1",
+    "ip": "192.168.1.20/24",
+    "connected": true
+  },
+  "wifi": {
+    "enabled": true,
+    "interface": "wlan0",
+    "state": "connected",
+    "connected": true,
+    "connection": "Home",
+    "ssid": "Home",
+    "signal": 70,
+    "ip": "192.168.1.31/24"
+  },
+  "bluetooth": {
+    "powered": true,
+    "connected": true,
+    "devices": [{"mac_address": "AA:BB:CC:DD:EE:FF", "name": "Speaker"}]
+  },
+  "restore": {"wifi": "already connected (Home)", "bluetooth AA:BB:CC:DD:EE:FF": "connected", "state": "done", "seconds": 4.2}
+}
+```
+
+* `state` (Ethernet, Wi-Fi): the NetworkManager device state: `connected`, `connecting`, `disconnected`, `unavailable` (no cable / radio off / no such port).
+* `ethernet.interface` is the built-in port (`eth*`/`en*`); a USB adapter or `usb0` only when there is no other one; `null` when there is no Ethernet device.
+* `wifi.signal`: 0-100. `ip`: IPv4 with prefix, `null` when not connected.
+* `restore`: `null` when nothing was restored (no saved state, development mode), `{"state": "running"}` while it runs, then one entry per part (`"connected ..."`, `"already connected ..."`, `"failed: <reason>"`).
+
+---
+
+## 1. Wi-Fi (`/system/wifi`)
 
 ### `GET /system/wifi/status`
-Returns whether the wireless radio is currently powered on.
+`{"enabled": true}`: whether the radio is on.
 
-* **Response (`200 OK`)**:
-  ```json
-  {
-    "enabled": true
-  }
-  ```
-
----
-
-### `GET /system/wifi/power/{state}`
-Turns the Wi-Fi radio on or off.
-
-* **Path Parameters**:
-  * `state`: `"on"` | `"off"`
-* **Response (`200 OK`)**:
-  ```json
-  {
-    "state": "on"
-  }
-  ```
-* **Example `curl`**:
-  ```bash
-  curl -X GET http://localhost:8000/system/wifi/power/on
-  ```
-
----
+### `POST /system/wifi/power/{state}`
+`state`: `on` | `off`. Answer `{"state": "on"}`. `GET` still works (the current front-end uses it) but a change should be a `POST`.
 
 ### `GET /system/wifi/scan`
-Triggers an active scan of nearby 2.4 GHz and 5 GHz wireless networks.
+The networks in range, **one per SSID** (the strongest access point of a mesh), hidden networks left out, the connected one first, then by signal.
 
-* **Response (`200 OK`)**:
-  ```json
-  [
-    {
-      "in_use": "*",
-      "ssid": "Studio-Mesh-5G",
-      "signal": 85,
-      "security": "WPA2"
-    },
-    {
-      "in_use": "",
-      "ssid": "Workshop_Guest",
-      "signal": 42,
-      "security": "WPA3"
-    }
-  ]
-  ```
-  * `in_use`: `"*"` indicates the currently connected network; empty string `""` otherwise.
-  * `signal`: Signal strength percentage (`0`–`100`).
-  * `security`: Encryption type (e.g. `"WPA2"`, `"WPA3"`, `"OPEN"`).
+* Query `rescan` (default `false`): `false` returns the list NetworkManager already keeps (it refreshes it by itself, instant, no radio scan); `true` forces a radio scan (up to ~20 s). For an automatic refresh in the UI use `rescan=false`; keep `true` for a "refresh" button.
 
----
+```json
+[
+  {"in_use": "*", "ssid": "Home", "signal": 70, "security": "WPA2", "saved": true},
+  {"in_use": "", "ssid": "My:Net", "signal": 65, "security": "WPA2", "saved": false},
+  {"in_use": "", "ssid": "Guest", "signal": 40, "security": "", "saved": false}
+]
+```
+
+* `in_use`: `"*"` for the connected network. `security`: `""` for an open network. `saved`: a profile exists, connecting needs no password. SSIDs containing `:` are returned correctly.
+
+### `GET /system/wifi/saved`
+`[{"name": "Home", "ssid": "Home", "autoconnect": true}]`. The password is never returned.
+
+### `DELETE /system/wifi/saved/{name}`
+Forgets a saved network (`name` = profile name or SSID). `204`; `404` when there is no such network.
 
 ### `POST /system/wifi/connect`
-Connects the scanner to a wireless network.
+Body (`NetworkCredentials`):
+```json
+{"ssid": "Home", "password": "", "identity": null}
+```
+* **Saved network** (`saved: true` in the scan): send an empty `password`; the saved profile is used. `401` if the saved password is no longer accepted: ask the user and send it.
+* **Saved network with a new password**: the profile is updated; if the new password is refused (`401`) the old one is kept.
+* **New network**: a profile is created; if the connection fails it is removed again (NetworkManager does not keep retrying a wrong password).
+* **Enterprise (802.1X)**: send `identity` (user) and `password`; profile `enterprise-<ssid>`, same rules.
 
-* **Request Body (`NetworkCredentials`)**:
-  ```json
-  {
-    "ssid": "Studio-Mesh-5G",
-    "password": "SecretPassword123",
-    "identity": null
-  }
-  ```
-  * `ssid` (string, required): Network name.
-  * `password` (string, optional): WPA/WPA2/WPA3 passphrase.
-  * `identity` (string, optional): Used for enterprise 802.1X authentication if required.
-
-* **Response (`204 No Content`)**:
-  Empty body confirming successful network association and DHCP lease acquisition.
-
-* **Error Response (`401 Unauthorized`)**:
-  Occurs if the password is incorrect or authentication fails.
-  ```json
-  {
-    "detail": "Connection failed: 802-11-wireless-security.psk: invalid key"
-  }
-  ```
-
-* **Example `curl`**:
-  ```bash
-  curl -X POST http://localhost:8000/system/wifi/connect \
-       -H "Content-Type: application/json" \
-       -d '{"ssid": "Studio-Mesh-5G", "password": "SecretPassword123"}'
-  ```
+Answer `204`. Errors: `401` wrong / missing password, `400` other failure (network out of range, radio off), `504` timeout, `409` during a scan.
 
 ---
 
-## 2. Bluetooth API (`/system/bluetooth`)
-
-Manages the onboard Bluetooth controller via `bluetoothctl` and BlueZ.
+## 2. Bluetooth (`/system/bluetooth`)
 
 ### `GET /system/bluetooth/status`
-Returns whether the Bluetooth adapter is powered.
+`{"powered": true}`.
 
-* **Response (`200 OK`)**:
-  ```json
-  {
-    "powered": true
-  }
-  ```
-
----
-
-### `GET /system/bluetooth/power/{state}`
-Enables or disables the Bluetooth radio.
-
-* **Path Parameters**:
-  * `state`: `"on"` | `"off"`
-* **Response (`200 OK`)**:
-  ```json
-  {
-    "powered": "on"
-  }
-  ```
-
----
+### `POST /system/bluetooth/power/{state}`
+`state`: `on` | `off`. Answer `{"powered": "on"}`. `GET` still works. A blocked adapter answers `400` with the hint `rfkill unblock bluetooth`.
 
 ### `GET /system/bluetooth/scan`
-Scans for discoverable Bluetooth devices in proximity.
+Runs a discovery and lists the devices **seen during it** that have a **real name**, strongest signal first, plus the devices connected right now.
 
-* **Response (`200 OK`)**:
-  ```json
-  [
-    {
-      "mac_address": "AA:BB:CC:DD:EE:FF",
-      "name": "Alin's Phone",
-      "icon": "phone",
-      "paired": true,
-      "connected": false,
-      "rssi": -58,
-      "device_class": 5898764
-    }
-  ]
-  ```
+| Query | Default | Meaning |
+|---|---|---|
+| `duration` | `8` | Discovery seconds, `1..20` |
+| `include_unnamed` | `false` | Also list devices that only show their address (`AA-BB-CC-...`) |
+| `include_out_of_range` | `false` | Also list devices BlueZ remembers from earlier but that are not in range now |
 
----
+```json
+[
+  {"mac_address": "AA:BB:CC:DD:EE:01", "name": "Phone", "icon": "phone", "paired": false, "connected": false, "rssi": -60, "device_class": null},
+  {"mac_address": "AA:BB:CC:DD:EE:05", "name": "Speaker", "icon": "audio-card", "paired": true, "connected": true, "rssi": null, "device_class": null}
+]
+```
+`rssi` is in dBm (`null` when BlueZ did not report it).
 
 ### `POST /system/bluetooth/connect`
-Pairs with and connects to a target Bluetooth device.
-
-* **Request Body (`BluetoothDevice`)**:
-  ```json
-  {
-    "mac_address": "AA:BB:CC:DD:EE:FF",
-    "name": "Alin's Phone"
-  }
-  ```
-* **Response (`200 OK`)**: Returns the paired `BluetoothDevice` object.
-
----
+Body: a `BluetoothDevice` (only `mac_address` is needed). Pairs only when the device is not paired yet, then connects; the device is reconnected when the server starts. Answer: the device.
 
 ### `POST /system/bluetooth/send-file`
-Transfers a file (such as a generated 3D model or diagnostic log) to a connected device via OBEX file transfer.
-
-* **Request Body (`SendFileRequest`)**:
-  ```json
-  {
-    "device": {
-      "mac_address": "AA:BB:CC:DD:EE:FF"
-    },
-    "file_path": "/home/alin/Desktop/3d-scanner-raspberry-pi/output/scan.zip"
-  }
-  ```
-* **Response (`204 No Content`)**: Empty response indicating successful file transmission.
-* **Error Response (`400 Bad Request`)**:
-  ```json
-  {
-    "detail": "Transfer failed: Device not reachable or OBEX rejected"
-  }
-  ```
+Body: `{"device": {"mac_address": "..."}, "file_path": "..."}`. `204` when sent. (Known issue SYS-2: any path on the Pi is accepted; see `PROBLEME_RAMASE.md`.)
 
 ---
 
-## 3. Ethernet API (`/system/ethernet`)
-
-Manages the physical RJ45 wired interface (`eth0`).
+## 3. Ethernet (`/system/ethernet`)
 
 ### `GET /system/ethernet/status`
-Checks if a physical network cable is plugged into the port and whether an IPv4 address has been assigned by DHCP.
-
-* **Response (`200 OK`)**:
-  ```json
-  {
-    "connected": true,
-    "ip_address": "192.168.1.150",
-    "speed": "1000Mbps",
-    "duplex": "full"
-  }
-  ```
-
----
+```json
+{"interface": "eth0", "cable_plugged": true, "state": "connected", "connection": "Wired connection 1", "ip": "192.168.1.20/24"}
+```
+`interface: null, state: "unavailable"` when there is no Ethernet port. A NetworkManager error is an error (`400` / `503`), not a fake `disconnected`.
 
 ### `POST /system/ethernet/connect`
-Configures authentication credentials for enterprise wired networks (802.1X EAP-TLS / PEAP).
-
-* **Request Body (`NetworkCredentials`)**:
-  ```json
-  {
-    "ssid": "Wired-802.1X",
-    "identity": "scanner_user",
-    "password": "CorporatePassword"
-  }
-  ```
-* **Response (`200 OK`)**:
-  ```json
-  {
-    "status": "success",
-    "message": "Enterprise Ethernet connected"
-  }
-  ```
+802.1X wired network. Body `{"ssid": "", "password": "...", "identity": "user"}` (`identity` required). The new profile replaces `enterprise-wired` only once it connected; a failed one is removed. Answer `{"status": "success", "message": "Enterprise Ethernet connected"}`.
 
 ---
 
-## Pydantic Data Models
+## Data Models
 
-All system request and response schemas are located in [`../../schemas/system`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/schemas/system/).
+* `NetworkCredentials` (`../../schemas/system/network.py`): `ssid`, `password` (default `""`), `identity` (default `null`).
+* `WIFICharacteristics` (`../../schemas/system/wifi.py`): `in_use`, `ssid`, `signal`, `security`, `saved`.
+* `SavedNetwork` (`../../schemas/system/wifi.py`): `name`, `ssid`, `autoconnect`.
+* `BluetoothDevice` (`../../schemas/system/bluetooth.py`): `mac_address`, `name`, `icon`, `paired`, `connected`, `rssi`, `device_class`.
 
-### `NetworkCredentials` ([`../../schemas/system/network.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/schemas/system/network.py))
-```python
-class NetworkCredentials(BaseModel):
-    ssid: str
-    password: Optional[str] = ""
-    identity: Optional[str] = None
-```
-
-### `WIFICharacteristics` ([`../../schemas/system/wifi.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/schemas/system/wifi.py))
-```python
-class WIFICharacteristics(BaseModel):
-    in_use: Optional[str] = ""  # '*' if currently active network
-    ssid: str
-    signal: int
-    security: str
-```
-
-### `BluetoothDevice` ([`../../schemas/system/bluetooth.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/schemas/system/bluetooth.py))
-```python
-class BluetoothDevice(BaseModel):
-    mac_address: str  # RegEx validated: ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$
-    name: str = "Unknown"
-    icon: Optional[str] = None
-    paired: bool = False
-    connected: bool = False
-    rssi: Optional[int] = None
-    device_class: Optional[int] = None
-```
-
----
-
-## Error Handling & Exception Mapping
-
-System errors originating from underlying OS command calls inherit from `SystemConnectionError` ([`../../system/exception.py`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/system/exception.py)):
-
-* `WIFIConnectionError` $\to$ Mapped to `HTTP 401 Unauthorized` in `../system/wifi.py`.
-* `BluetoothConnectionError` $\to$ Mapped to `HTTP 400 Bad Request` via global exception handler in `../../main_prod.py`.
-* `SystemConnectionError` $\to$ Caught by `system_connection_error_handler` in `../../main_prod.py`, returning structured JSON:
-  ```json
-  {
-    "detail": "Error description from hardware or system driver"
-  }
-  ```
-
----
-
-## Roadmap & Planned Enhancements ([`../system/TODOS.md`](file:///home/alin/Desktop/3d-scanner-raspberry-pi/router/system/TODOS.md))
-
-* **Aggregated Health Endpoint**: Add `GET /system/status` in `../system/__init__.py` to fetch Wi-Fi, Bluetooth, and Ethernet status in a single round-trip.
-* **Credential Vaulting**: Store verified Wi-Fi credentials locally on the Pi to eliminate re-prompting on reconnect.
-* **USB Router (`../system/usb.py`)**: Implement auto-mount and status reporting for external USB flash drives (exporting 3D models directly to a thumb drive).
+Open problems of this layer (XSS through SSID names in the front-end, passwords in the process arguments, `send-file` paths, 802.1X certificate validation) are listed in `PROBLEME_RAMASE.md` (levels 4 and 5).

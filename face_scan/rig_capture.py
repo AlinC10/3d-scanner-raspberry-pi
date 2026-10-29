@@ -10,8 +10,8 @@ Does NOT depend on 3D reconstruction libraries (Trimesh, Poisson, PyMeshLab, etc
 Can run standalone on Edge RPi 5.
 
 Usage Examples:
-  # 1. Standard production capture on Raspberry Pi 5 (with homing and best sweep):
-  python rig_capture.py --home --strategy sweep_best_score
+  # 1. Standard production capture on Raspberry Pi 5 (face prepare: homing + climb, then the best sweep):
+  python rig_capture.py --strategy sweep_best_score
 
   # 2. Fast capture with direct stop on face center:
   python rig_capture.py --strategy direct_stop
@@ -57,9 +57,10 @@ Ready to be processed by photogrammetry (locally on Windows PC or on RunPod Clou
     )
     parser.add_argument(
         "--strategy",
-        choices=["sweep_best_score", "direct_stop"],
+        choices=["sweep_best_score", "direct_stop", "none"],
         default="sweep_best_score",
-        help="Auto-framing strategy: 'sweep_best_score' (full sweep and return to apex) or 'direct_stop' (stop on center)",
+        help="Auto-framing strategy: 'sweep_best_score' (full sweep and return to apex), 'direct_stop' (stop on "
+             "center) or 'none' (photo at the start height)",
     )
     parser.add_argument(
         "--start-z-mm",
@@ -72,18 +73,6 @@ Ready to be processed by photogrammetry (locally on Windows PC or on RunPod Clou
         type=float,
         default=150.0,
         help="Vertical search range in mm above start-z-mm (default: 150.0 mm)",
-    )
-    parser.add_argument(
-        "--home",
-        action="store_true",
-        default=True,
-        help="Perform initial homing sequence to bottom limit switch (GPIO 4) before scanning (default: True)",
-    )
-    parser.add_argument(
-        "--no-home",
-        dest="home",
-        action="store_false",
-        help="Skip initial homing sequence",
     )
     parser.add_argument(
         "--manual-z",
@@ -127,7 +116,6 @@ Ready to be processed by photogrammetry (locally on Windows PC or on RunPod Clou
     log.info("INITIALIZING AUTONOMOUS RIG CAPTURE MODULE")
     log.info("  • Strategy: %s", args.strategy)
     log.info("  • Hardware Mode: %s", "MOCK (Desktop Simulation)" if args.mock else "REAL HARDWARE (RPi 5)")
-    log.info("  • Homing: %s", args.home)
     log.info("  • Upload R2: %s", args.upload_r2)
     log.info("=" * 60)
 
@@ -142,21 +130,25 @@ Ready to be processed by photogrammetry (locally on Windows PC or on RunPod Clou
 
     scanner = Scanner()
     try:
+        # The same two steps as POST /scanner/face/prepare and POST /scanner/face/capture
+        scanner.lights.set_brightness(args.illumination)
+        scanner.setup_and_stream(enable_stream=False, scan_mode="face", check_cloud=args.upload_r2)
+        scanner.finish_preparation(z_start_mm=args.start_z_mm, upload_r2=args.upload_r2)
+        if scanner.state != "prepared":
+            log.error("Face prepare failed: %s", scanner.error)
+            return
         result = scanner.face_scan(
             strategy=args.strategy,
-            start_z_mm=args.start_z_mm,
             search_range_mm=args.search_range_mm,
             step_mm=args.step_mm,
             manual_z=args.manual_z,
-            home=args.home,
-            upload_r2=args.upload_r2,
-            illumination_brightness=args.illumination,
         )
 
         log.info("=" * 60)
         log.info("FACE CAPTURE RESULT: %s", result.get("status"))
         log.info("  • Optimal Z: %s mm", result.get("optimal_z_mm"))
         log.info("  • Best Score: %s", result.get("best_score"))
+        log.info("  • Face detected: %s %s", result.get("face_detected"), result.get("warning") or "")
         log.info("  • Photos: %s", result.get("photos"))
         log.info("  • R2 Uploaded: %s", result.get("r2_uploaded"))
         log.info("=" * 60)

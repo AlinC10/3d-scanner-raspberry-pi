@@ -8,6 +8,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -63,6 +64,8 @@ class FakeS3:
         self.upload_exc = FakeClientError
         self.page_size = 1000
         self.delete_errors = set()  # keys reported in the 'Errors' list of delete_objects
+        self.chunks = [1]           # bytes reported to the progress callback, one call per chunk
+        self.chunk_pause = 0.0      # seconds each chunk takes (a slow uplink)
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -104,10 +107,16 @@ class FakeS3:
             raise FakeClientError({"Error": {"Code": "404"}}, "HeadObject")
         return {}
 
-    def upload_file(self, filename, bucket, key):
+    def upload_file(self, filename, bucket, key, Callback=None):
         self.calls.append(("upload_file", filename, bucket, key))
         if self.fail_on == "upload":
             raise self.upload_exc("upload failed")
+        # like s3transfer: the progress callback runs as the bytes go out, and what it raises aborts the transfer
+        for chunk in self.chunks:
+            if self.chunk_pause:
+                time.sleep(self.chunk_pause)
+            if Callback is not None:
+                Callback(chunk)
         self.objects[key] = b"x"
 
 
@@ -314,6 +323,26 @@ class UploadFileTests(unittest.TestCase):
     def test_directory_is_not_uploaded(self):
         self.assertFalse(self.r2.upload_file(self.tmp.name))
         self.assertEqual(self.s3.calls, [])
+
+    def test_an_attempt_longer_than_its_limit_is_abandoned(self):
+        # E2: a transfer that keeps trickling bytes is cut at the attempt limit and reported as a failure
+        self.s3.chunks = [1] * 50
+        self.s3.chunk_pause = 0.02     # the whole transfer would take 1 s
+        started = time.monotonic()
+        self.assertFalse(self.r2.upload_file(self.path, object_name="rig/0/slow.jpg", timeout_s=0.1))
+        self.assertLess(time.monotonic() - started, 0.8)
+        self.assertNotIn("rig/0/slow.jpg", self.s3.objects)
+
+    def test_an_attempt_within_its_limit_succeeds_and_zero_disables_the_limit(self):
+        self.s3.chunks = [1] * 5
+        self.s3.chunk_pause = 0.01
+        self.assertTrue(self.r2.upload_file(self.path, object_name="a.jpg", timeout_s=5.0))
+        self.assertTrue(self.r2.upload_file(self.path, object_name="b.jpg", timeout_s=0))
+
+    def test_the_default_attempt_limit_is_five_minutes(self):
+        if "SCAN_UPLOAD_ATTEMPT_TIMEOUT_S" in os.environ:
+            self.skipTest("SCAN_UPLOAD_ATTEMPT_TIMEOUT_S override present in the environment")
+        self.assertEqual(self.r2.UPLOAD_ATTEMPT_TIMEOUT_S, 300.0)
 
 
 class PreflightTests(unittest.TestCase):

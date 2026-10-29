@@ -77,6 +77,8 @@ It never returns `inf`. The empty backdrop is itself a **valid** reading, so an 
 
 At start-up `__init__` never raises. If `board`, `busio` or `adafruit_vl53l1x` cannot be imported, importing `tof.py` still works and the sensor is marked `available = False` with a warning. If the driver constructor or the configuration fails after the I2C bus was opened, the bus is released (`deinit`) and the sensor is unavailable for that run. `close()` can be called any number of times.
 
+`reinitialize()` releases the sensor and opens it again with the same settings (PERI-10): a sensor that was missing at boot or stopped answering can come back without a restart. `Scanner.require_tof()` does this once before refusing an **object** scan (at `/scanner/prepare` and again at `/scanner/start`). The **face** scan does not use the ToF sensor and never checks it, and the server starts without it.
+
 ### 4. Object Probe (`probe_object`, `is_object_detected`)
 Laser sensors can occasionally bounce off dust or highly reflective surfaces at odd angles. To prevent a false positive, `probe_object(threshold, samples=2)` takes up to `samples` **consecutive fresh readings**. Each read waits for its own measurement, so the second one is always taken entirely after the first and after the turntable has stopped. It returns `Optional[bool]`, reading by reading:
 
@@ -105,7 +107,7 @@ Always answers `200`. It never fails because of an invalid reading.
 ```
 
 - `valid: false, available: true`: the sensor is there but the reading is invalid (no target, weak signal, timeout, I2C error).
-- `available: false`: the sensor never initialised (see the start-up warning in the log: library missing, wires, wrong model ID). Restart after fixing the cause.
+- `available: false`: the sensor never initialised (see the start-up warning in the log: library missing, wires, wrong model ID). After fixing the cause, the next `/scanner/prepare` reinitialises it (no restart needed).
 
 ---
 

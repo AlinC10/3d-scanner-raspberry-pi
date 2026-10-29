@@ -15,6 +15,7 @@ PROGRAM = r"""
 import asyncio, json, os, sys, tempfile, time
 sys.path.insert(0, %r)
 os.environ["MOCK_HARDWARE"] = "1"
+os.environ["GROQ_API_KEY"] = ""      # the AI assistant stays off: the server must start anyway
 from hardware.mock_hardware import MockHardware
 MockHardware.apply()
 import main_dev                       # applies the mocks and builds the app
@@ -50,6 +51,19 @@ def wait_for(client, states, timeout=30):
 
 with TestClient(app) as client:
     out["status_idle"] = client.get("/scanner/status").json()["state"]
+
+    # the AI assistant is off without a key, and says so; the server still runs
+    import router.ai
+    router.ai.service.wait_until_loaded(10)
+    out["ai_status"] = client.get("/api/ai/status").json()
+    chat = client.post("/api/ai/chat", json={"question": "hi"})
+    out["ai_chat"] = [chat.status_code, "GROQ_API_KEY" in chat.json().get("detail", "")]
+
+    # no CORS headers (local only), Swagger still at /docs, the AI documents at /ai-docs
+    cors = client.get("/scanner/status", headers={"Origin": "http://evil.example"})
+    out["cors_header"] = cors.headers.get("access-control-allow-origin")
+    out["swagger"] = [client.get("/docs").status_code, "swagger" in client.get("/docs").text.lower()]
+    out["ai_docs"] = client.get("/ai-docs/user_manual.md").status_code
 
     # preview refused before anything is started: the same message on both prefixes
     a = client.get("/scanner/stream/mjpeg")
@@ -109,6 +123,21 @@ with TestClient(app) as client:
     wait_for(client, ("prepared", "error"))
     client.post("/scanner/cancel")
 
+    # without the Arduino: every motor request is a 503 that names it, the rest of the server works
+    router.scanner.scanner.arduino_available = False
+    prep = client.post("/scanner/prepare", json={})
+    out["no_arduino"] = [
+        prep.status_code, "Arduino" in prep.json().get("detail", ""),
+        client.post("/test/motor/z-move", json={"direction": "up", "distance_mm": 10}).status_code,
+        client.post("/test/turntable/rotate", json={"angle": 18}).status_code,
+        client.post("/scanner/face/capture", json={"manual_z": 240.0}).status_code,
+        client.get("/scanner/status").json()["state"],
+        client.post("/test/cleanup").status_code,
+        client.get("/test/endstops").status_code,
+    ]
+    router.scanner.scanner.arduino_available = True
+    out["arduino_back"] = client.post("/test/motor/z-move", json={"direction": "up", "distance_mm": 10}).status_code
+
 print(json.dumps(out))
 """ % ROOT
 
@@ -165,6 +194,21 @@ class DevAppTest(unittest.TestCase):
         self.assertIs(self.r["to_top"], True)
         self.assertEqual(self.r["snap"], [200, 2, True])
         self.assertEqual(self.r["cleanup"], 200)
+
+    def test_the_server_starts_with_the_ai_assistant_off_and_reports_why(self):
+        st = self.r["ai_status"]
+        self.assertEqual((st["on"], st["loading"]), (False, False))
+        self.assertIn("GROQ_API_KEY", st["reason"])
+        self.assertEqual(self.r["ai_chat"], [503, True])
+
+    def test_no_cors_headers_and_the_docs_paths_do_not_collide(self):
+        self.assertIsNone(self.r["cors_header"])
+        self.assertEqual(self.r["swagger"], [200, True])
+        self.assertEqual(self.r["ai_docs"], 200)
+
+    def test_without_the_arduino_motor_requests_are_503_and_the_rest_works(self):
+        self.assertEqual(self.r["no_arduino"], [503, True, 503, 503, 503, "cancelled", 200, 200])
+        self.assertEqual(self.r["arduino_back"], 200)
 
     def test_a_run_can_be_cancelled_and_prepared_again(self):
         self.assertEqual(self.r["cancel"], ["cancelled", "cancelled"])

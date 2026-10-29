@@ -8,7 +8,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union, Any, Dict
+from typing import Optional, Union, Any, Dict, Tuple
 import threading
 import time
 from queue import Queue
@@ -88,8 +88,10 @@ UPLOAD_BACKOFF_JITTER = _env_float("SCAN_UPLOAD_BACKOFF_JITTER", 0.2)
 # UPLOAD_PARK_RETRY_S seconds instead.
 UPLOAD_ATTEMPTS_PER_FILE = int(_env_float("SCAN_UPLOAD_ATTEMPTS_PER_FILE", 8))
 UPLOAD_PARK_RETRY_S = _env_float("SCAN_UPLOAD_PARK_RETRY_S", 60.0)
-# Once the physical scan has ended, uploads may take at most this long without a single file succeeding.
-UPLOAD_DRAIN_TIMEOUT_S = _env_float("SCAN_UPLOAD_DRAIN_TIMEOUT_S", 1800.0)
+# Once the physical scan has ended, uploads may take at most this long without a single file succeeding (5 min: past
+# that something is wrong with the uplink). One attempt of one file is limited separately, in
+# cloud.cloudflare_r2.UPLOAD_ATTEMPT_TIMEOUT_S (SCAN_UPLOAD_ATTEMPT_TIMEOUT_S, 300 s).
+UPLOAD_DRAIN_TIMEOUT_S = _env_float("SCAN_UPLOAD_DRAIN_TIMEOUT_S", 300.0)
 UPLOAD_DRAIN_POLL_S = 0.1
 # Preflight refuses a scan when the photo directory has less free space than this.
 MIN_FREE_DISK_MB = _env_float("SCAN_MIN_FREE_DISK_MB", 2048.0)
@@ -121,6 +123,20 @@ class ScannerBusyError(ScannerError):
 
     # Duck-typed by the routers (like ScannerStoppingError.conflict): a temporary refusal, HTTP 409
     conflict = True
+
+
+class ArduinoUnavailableError(ScannerError):
+    """
+    The Arduino (motor controller) does not answer on the USB serial port, so nothing that moves a motor can run.
+    The server keeps running without it (API-21); the API answers 503 with this message.
+    """
+    unavailable = True
+
+
+ARDUINO_UNAVAILABLE_MESSAGE = (
+    "The Arduino motor controller is not responding on the USB serial port: scanning and motor moves are unavailable. "
+    "Check the USB cable and the Arduino's power, then try again."
+)
 
 
 class ScannerPreflightError(RuntimeError):
@@ -161,6 +177,17 @@ class ScannerState:
 
     # Terminal states that cleanup() must not overwrite back to IDLE
     TERMINAL = (CANCELLED, ERROR, COMPLETED)
+
+
+class ScanMode:
+    """What /prepare readied the rig for (Scanner.mode, in GET /status). None: not prepared for a scan."""
+    OBJECT = "object"   # POST /scanner/prepare, then POST /scanner/start
+    FACE = "face"       # POST /scanner/face/prepare, then POST /scanner/face/capture
+    ALL = (OBJECT, FACE)
+
+
+class ScannerModeError(RuntimeError):
+    """The scanner is not prepared for this kind of scan (prepared for the other one, or not prepared): 400."""
 
 
 class ScanPhase:
@@ -262,6 +289,7 @@ class Scanner:
         self._upload_failed: set[str] = set()
         self._upload_keys: dict[str, str] = {}
         self._last_upload_time = time.monotonic()
+        self._drain_started_at: Optional[float] = None   # set while _drain_uploads() waits (upload_progress)
 
         # Manifest of the running scan (see _register_photos), protected by _manifest_lock
         self._manifest_lock = threading.Lock()
@@ -278,6 +306,16 @@ class Scanner:
         self.uploaded_keys: list[str] = []
         self.upload_verified: Optional[bool] = None
         self._phase_note: Optional[str] = None   # sticky message (e.g. first-ring ToF remark) kept across phases
+        self.face_result: Optional[dict] = None   # outcome of the last completed face scan (GET /status)
+        # What the last /prepare readied the rig for (ScanMode; None for a manual /test session or before any prepare).
+        # It stays set after the run so /status still says which kind of scan ended.
+        self.mode: Optional[str] = None
+        # Height of the carriage above the bottom endstop, known after a prepare homed it (None: unknown, e.g. after a
+        # cancel). The face scan starts from it instead of homing again.
+        self.z_position_mm: Optional[float] = None
+        # Camera settings and upload choice of the face prepare, used when the face capture locks the cameras
+        self._face_camera_settings: dict = {}
+        self._face_upload_r2 = True
         # Whether prepare_scan() of the selected camera driver accepts lock_auto (set by setup_and_stream)
         self._lock_auto_supported = False
         # True while the cameras/lights were started by a manual /test endpoint (setup_and_stream(preflight=False)),
@@ -611,20 +649,43 @@ class Scanner:
         """
         limit = UPLOAD_DRAIN_TIMEOUT_S if timeout_s is None else timeout_s
         drain_start = time.monotonic()
-        while True:
-            if self._cancel_event.is_set():
-                return "cancelled"
+        with self._upload_lock:
+            self._drain_started_at = drain_start
+        try:
+            while True:
+                if self._cancel_event.is_set():
+                    return "cancelled"
+                with self._upload_lock:
+                    pending = len(self._pending)
+                    reference = max(self._last_upload_time, drain_start)
+                if pending == 0:
+                    return "done"
+                thread = self._upload_thread
+                if thread is None or not thread.is_alive():
+                    return "worker_dead"
+                if time.monotonic() - reference > limit:
+                    log.error("[Scanner] No upload succeeded for %.0f s; giving up the drain.", limit)
+                    return "timeout"
+                self._cancel_event.wait(UPLOAD_DRAIN_POLL_S)
+        finally:
             with self._upload_lock:
-                pending = len(self._pending)
-                reference = max(self._last_upload_time, drain_start)
-            if pending == 0:
-                return "done"
-            thread = self._upload_thread
-            if thread is None or not thread.is_alive():
-                return "worker_dead"
-            if time.monotonic() - reference > limit:
-                return "timeout"
-            self._cancel_event.wait(UPLOAD_DRAIN_POLL_S)
+                self._drain_started_at = None
+
+    def upload_progress(self) -> dict:
+        """
+        Upload progress for GET /status.
+
+        :return: ``seconds_since_last_upload``: seconds since the last successful upload (or since the upload worker
+            or the drain started, whichever is later); None when no upload worker runs. ``upload_drain_timeout_s``:
+            the drain gives up after that long without a successful upload.
+        """
+        thread = self._upload_thread
+        seconds = None
+        if thread is not None and thread.is_alive():
+            with self._upload_lock:
+                reference = max(self._last_upload_time, self._drain_started_at or 0.0)
+            seconds = round(max(0.0, time.monotonic() - reference), 1)
+        return {"seconds_since_last_upload": seconds, "upload_drain_timeout_s": UPLOAD_DRAIN_TIMEOUT_S}
 
     def stop_upload_worker(self, wait_for_completion: bool = True, stall_timeout: Optional[float] = None) -> str:
         """
@@ -796,9 +857,11 @@ class Scanner:
         with self._manifest_lock:
             return list(self._manifest["expected_keys"]) if self._manifest else []
 
-    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
+    def move_z_up(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
         """
         Move Z-axis UP. Blocked if the top endstop is already active or hit mid-flight.
+
+        Constant speed by default (``acceleration=False``): the Z axis is not ramped unless a caller asks for it.
 
         :raises ScannerBusyError: if another motion is in progress (nothing is sent).
         :return: False without sending anything when a cancel is pending (see `_cancel_applies`).
@@ -831,9 +894,11 @@ class Scanner:
                 raise TopEndstopTriggered("Top limit switch hit during upward travel!")
             return success
 
-    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = True, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
+    def move_z_down(self, steps: int = 20, delay: float = 0.002, step_type: Optional[str] = None, acceleration: bool = False, start_delay: Optional[float] = 0.004, ramp_percent: float = 0.2, decel_percent: Optional[float] = None, end_delay: Optional[float] = None) -> bool:
         """
         Move Z-axis DOWN. Blocked if the bottom endstop is already active or hit mid-flight.
+
+        Constant speed by default (``acceleration=False``), like `move_z_up`.
 
         :raises ScannerBusyError: if another motion is in progress (nothing is sent).
         :return: False without sending anything when a cancel is pending (see `_cancel_applies`).
@@ -1038,6 +1103,8 @@ class Scanner:
         enable_stream: bool = True,
         camera_mode: Optional[str] = None,
         preflight: bool = True,
+        scan_mode: Optional[str] = ScanMode.OBJECT,
+        check_cloud: bool = True,
         **kwargs
     ) -> list[str] | None:
         """
@@ -1046,6 +1113,9 @@ class Scanner:
 
         :param preflight: run the scan preflight (R2, ToF, disk space) first. The manual /test endpoints pass False:
             they only need the cameras and the lights, not the cloud.
+        :param scan_mode: what this prepare readies the rig for (ScanMode). The face scan does not check the ToF
+            sensor. Ignored (mode None) for a manual session (preflight=False).
+        :param check_cloud: check the cloud storage in the preflight (a face scan without upload does not need it).
         """
         # The MJPEG preview has no bitrate; legacy callers may still pass one
         kwargs.pop("bitrate", None)
@@ -1054,10 +1124,14 @@ class Scanner:
         with self._lock:
             self._check_prepare_allowed()
 
+        # A scan prepare homes the carriage: without the Arduino it cannot start (the manual /test stream can)
+        if preflight:
+            self.require_motors()
+
         # Checked BEFORE any state change: a failure leaves the scanner IDLE and the router answers 400 with the text
         if preflight:
             try:
-                self.preflight()
+                self.preflight(check_cloud=check_cloud, check_tof=scan_mode != ScanMode.FACE)
             except ScannerPreflightError as e:
                 self._set_phase(ScanPhase.ERROR, error=str(e))
                 raise
@@ -1068,6 +1142,8 @@ class Scanner:
             self._check_prepare_allowed()
             self.state = ScannerState.PREPARING
             self._manual_session = not preflight   # manual /test endpoints pass preflight=False
+            self.mode = scan_mode if preflight else None
+            self.z_position_mm = None   # the carriage is homed again below
             self._cancel_event.clear()
             self.stream_urls = None
             self.total_photos = 0
@@ -1082,7 +1158,7 @@ class Scanner:
 
             # A 0% brightness is refused BEFORE the lights are switched on and before the bucket is wiped
             self._require_brightness()
-            self.lights.on()
+            self._lights_on_unless_cancelled()
 
             # Determine camera driver mode
             selected_mode = (
@@ -1202,6 +1278,24 @@ class Scanner:
         self.upload_verified = None
         self._phase_note = None
         self.phase_message = None
+        self.face_result = None
+
+    def _lights_on_unless_cancelled(self) -> bool:
+        """
+        Switches the lights on unless a cancel is pending (SCAN-11).
+
+        The check and the switch happen under `_lock`, where `emergency_stop()` sets the cancel flag: either the cancel
+        is seen here and the lights stay off, or the lights were already on when the stop began and its teardown
+        switches them off. A thread that checked the cancel flag earlier can no longer switch the lights on after the
+        stop.
+
+        :return: True when the lights were switched on, False when a cancel is pending (nothing done).
+        """
+        with self._lock:
+            if self._cancel_event.is_set():
+                return False
+            self.lights.on()
+            return True
 
     def _require_brightness(self) -> None:
         try:
@@ -1221,22 +1315,73 @@ class Scanner:
         self.phase = ScanPhase.CANCELLED
         return True
 
-    def preflight(self) -> None:
+    def preflight(self, check_cloud: bool = True, check_tof: bool = True) -> None:
         """
         Checks, before a prepare starts, what would otherwise only fail after the scan: the cloud storage (credentials,
         write/read/delete rights), the ToF sensor and the free space for the photos. Stops at the first problem.
 
+        :param check_cloud: check the cloud storage (a face scan without upload does not need it).
+        :param check_tof: check the ToF sensor (only the object scan uses it; the face scan does not).
         :raises ScannerPreflightError: with a human readable message. SCAN_PREFLIGHT=0 skips the checks (development).
         """
         if os.environ.get("SCAN_PREFLIGHT", "1") == "0":
             log.warning("[Scanner] Preflight checks skipped (SCAN_PREFLIGHT=0).")
             return
 
-        try:
-            r2.preflight()
-        except Exception as e:
-            raise ScannerPreflightError(f"Cloud storage check failed: {e}")
+        if check_cloud:
+            try:
+                r2.preflight()
+            except Exception as e:
+                raise ScannerPreflightError(f"Cloud storage check failed: {e}")
 
+        if check_tof:
+            self.require_tof()
+        self._check_free_disk()
+
+    def require_motors(self) -> None:
+        """
+        Checks, before anything that moves a motor, that the Arduino answers (reconnecting when the server started
+        without it or the USB link dropped) and that both motors are configured on it.
+
+        :raises ArduinoUnavailableError: the Arduino does not answer, or refused a motor's configuration.
+        """
+        bridge = getattr(self.turntable_motor, "bridge", None)
+        ensure = getattr(bridge, "ensure_connected", None)
+        if callable(ensure) and not ensure():
+            raise ArduinoUnavailableError(ARDUINO_UNAVAILABLE_MESSAGE)
+        for motor in (self.turntable_motor, self.z_axis_motor):
+            if getattr(motor, "configured", True) is False and not motor.configure():
+                raise ArduinoUnavailableError(
+                    f"{ARDUINO_UNAVAILABLE_MESSAGE} ({getattr(motor, 'config_error', '')})"
+                )
+
+    def require_tof(self) -> None:
+        """
+        The object scan needs the ToF sensor (it ends the scan at the top of the object): checked at /prepare and
+        again at /start. A sensor that is missing or fails is reinitialised once before giving up (PERI-10). The face
+        scan never calls this. SCAN_PREFLIGHT=0 skips it (development).
+
+        :raises ScannerPreflightError: the sensor is still missing or gives no valid reading.
+        """
+        if os.environ.get("SCAN_PREFLIGHT", "1") == "0":
+            return
+        try:
+            self._check_tof()
+            return
+        except ScannerPreflightError as first:
+            reinitialize = getattr(self.tof, "reinitialize", None)
+            if not callable(reinitialize):
+                raise
+            log.warning("[Scanner] %s Reinitialising the ToF sensor once.", first)
+            try:
+                reinitialize()
+            except Exception as e:
+                log.warning("[Scanner] ToF reinitialisation failed: %s", e)
+                raise first
+        self._check_tof()
+
+    def _check_tof(self) -> None:
+        """:raises ScannerPreflightError: the ToF sensor is missing or gives no valid test reading."""
         if not getattr(self.tof, "available", True):
             raise ScannerPreflightError(
                 "The ToF distance sensor is not available (not detected or not initialised); "
@@ -1252,6 +1397,8 @@ class Scanner:
                 "view)."
             )
 
+    def _check_free_disk(self) -> None:
+        """:raises ScannerPreflightError: less than MIN_FREE_DISK_MB free for the photos."""
         # The photo directory may not exist yet: measure the nearest existing parent
         probe = Path(self.images_dir)
         while not probe.exists() and probe != probe.parent:
@@ -1266,14 +1413,20 @@ class Scanner:
                 "needed for a scan."
             )
 
-    def finish_preparation(self, z_start_mm: float = Z_START_DEFAULT_MM, **camera_kwargs):
+    def finish_preparation(self, z_start_mm: float = Z_START_DEFAULT_MM, upload_r2: bool = True, **camera_kwargs):
         """
         Phase 2 & 3: Homes carriage, climbs to the start position, cleans R2, recalibrates cameras in front of the
         object. Designed to run as a background task.
 
+        For a face prepare (``self.mode == ScanMode.FACE``) the cameras are not locked here: AE/AWB keep running and the
+        lenses stay on the requested (or saved) focus while the face capture searches the height; the autofocus and
+        the AE/AWB lock run at the height found (see `face_scan`). The camera settings are kept for that step.
+
         :param z_start_mm: Height of the scan start position above the bottom endstop (0 = stay on the endstop).
             Must be a whole number of Z steps (MotorError otherwise, before anything moves).
+        :param upload_r2: clean the bucket now (the photos will be uploaded). Only a face prepare may pass False.
         """
+        face = self.mode == ScanMode.FACE
         # This thread now runs the prepare sequence: the Z helpers honour a pending cancel for it (_cancel_applies)
         self._tls.automated = True
         try:
@@ -1330,19 +1483,21 @@ class Scanner:
 
             # Clean up the cloud bucket before capturing new assets: a leftover key of an older scan would be
             # ingested with the new set. An incomplete cleanup is an error, not a warning.
-            try:
-                removed = r2.delete_all_files_from_bucket()
-            except Exception as e:
-                raise ScannerError(f"Cloud sanitization failed: {e}")
-            log.info("[Scanner] Bucket cleaned before the scan (%s object(s) removed).", removed)
+            if upload_r2 or not face:
+                try:
+                    removed = r2.delete_all_files_from_bucket()
+                except Exception as e:
+                    raise ScannerError(f"Cloud sanitization failed: {e}")
+                log.info("[Scanner] Bucket cleaned before the scan (%s object(s) removed).", removed)
 
             if self._cancel_event.is_set(): return
 
             self.lights.lock_brightness()
 
             try:
-                if not self.lights.is_on:
-                    self.lights.on()
+                if not self.lights.is_on and not self._lights_on_unless_cancelled():
+                    self.lights.unlock_brightness()
+                    return  # cancelled between the last check and here: the lights stay off (SCAN-11)
 
                 if not self.lights.is_on:
                     raise ScannerError("Failed to energize LED illumination.")
@@ -1359,27 +1514,22 @@ class Scanner:
                 if not self.lights.is_on:
                     raise ScannerError("Lights were turned off before camera lock.")
 
+                if face:
+                    # The face capture locks the cameras on the face, at the height it finds: keep the settings for it.
+                    # Here the lenses go to the requested position (or the saved one for "auto" / null) and AE/AWB keep
+                    # following the subject while the height is searched.
+                    self._face_camera_settings = {**camera_kwargs, "copy_colour_gains": copy_colour_gains}
+                    self._face_upload_r2 = bool(upload_r2)
+                    search_kwargs = {k: v for k, v in camera_kwargs.items()
+                                     if k not in ("exposure_time", "analogue_gain", "colour_gains")}
+                    search_kwargs["keep_running"] = True
+                    results = self.dual_cameras.prepare_scan(**search_kwargs)
+                    log.info("[Scanner] Face prepare: cameras ready for the height search: %s", results)
+                    camera_kwargs = None
+
                 # Recalibrate AE/AWB and focus in front of the illuminated object
-                camera_kwargs["keep_running"] = True
-                # Only this call locks AE/AWB (after the light has stabilised and in front of the object); the first
-                # prepare_scan of setup_and_stream stays unlocked so the stream can adapt.
-                if self._lock_auto_supported:
-                    camera_kwargs["lock_auto"] = True
-                # Part of the BaseDualCamera interface: every driver accepts it (the ones without support ignore it)
-                camera_kwargs["copy_colour_gains"] = copy_colour_gains
-                log.info("[Scanner] In-position camera recalibration settings (home + %g mm): %s",
-                         z_start_mm, camera_kwargs)
-                recalib_results = self.dual_cameras.prepare_scan(**camera_kwargs)
-                log.info("[Scanner] Applied recalibration settings from prepare_scan: %s", recalib_results)
-                if self._lock_auto_supported:
-                    unlocked = [
-                        r for r in (recalib_results if isinstance(recalib_results, (list, tuple)) else [recalib_results])
-                        if isinstance(r, dict) and not (r.get("locked") and r.get("ready", True))
-                    ]
-                    if unlocked:
-                        raise ScannerError(
-                            "AE/AWB lock failed on at least one camera; exposure would drift during the scan."
-                        )
+                if camera_kwargs is not None:
+                    self._lock_cameras(camera_kwargs, copy_colour_gains, f"home + {z_start_mm:g} mm")
                 
             except Exception:
                 self.lights.unlock_brightness()
@@ -1390,6 +1540,7 @@ class Scanner:
                 if self.state != ScannerState.CANCELLED:
                     self.state = ScannerState.PREPARED
                     self._level = 0
+                    self.z_position_mm = float(z_start_mm)
                     self._set_phase(ScanPhase.PREPARED)
                     log.info("[Scanner] Preparation fully completed!")
 
@@ -1402,6 +1553,36 @@ class Scanner:
                     self._set_phase(ScanPhase.ERROR, error=str(e))
         finally:
             self._tls.automated = False
+
+    def _lock_cameras(self, camera_kwargs: dict, copy_colour_gains: bool, where: str) -> list:
+        """
+        Locks the cameras where they are: autofocus sweep (``focus="auto"``; an integer or a pair is set instead, and
+        null keeps the saved positions), then AE/AWB settle and lock (manual exposure / gain / colour gains are applied
+        and kept). Used in position by the object prepare and by the face capture.
+
+        :raises ScannerError: AE/AWB could not be locked on a camera.
+        """
+        camera_kwargs = dict(camera_kwargs)
+        camera_kwargs["keep_running"] = True
+        # Only this call locks AE/AWB (after the light has stabilised and in position); the first prepare_scan of
+        # setup_and_stream stays unlocked so the stream can adapt.
+        if self._lock_auto_supported:
+            camera_kwargs["lock_auto"] = True
+        # Part of the BaseDualCamera interface: every driver accepts it (the ones without support ignore it)
+        camera_kwargs["copy_colour_gains"] = copy_colour_gains
+        log.info("[Scanner] In-position camera recalibration settings (%s): %s", where, camera_kwargs)
+        recalib_results = self.dual_cameras.prepare_scan(**camera_kwargs)
+        log.info("[Scanner] Applied recalibration settings from prepare_scan: %s", recalib_results)
+        if self._lock_auto_supported:
+            unlocked = [
+                r for r in (recalib_results if isinstance(recalib_results, (list, tuple)) else [recalib_results])
+                if isinstance(r, dict) and not (r.get("locked") and r.get("ready", True))
+            ]
+            if unlocked:
+                raise ScannerError(
+                    "AE/AWB lock failed on at least one camera; exposure would drift during the scan."
+                )
+        return recalib_results
 
     def generate_livestream(self):
         """Starts or retrieves livestream URLs."""
@@ -1653,6 +1834,10 @@ class Scanner:
         with self._lock:
             if self.state != ScannerState.PREPARED:
                 raise RuntimeError("System must be prepared before scanning.")
+            if self.mode == ScanMode.FACE:
+                raise ScannerModeError(
+                    "The scanner is prepared for a face scan; call POST /scanner/prepare for an object scan."
+                )
             if self.dual_cameras is None:
                 raise ScannerError("Dual Camera System is not initialized. Run prepare_scan() before scan().")
 
@@ -1753,9 +1938,11 @@ class Scanner:
                     break
 
                 try:
-                    # The settle pauses are interruptible and the cancel flag is re-checked before every step:
+                    # The turntable stays energized for the whole scan (M9): released during the climb, the platter
+                    # could be nudged and the next ring would start at another angle. Only Z is switched on and off;
+                    # the lead screw holds the carriage between climbs.
+                    # The settle pause is interruptible and the cancel flag is re-checked before every step:
                     # a cancel that lands during a pause must not still lift the carriage.
-                    self.turntable_motor.disable(interrupt=self._cancel_event)  # Holding torque settles for 0.5s then cuts power
                     if self._cancel_event.is_set():
                         break
                     self.z_axis_motor.enable()      # Energize Z-axis
@@ -1779,7 +1966,8 @@ class Scanner:
                         # The climb ended exactly on the top switch: rotate() reported success, but the carriage is at
                         # the ceiling. Take the final ring instead of silently leaving the loop without it.
                         raise TopEndstopTriggered("Top limit switch reached at the end of the climb.")
-                    self.turntable_motor.enable()   # Re-enable turntable for next slice
+                    # Never released: this only re-asserts the holding torque (e.g. after an Arduino reset)
+                    self.turntable_motor.enable()
                 except TopEndstopTriggered:
                     log.info("[Scanner] Carriage reached the TOP ceiling during climb. Performing final top-level photo ring...")
                     self.z_axis_motor.disable()
@@ -1859,250 +2047,358 @@ class Scanner:
             if self.state == ScannerState.RUNNING:
                 self.state = finish_state
 
-    def face_scan(
+    # Strategies of the face capture: search the height ("sweep_best_score", "direct_stop") or photograph at once
+    FACE_STRATEGIES = ("sweep_best_score", "direct_stop", "none")
+    # Below this score (sum of both cameras, see StereoFramingAnalyzer) no camera saw a usable face
+    FACE_MIN_SCORE = 0.3
+    # Fresh preview pair: how long one wait lasts, and how many waits before the face capture gives up
+    FACE_FRAME_TIMEOUT_S = 1.0
+    FACE_FRAME_ATTEMPTS = 3
+    # Margin around the face box for the autofocus (fraction of the box on each side)
+    FACE_AF_MARGIN = 0.10
+
+    def begin_face_scan(
         self,
         strategy: str = "sweep_best_score",
-        start_z_mm: float = 180.0,
         search_range_mm: float = 150.0,
         step_mm: float = 8.0,
         manual_z: Optional[float] = None,
-        home: bool = True,
-        upload_r2: bool = True,
-        illumination_brightness: float = 0.5,
-        settle_s: float = 0.150,
-        finish_state: str = ScannerState.IDLE,
-        analyzer: Optional[Any] = None,
-    ) -> dict:
+        **_ignored: Any,
+    ) -> None:
         """
-        Face capture mode: mechatronic auto-framing and synchronized 12.3MP photo capture.
+        Synchronous part of the face capture: checks that the rig was readied by a face prepare, validates the heights
+        against the carriage position, checks that face detection can run, and moves the scanner to RUNNING.
 
-        Elevates the carriage across the facial region, evaluates stereo face framing
-        using in-memory preview frames (MediaPipe FaceLandmarker), finds the optimal
-        optical elevation, compensates mechanical backlash, and triggers synchronized still captures.
+        `POST /scanner/face/capture` calls it before answering 202, so a refusal is an HTTP error instead of a failure
+        of the background task; `face_scan(begun=True)` then does the work.
 
-        :param strategy: 'sweep_best_score' (search full range and return to apex) or
-            'direct_stop' (stop as soon as face is vertically centered).
-        :param start_z_mm: Initial rapid climb height in mm before starting search (default 180.0 mm).
-        :param search_range_mm: Window in mm to sweep above start_z_mm (default 150.0 mm).
-        :param step_mm: Climb distance between framing checks (must be whole motor steps).
-        :param manual_z: Optional explicit height in mm (>= 200.0 mm). Skips auto-framing if provided.
-        :param home: Whether to home carriage to bottom limit switch before moving.
-        :param upload_r2: Whether to enqueue and verify captured photos in Cloudflare R2 bucket.
-        :param illumination_brightness: Chamber LED PWM brightness level (0.0 - 1.0, default 0.5).
-        :param settle_s: Mechanical damping pause in seconds before the photo.
-        :param finish_state: State to set upon completion (default IDLE).
-        :param analyzer: Optional StereoFramingAnalyzer instance for dependency injection.
-        :return: Dict containing status, optimal_z_mm, best_score, photos list, and r2_uploaded flag.
+        :raises ScannerStoppingError: an emergency stop is still in progress (409).
+        :raises ScannerBusyError: another run owns the rig (409).
+        :raises ScannerModeError: the scanner is not PREPARED for a face scan (400).
+        :raises ArduinoUnavailableError: the Arduino does not answer (503).
+        :raises ValueError: a height or distance outside the travel or not a whole number of Z steps (422).
+        :raises ScannerPreflightError: MediaPipe, OpenCV or the face model is missing and the strategy needs them (400).
         """
-        with self._lock:
+        def check_state() -> None:
             if self._stopping:
                 raise ScannerStoppingError("Cannot start face scan. An emergency stop is still in progress.")
-            if self.state in (ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING, ScannerState.DOWNLOADING):
+            if self.state in (ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING,
+                              ScannerState.DOWNLOADING):
                 raise ScannerBusyError(f"Cannot start face scan. Scanner is currently {self.state}")
+            if self.state != ScannerState.PREPARED or self.mode != ScanMode.FACE:
+                raise ScannerModeError(
+                    f"Cannot start face scan: the scanner is {self.state} (mode {self.mode}). "
+                    "Call POST /scanner/face/prepare first."
+                )
+            if self.z_position_mm is None:
+                raise ScannerModeError("Cannot start face scan: the carriage position is unknown; prepare again.")
 
-            if manual_z is not None:
-                if manual_z < 200.0 or manual_z > Z_TRAVEL_MAX_MM:
-                    raise ValueError(f"manual_z must be between 200.0 mm and {Z_TRAVEL_MAX_MM} mm (got {manual_z})")
-            else:
-                if start_z_mm + search_range_mm > Z_TRAVEL_MAX_MM:
-                    raise ValueError(
-                        f"start_z_mm ({start_z_mm}) + search_range_mm ({search_range_mm}) "
-                        f"exceeds maximum Z travel ({Z_TRAVEL_MAX_MM} mm)"
-                    )
+        with self._lock:
+            check_state()
+            current_z = float(self.z_position_mm)
 
-            # Validate mechanical step conversion before moving hardware
-            self.z_axis_motor.distance_to_step_conversion(distance=step_mm)
+        if strategy not in self.FACE_STRATEGIES:
+            raise ValueError(f"strategy must be one of {self.FACE_STRATEGIES} (got {strategy!r})")
+        if manual_z is not None:
+            if manual_z < 200.0 or manual_z > Z_TRAVEL_MAX_MM:
+                raise ValueError(f"manual_z must be between 200.0 mm and {Z_TRAVEL_MAX_MM} mm (got {manual_z})")
+        elif strategy != "none" and current_z + search_range_mm > Z_TRAVEL_MAX_MM:
+            raise ValueError(
+                f"The search ends above the Z travel: carriage at {current_z:g} mm + search_range_mm "
+                f"{search_range_mm:g} > {Z_TRAVEL_MAX_MM} mm"
+            )
+        # Every height becomes a Z move: refuse a value that is not a whole number of steps before anything moves
+        for name, value in (("step_mm", step_mm), ("search_range_mm", search_range_mm), ("manual_z", manual_z)):
+            if value is None:
+                continue
+            try:
+                self.z_axis_motor.distance_to_step_conversion(distance=value)
+            except Exception as e:
+                raise ValueError(f"{name} is not reachable with Z motor steps: {e}")
 
+        # The libraries are checked before the carriage moves (FACE-13): a height search without them is pointless
+        if manual_z is None and strategy != "none":
+            problem = self._face_detection_problem()
+            if problem:
+                raise ScannerPreflightError(problem)
+
+        self.require_motors()
+
+        with self._lock:
+            check_state()
             self._cancel_event.clear()
+            self._manual_session = False
             self.total_photos = 0
             self.state = ScannerState.RUNNING
             self._reset_status()
-            self._set_phase(ScanPhase.SCANNING)
+            self._set_phase(ScanPhase.SCANNING, "Face scan: positioning the carriage")
 
+    @staticmethod
+    def _face_detection_problem() -> Optional[str]:
+        """Why MediaPipe face detection cannot run (None when it can)."""
+        try:
+            from face_scan.face_scanner import face_detection_problem
+        except Exception as e:   # the module itself needs cv2 / numpy
+            return f"Face detection could not be loaded: {e}"
+        return face_detection_problem()
+
+    def _face_z_move(self, up: bool, distance_mm: float) -> None:
+        """
+        One Z move of the face scan, at constant speed (no acceleration on the Z axis) and checked. The known carriage
+        height follows the move.
+
+        Only the endstop in the direction of the move counts (the move helpers ignore the other one). It propagates as
+        TopEndstopTriggered / BottomEndstopTriggered: the height search ends on the top one, anything else turns it into
+        an error with a clear message.
+
+        :raises ScannerError: the move did not complete (cancel, aborted move).
+        """
+        if distance_mm <= 0:
+            return
+        self.z_axis_motor.enable()
+        move = self.move_z_up_distance if up else self.move_z_down_distance
+        try:
+            done = move(distance=distance_mm, delay=Z_PREPARE_DELAY_S, acceleration=False)
+        except (TopEndstopTriggered, BottomEndstopTriggered):
+            self.z_position_mm = None   # stopped somewhere along the move
+            raise
+        if not done:
+            self.z_position_mm = None
+            if self._cancel_event.is_set():
+                raise ScannerError("Face scan cancelled during a Z move.")
+            raise ScannerError(f"The Z move of {distance_mm:.2f} mm {'up' if up else 'down'} did not complete.")
+        if self.z_position_mm is not None:
+            self.z_position_mm += distance_mm if up else -distance_mm
+
+    def _face_go_to(self, target_mm: float, backlash_mm: float = 3.0) -> None:
+        """Moves the carriage to `target_mm`, always arriving from below (the nut loaded against gravity)."""
+        current = float(self.z_position_mm)
+        if target_mm > current:
+            self._face_z_move(True, target_mm - current)
+        elif target_mm < current:
+            descent = min(current - target_mm + backlash_mm, current)   # never below the bottom endstop
+            self._face_z_move(False, descent)
+            self._cancel_event.wait(0.05)
+            self._face_z_move(True, target_mm - float(self.z_position_mm))
+        self.z_position_mm = float(target_mm)
+
+    def _fresh_face_frames(self) -> Tuple[Any, Any]:
+        """
+        A preview pair taken after the carriage stopped (FACE-16): frames in flight during the move are not used.
+
+        :raises ScannerError: no fresh pair after FACE_FRAME_ATTEMPTS waits.
+        """
+        for _ in range(self.FACE_FRAME_ATTEMPTS):
+            if self._cancel_event.is_set():
+                raise ScannerError("Face scan cancelled while waiting for a preview frame.")
+            left, right = self.dual_cameras.get_latest_lores_frames(
+                timeout=self.FACE_FRAME_TIMEOUT_S, fresh=True, strict=True
+            )
+            if left is not None or right is not None:
+                return left, right
+        raise ScannerError("The cameras delivered no fresh preview frame for the face framing.")
+
+    def _face_af_roi(self, evaluation: Optional[dict]) -> Optional[tuple]:
+        """Per-camera autofocus boxes around the face found (None: no face, the default centre box is used)."""
+        if not evaluation:
+            return None
+        boxes = []
+        for side in ("left", "right"):
+            box = (evaluation.get(side) or {}).get("bbox_norm")
+            if not box:
+                return None
+            x, y, w, h = box
+            mx, my = w * self.FACE_AF_MARGIN, h * self.FACE_AF_MARGIN
+            x0, y0 = max(0.0, x - mx), max(0.0, y - my)
+            x1, y1 = min(1.0, x + w + mx), min(1.0, y + h + my)
+            if x1 <= x0 or y1 <= y0:
+                return None
+            boxes.append((x0, y0, x1 - x0, y1 - y0))
+        return tuple(boxes)
+
+    def _search_face_height(self, strategy: str, search_range_mm: float, step_mm: float,
+                            analyzer: Any) -> Tuple[float, Optional[float], Optional[dict], dict]:
+        """
+        Climbs from the prepared height through `search_range_mm`, scoring each stop on fresh preview frames, then goes
+        to the best height (from below). Returns (best_z, best_score, evaluation at best_z, detection summary).
+
+        The score of a stop is the framing score of `StereoFramingAnalyzer` (centering, size, cheek profile and the
+        share of the face mesh inside the frame). When no camera ever saw a face, the photo is still taken at the start
+        height and the summary says so (FACE-11: a warning, not an error).
+        """
+        start_z = float(self.z_position_mm)
+        max_z = start_z + search_range_mm
+        best_score, best_z, best_eval = -1.0, start_z, None
+        seen_any = seen_both = False
+        passed_apex_count = 0
+        direct_stop_hit = False
+
+        log.info("[Scanner Face] Starting auto-framing sweep: Z=%.1f mm to %.1f mm (step=%.1f mm, strategy=%s)",
+                 start_z, max_z, step_mm, strategy)
+        while True:
+            if self._cancel_applies():
+                raise ScannerError("Face scan cancelled during the framing sweep.")
+            current_z = float(self.z_position_mm)
+            frame_left, frame_right = self._fresh_face_frames()
+            eval_res = analyzer.evaluate_stereo_pair(frame_left, frame_right)
+            score = float(eval_res.get("total_score", 0.0) or 0.0)
+            avg_nose_y = eval_res.get("avg_nose_y")
+            both = bool(eval_res.get("both_detected"))
+            seen_both = seen_both or both
+            seen_any = seen_any or both or bool(eval_res.get("any_detected"))
+            log.info(
+                "[Scanner Face | Z=%5.1f mm] Score: %4.2f (L: %4.2f, R: %4.2f) | Nose Y: %s",
+                current_z, score,
+                (eval_res.get("left") or {}).get("score", 0.0), (eval_res.get("right") or {}).get("score", 0.0),
+                f"{avg_nose_y:.3f}" if avg_nose_y is not None else "N/A",
+            )
+
+            if strategy == "direct_stop" and both and avg_nose_y is not None and 0.45 <= avg_nose_y <= 0.55:
+                log.info("[Scanner Face] Direct stop centered at Z=%.1f mm (Nose Y=%.3f)", current_z, avg_nose_y)
+                best_score, best_z, best_eval = score, current_z, eval_res
+                direct_stop_hit = True
+                break
+
+            if score > best_score:
+                best_score, best_z, best_eval = score, current_z, eval_res
+                passed_apex_count = 0
+            elif best_score > 1.2:
+                passed_apex_count += 1
+                if passed_apex_count >= 5:
+                    log.info("[Scanner Face] Early exit: passed apex (Best: %.2f at %.1f mm)", best_score, best_z)
+                    break
+
+            if current_z + step_mm > max_z + 1e-6 or self.up_endstop.is_active:
+                break
+            try:
+                self._face_z_move(True, step_mm)
+            except TopEndstopTriggered:
+                log.info("[Scanner Face] Top endstop reached during the sweep; the search ends here.")
+                break
+
+        if self._cancel_applies():
+            raise ScannerError("Face scan cancelled during the framing sweep.")
+        if self.z_position_mm is None:
+            # The top endstop stopped the last step somewhere: home is far, the best height is relative to the start
+            raise ScannerError("The carriage position was lost at the top endstop during the face search.")
+
+        summary = {"face_detected": seen_any and best_score >= self.FACE_MIN_SCORE, "both_cameras": seen_both}
+        if not summary["face_detected"]:
+            best_z, best_eval = start_z, None
+        if not direct_stop_hit:
+            self._face_go_to(best_z)
+        return best_z, (best_score if summary["face_detected"] else None), best_eval, summary
+
+    def face_scan(
+        self,
+        strategy: str = "sweep_best_score",
+        search_range_mm: float = 150.0,
+        step_mm: float = 8.0,
+        manual_z: Optional[float] = None,
+        settle_s: float = 0.150,
+        finish_state: str = ScannerState.COMPLETED,
+        analyzer: Optional[Any] = None,
+        begun: bool = False,
+    ) -> dict:
+        """
+        Face capture, after a face prepare (`POST /scanner/face/prepare`: homing, climb to the start height, lights,
+        cameras streaming with AE/AWB running and the focus fixed).
+
+        1. Height: ``manual_z`` (direct move), or a search from the prepared height (``sweep_best_score`` /
+           ``direct_stop``, MediaPipe on fresh preview frames), or none (``strategy="none"``: photo where it is).
+           Every Z move runs at constant speed and arrives from below.
+        2. Cameras locked on the face at that height: autofocus sweep on the face box (when the prepare asked for
+           ``focus="auto"``) and AE/AWB settle and lock; values given at the prepare are applied instead.
+        3. Settle pause, synchronized photo pair, upload and verification (if the prepare asked for the upload).
+
+        The MediaPipe detector exists only during the search and is closed after it (FACE-14).
+
+        :param strategy: ``sweep_best_score``, ``direct_stop`` or ``none``.
+        :param search_range_mm: How far above the prepared height the search goes.
+        :param step_mm: Climb between two framing checks (whole motor steps).
+        :param manual_z: Explicit height in mm (>= 200); skips the search.
+        :param settle_s: Mechanical damping pause in seconds before the photo (interrupted by a cancel).
+        :param finish_state: State after a face scan that completed (default COMPLETED).
+        :param analyzer: Optional StereoFramingAnalyzer (dependency injection; then nothing is built or closed here).
+        :param begun: True when `begin_face_scan()` already validated the request and set RUNNING.
+        :return: Dict with status, optimal_z_mm, best_score, face_detected, warning, photos and r2_uploaded.
+        :raises ScannerError: the face scan failed (the state is then ERROR).
+        """
+        if not begun:
+            self.begin_face_scan(strategy=strategy, search_range_mm=search_range_mm, step_mm=step_mm,
+                                 manual_z=manual_z)
+
+        upload_r2 = self._face_upload_r2
         scan_ok = False
         images_dir = str(self.images_dir)
         paths = []
-        target_z = 0.0
+        target_z = float(self.z_position_mm or 0.0)
         best_score = None
+        face_detected: Optional[bool] = None
+        warning: Optional[str] = None
 
         self._tls.automated = True
         try:
             with self.motion_guard():
-                # Chamber illumination setup
-                self.lights.unlock_brightness()
-                self.lights.set_brightness(illumination_brightness)
-                self.lights.lock_brightness()
-                self.lights.on()
-
                 # Turntable is idle during face scanning
                 self.turntable_motor.disable()
-
-                # Initialize cameras if not already available
                 if self.dual_cameras is None:
-                    mode = (self.camera_mode or "rpi_sync").lower()
-                    if mode in ("rpi_sync", "sync", "dual_camera_rpi_sync"):
-                        CameraClass = DualCameraRPISync
-                    elif mode in ("xvs", "dual_camera_xvs"):
-                        CameraClass = DualCameraXVS
-                    elif mode in ("staggered", "dual_camera", "legacy"):
-                        CameraClass = DualCamera
-                    else:
-                        CameraClass = DualCameraRPISync
-                    self.dual_cameras = CameraClass(
-                        stream_size=(960, 720),
-                        preview_size=(960, 720),
-                        size=(4056, 3040),
-                        rotation1=0,
-                        rotation2=0,
-                    )
-                    self.dual_cameras.prepare_scan()
-                else:
-                    if hasattr(self.dual_cameras, "_framing_active"):
-                        self.dual_cameras._framing_active = True
+                    raise ScannerError("The cameras are not running; call POST /scanner/face/prepare again.")
 
-                if self._cancel_applies():
-                    return {"status": "cancelled", "message": "Face scan cancelled before start"}
-
-                # Clean photo directory & manifest
+                # Clean photo directory & manifest (the bucket was cleaned by the face prepare)
                 try:
                     fc.create_clean_dir(images_dir)
                 except Exception as e:
                     raise ScannerError(f"Could not clean local photo directory {images_dir}: {e}")
-
                 self._begin_manifest(images_dir)
                 if upload_r2:
-                    try:
-                        r2.delete_all_files_from_bucket()
-                    except Exception as e:
-                        log.warning("[Scanner] Bucket cleanup warning: %s", e)
                     self.start_upload_worker()
 
-                # 1. Homing
-                current_z = 0.0
-                if home:
-                    log.info("[Scanner Face] Homing Z axis to bottom endstop...")
-                    self.home_z_axis()
-                    current_z = 0.0
-                    if self._cancel_applies():
-                        raise ScannerError("Face scan cancelled during homing.")
-
-                # 2. Elevation & Auto-framing
+                best_eval = None
                 if manual_z is not None:
-                    target_z = float(manual_z)
-                    climb_dist = target_z - current_z
-                    if climb_dist > 0:
-                        self.z_axis_motor.enable()
-                        self.move_z_up_distance(climb_dist)
-                        current_z = target_z
-                else:
-                    # Climb directly to initial search baseline
-                    climb_to_start = start_z_mm - current_z
-                    if climb_to_start > 0:
-                        self.z_axis_motor.enable()
-                        self.move_z_up_distance(climb_to_start)
-                        current_z = start_z_mm
+                    self._face_go_to(float(manual_z))
+                elif strategy != "none":
+                    if hasattr(self.dual_cameras, "_framing_active"):
+                        self.dual_cameras._framing_active = True
+                    if analyzer is not None:
+                        _, best_score, best_eval, summary = self._search_face_height(
+                            strategy, search_range_mm, step_mm, analyzer)
+                    else:
+                        from face_scan.core.framing_analyzer import StereoFramingAnalyzer
+                        from face_scan.face_scanner import FaceScanner
+                        with FaceScanner(num_faces=1) as detector:
+                            _, best_score, best_eval, summary = self._search_face_height(
+                                strategy, search_range_mm, step_mm, StereoFramingAnalyzer(detector))
+                    face_detected = summary["face_detected"]
+                    if not face_detected:
+                        warning = ("No face was found in the search range; the photo was taken at the start height. "
+                                   "Check the subject's height against the prepared start height and search range.")
+                    elif not summary["both_cameras"]:
+                        warning = "The face was seen by one camera only; the framing of the other one is not checked."
+                    if warning:
+                        log.warning("[Scanner Face] %s", warning)
+                target_z = float(self.z_position_mm)
 
-                    if analyzer is None:
-                        try:
-                            from face_scan.core.framing_analyzer import StereoFramingAnalyzer
-                            from face_scan.face_scanner import FaceScanner, MEDIAPIPE_AVAILABLE
-                        except (ImportError, ValueError):
-                            StereoFramingAnalyzer = None
-                            FaceScanner = None
-                            MEDIAPIPE_AVAILABLE = False
+                if self._cancel_applies():
+                    raise ScannerError("Face scan cancelled before the camera lock.")
 
-                        if not MEDIAPIPE_AVAILABLE or StereoFramingAnalyzer is None:
-                            raise ScannerError(
-                                "MediaPipe is required for face auto-framing but is not available. "
-                                "Please specify manual_z or install mediapipe."
-                            )
-                        analyzer = StereoFramingAnalyzer(FaceScanner(num_faces=1))
+                # Cameras locked on the face, at this height (FACE-7b)
+                self._set_phase(ScanPhase.SCANNING, f"Face scan: focusing and locking the cameras at Z={target_z:.1f} mm")
+                lock_kwargs = dict(self._face_camera_settings)
+                copy_colour_gains = bool(lock_kwargs.pop("copy_colour_gains", False))
+                roi = self._face_af_roi(best_eval)
+                if roi is not None:
+                    lock_kwargs["autofocus_roi"] = roi
+                self._lock_cameras(lock_kwargs, copy_colour_gains, f"face at Z={target_z:g} mm")
 
-                    max_z = start_z_mm + search_range_mm
-                    best_score = -1.0
-                    best_z = current_z
-                    passed_apex_count = 0
-                    direct_stop_hit = False
-
-                    log.info("[Scanner Face] Starting auto-framing sweep: Z=%.1f mm to %.1f mm (step=%.1f mm, strategy=%s)",
-                             current_z, max_z, step_mm, strategy)
-
-                    while current_z <= max_z and not self.up_endstop.is_active:
-                        if self._cancel_applies():
-                            break
-
-                        # Retrieve in-memory preview frames
-                        frame_left, frame_right = self.dual_cameras.get_latest_lores_frames(fresh=True)
-                        eval_res = analyzer.evaluate_stereo_pair(frame_left, frame_right)
-                        score = eval_res.get("total_score", 0.0)
-                        avg_nose_y = eval_res.get("avg_nose_y")
-
-                        log.info(
-                            "[Scanner Face | Z=%5.1f mm] Score: %4.2f (L: %4.2f, R: %4.2f) | Nose Y: %s",
-                            current_z,
-                            score,
-                            eval_res.get("left", {}).get("score", 0.0),
-                            eval_res.get("right", {}).get("score", 0.0),
-                            f"{avg_nose_y:.3f}" if avg_nose_y is not None else "N/A"
-                        )
-
-                        if strategy == "direct_stop" and eval_res.get("both_detected") and avg_nose_y is not None:
-                            if 0.45 <= avg_nose_y <= 0.55:
-                                log.info("[Scanner Face] Direct stop centered at Z=%.1f mm (Nose Y=%.3f)", current_z, avg_nose_y)
-                                best_score = score
-                                best_z = current_z
-                                direct_stop_hit = True
-                                break
-
-                        if score > best_score:
-                            best_score = score
-                            best_z = current_z
-                            passed_apex_count = 0
-                        else:
-                            if best_score > 1.2:
-                                passed_apex_count += 1
-                                if passed_apex_count >= 5:
-                                    log.info("[Scanner Face] Early exit: passed apex (Best: %.2f at %.1f mm)", best_score, best_z)
-                                    break
-
-                        if current_z + step_mm > max_z or self.up_endstop.is_active:
-                            break
-
-                        try:
-                            self.z_axis_motor.enable()
-                            moved = self.move_z_up_distance(step_mm)
-                            if not moved:
-                                break
-                            current_z += step_mm
-                        except TopEndstopTriggered:
-                            log.info("[Scanner Face] Top endstop switch triggered at Z=%.1f mm", current_z)
-                            break
-
-                    # Anti-backlash positioning to best_z
-                    if not direct_stop_hit and current_z > best_z:
-                        overshoot_mm = 3.0
-                        descent = (current_z - best_z) + overshoot_mm
-                        log.info("[Scanner Face] Backlash compensation: descending %.2f mm then climbing +%.2f mm to Z=%.1f mm",
-                                 descent, overshoot_mm, best_z)
-                        self.move_z_down_distance(descent)
-                        time.sleep(0.05)
-                        self.move_z_up_distance(overshoot_mm)
-                        current_z = best_z
-                    elif current_z < best_z:
-                        climb = best_z - current_z
-                        self.move_z_up_distance(climb)
-                        current_z = best_z
-
-                    target_z = best_z
-
-                # 3. Stabilization pause
+                # Stabilization pause (a cancel ends it at once)
                 if settle_s > 0:
-                    time.sleep(settle_s)
-
+                    self._cancel_event.wait(settle_s)
                 if self._cancel_applies():
                     raise ScannerError("Face scan cancelled before photo capture.")
 
-                # 4. Synchronized Still Capture
+                # Synchronized Still Capture
+                self._set_phase(ScanPhase.SCANNING, f"Face scan: capturing at Z={target_z:.1f} mm",)
                 stem = f"f_{int(round(target_z))}"
                 log.info("[Scanner Face] Capturing stereo pair at Z=%.1f mm with prefix %s...", target_z, stem)
                 paths = self.dual_cameras.capture_photo(
@@ -2124,7 +2420,12 @@ class Scanner:
             if self._cancel_event.is_set():
                 log.info("[Scanner Face] Scan stopped by cancellation (%s).", e)
             else:
-                message = f"Error during face scan: {str(e)}"
+                if isinstance(e, TopEndstopTriggered):
+                    message = "Error during face scan: the top endstop was reached; the requested height is out of travel."
+                elif isinstance(e, BottomEndstopTriggered):
+                    message = "Error during face scan: the bottom endstop was reached while moving down."
+                else:
+                    message = f"Error during face scan: {str(e)}"
                 with self._lock:
                     if self.state == ScannerState.RUNNING:
                         self.state = ScannerState.ERROR
@@ -2132,6 +2433,8 @@ class Scanner:
                 raise ScannerError(message)
         finally:
             self._tls.automated = False
+            if hasattr(self.dual_cameras, "_framing_active"):
+                self.dual_cameras._framing_active = False
             completed = scan_ok and not self._cancel_event.is_set()
             if completed:
                 self._teardown_hardware()
@@ -2140,36 +2443,36 @@ class Scanner:
                 if upload_r2:
                     self.stop_upload_worker(wait_for_completion=False)
 
+        def outcome(status: str, message: str, uploaded: bool) -> dict:
+            return {
+                "status": status, "message": message,
+                "optimal_z_mm": float(target_z),
+                "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
+                "face_detected": face_detected, "warning": warning,
+                "photos": list(paths), "r2_uploaded": uploaded,
+            }
+
         if self._cancel_event.is_set() or not scan_ok:
             self._set_phase(ScanPhase.CANCELLED)
-            return {
-                "status": "cancelled",
-                "message": "Face scan was cancelled",
-                "optimal_z_mm": float(target_z) if target_z > 0 else None,
-                "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
-                "photos": paths,
-                "r2_uploaded": False
-            }
+            return outcome("cancelled", "Face scan was cancelled", False)
 
         if upload_r2:
             try:
                 self._drain_and_verify()
             finally:
                 self.stop_upload_worker(wait_for_completion=False)
+            if self._cancel_event.is_set():
+                self._set_phase(ScanPhase.CANCELLED)
+                return outcome("cancelled", "Face scan was cancelled during the upload", False)
 
-        self._set_phase(ScanPhase.DONE)
+        result = outcome("success", "Face capture completed successfully", bool(upload_r2))
+        self.face_result = {k: result[k] for k in
+                            ("optimal_z_mm", "best_score", "face_detected", "warning", "photos", "r2_uploaded")}
+        self._set_phase(ScanPhase.DONE, warning)
         with self._lock:
             if self.state == ScannerState.RUNNING:
                 self.state = finish_state
-
-        return {
-            "status": "success",
-            "message": "Face capture completed successfully",
-            "optimal_z_mm": float(target_z),
-            "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
-            "photos": paths,
-            "r2_uploaded": bool(upload_r2)
-        }
+        return result
 
     def _drain_and_verify(self) -> None:
         """
@@ -2273,6 +2576,7 @@ class Scanner:
             self._stopping = True
             self.state = ScannerState.CANCELLED
             self.phase = ScanPhase.CANCELLED
+            self.z_position_mm = None   # a move may have been cut half-way
             with self._z_stop_lock:
                 self._cancel_event.set()
 
@@ -2298,6 +2602,8 @@ class Scanner:
             # 5. Final STOP: catches a move a straggler thread managed to start while the above was running
             for name, motor in motors:
                 self._try_step(f"{name} final stop", motor.stop)
+            # ... and the lights once more: in CANCELLED every peripheral is off (SCAN-11)
+            self._try_step("lights final off", self.lights.off)
         finally:
             with self._lock:
                 self._stopping_depth -= 1

@@ -25,127 +25,51 @@ sudo usermod -aG netdev,bluetooth $USER
 
 | Module | Core Responsibility | Underlying System Interface |
 |---|---|---|
-| [`wifi.py`](#1-wifi-systemwifi) | Wi-Fi scanning, radio toggling, WPA/WPA2/802.1X connection | `nmcli` (NetworkManager CLI) |
-| [`bluetooth.py`](#2-bluetooth-systembluetooth) | Device discovery, pairing, trust, and OBEX file transfer | `bluetoothctl` (BlueZ) & `bt-obex` |
-| [`ethernet.py`](#3-ethernet-systemethernet) | Physical carrier detection & Enterprise 802.1X profile setup | Linux `/sys/class/net/` & `nmcli` |
-| [`file_control.py`](#4-file-control-systemfile_control) | Directory sanitization with root-deletion guards | `pathlib` & `shutil` |
-| [`exception.py`](#5-exceptions-systemexception) | Centralized subprocess error inspection & exception hierarchy | `subprocess.CompletedProcess` |
+| `nm.py` | One runner for every network command: deadline, C locale, missing tool -> 503, timeout -> 504, `nmcli -t` parser that respects `\:` | `subprocess`, `nmcli` |
+| `wifi.py` | Radio, scan (`--rescan no` by default), saved profiles, connect (saved profile without password, failed new profile removed, old password kept on a refused new one) | `nmcli` |
+| `bluetooth.py` | Discovery (only named devices seen now), pairing, connection, OBEX push | `bluetoothctl`, `bt-obex` |
+| `ethernet.py` | Device list, built-in port, carrier, state, IPv4, 802.1X profile (replaced only once the new one connected) | `/sys/class/net/`, `nmcli` |
+| `status.py` | `get_network_status()`: every connection in one read-only call (`GET /system/status`) | the modules above |
+| `network_state.py` | Remembers the connections made (`state/network.json`, no passwords) and makes them again at startup (`restore()`, background thread) | the modules above |
+| `file_control.py` | Directory sanitization with root-deletion guards | `pathlib` & `shutil` |
+| `exception.py` | `SystemConnectionError` (with an HTTP `status_code`) and `check_and_raise_error` | `subprocess.CompletedProcess` |
+
+The HTTP side (routes, the 409 guard during a scan, error codes) is documented in `../router/docs/SYSTEM_API.md`.
 
 ---
 
-## 1. Wi-Fi (`system.wifi`)
+## 1. Runner (`system.nm`)
 
-Controls the wireless interface via NetworkManager CLI (`nmcli`).
+* `run(cmd, timeout)`: `subprocess.run` with `LC_ALL=C`; `CommandTimeoutError` (504) on a timeout (the child is killed), `ToolUnavailableError` (503) when the program is missing.
+* `nmcli(args, timeout=15, error_type=..., check=None)`: with `check`, a non-zero exit raises `error_type(check + ": " + message)`; "NetworkManager is not running" becomes `ToolUnavailableError`.
+* `split_terse(line)`: splits `nmcli -t` output on unescaped `:` (`My\:Net:80` -> `["My:Net", "80"]`).
+* Deadlines: `NMCLI_TIMEOUT_S` 15, `WIFI_SCAN_TIMEOUT_S` 25, `WIFI_CONNECT_WAIT_S` 40 (`nmcli --wait`), `WIFI_CONNECT_TIMEOUT_S` 50.
 
-### `get_status() -> bool`
-Queries whether the Wi-Fi radio is enabled.
-* **Underlying Command**: `nmcli radio wifi`
-* **Returns**: `True` if enabled, `False` otherwise.
-* **Raises**: `WIFIConnectionError` on command failure.
+## 2. Wi-Fi (`system.wifi`)
 
-### `set_wifi_power(state: Literal["on", "off"]) -> None`
-Enables or disables the physical Wi-Fi radio.
-* **Underlying Command**: `nmcli radio wifi on|off`
-* **Raises**: `WIFIConnectionError` if NetworkManager rejects state change.
+* `get_status()`, `set_wifi_power(state)`.
+* `scan_wifi(rescan=False) -> dict[ssid, WIFICharacteristics]`: one entry per SSID (strongest), hidden SSIDs left out, `saved` set from the profiles. `rescan=True` forces a radio scan.
+* `list_saved_networks() -> list[SavedNetwork]`, `find_saved_network(ssid)`, `delete_saved_network(name)` (404 when unknown).
+* `connect_wifi(details) -> profile name`: see the rules in `SYSTEM_API.md`. `WIFIAuthenticationError` (401) when the password is refused.
 
-### `scan_wifi() -> dict[str, WIFICharacteristics]`
-Performs an active scan of all nearby 2.4 GHz and 5 GHz networks.
-* **Underlying Command**: `nmcli -t -f IN-USE,SSID,SIGNAL,SECURITY dev wifi`
-* **Behavior**: Parses colon-delimited tabular output, filters out hidden SSIDs, and deduplicates networks by SSID.
-* **Returns**: Dictionary mapping `SSID -> WIFICharacteristics(in_use, ssid, signal, security)`.
+## 3. Bluetooth (`system.bluetooth`)
 
-### `connect_wifi(details: NetworkCredentials) -> None`
-Associates with a wireless network.
-* **Standard WPA-PSK / Open**:
-  * Runs: `nmcli dev wifi connect <ssid> password <password>`
-* **Enterprise 802.1X (PEAP/MSCHAPv2)**:
-  * When `details.identity` is provided:
-  * Deletes any existing conflict connection profile: `nmcli connection delete enterprise-<ssid>`
-  * Creates a persistent 802.1X connection profile:
-    ```bash
-    nmcli connection add type wifi con-name enterprise-<ssid> ssid <ssid> \
-        wifi-sec.key-mgmt wpa-eap 802-1x.eap peap 802-1x.phase2-auth mschapv2 \
-        802-1x.identity <identity> 802-1x.password <password>
-    ```
-  * Activates the connection: `nmcli connection up enterprise-<ssid>`
-* **Raises**: `WIFIConnectionError` if connection fails or credentials are rejected.
+* `run_bluetoothctl(args, timeout)`: deadline (`BLUETOOTHCTL_TIMEOUT_S` 10, pair 40, connect 30); timeout -> `BluetoothConnectionError` with `status_code` 504; missing tool -> 503.
+* `scan_devices(duration=8, include_unnamed=False, include_out_of_range=False)`: discovery of `duration` s (max 20) whose output (`[NEW]` / `[CHG] Device ...`) tells which devices are in range; a device with an RSSI or connected also counts. Unnamed devices (`is_unnamed`: no name or the address as name) are left out. The `info` calls share one `INFO_BUDGET_S` (10 s). RSSI parsed from `-60` and `0xffffffc4 (-60)`.
+* `connected_devices()`: `bluetoothctl devices Connected`.
+* `is_paired(mac)`, `pair_device(mac)` (pair + trust), `connect_device(mac)`, `send_file(mac, path)` (300 s deadline).
 
----
+## 3b. Ethernet (`system.ethernet`)
 
-## 2. Bluetooth (`system.bluetooth`)
+* `list_devices()`: every NetworkManager device `{device, type, state, connection}` (exit code checked).
+* `get_ethernet_interface()`: `eth*`/`en*` first, any other Ethernet device otherwise, `None` when there is none.
+* `get_status() -> {interface, cable_plugged, state, connection, ip}`; `device_ipv4(device)`.
+* `connect_secure_ethernet(details) -> "enterprise-wired"`, `activate_profile(name)`.
 
-Interacts with the Linux BlueZ stack via `bluetoothctl` and the `bt-obex` daemon.
+## 3c. Status and restore (`system.status`, `system.network_state`)
 
-Every `bluetoothctl` call runs through `run_bluetoothctl()` with a deadline, so a hung adapter or a device that never answers cannot block a request thread: 10 s for `power`, `show`, `devices`, `info` and `trust`, 40 s for `pair`, 30 s for `connect`, and the discovery duration plus 10 s for `scan on`. When the deadline passes the process is killed and `BluetoothConnectionError` is raised (a discovery that overruns, or an `info` that hangs, only shortens the result: the devices found so far are still returned). `bt-obex` (`send_file`) has no timeout yet.
-
-### `power_on() -> bool` / `power_off() -> bool`
-Turns the Bluetooth controller on or off.
-* **Underlying Command**: `bluetoothctl power on|off`
-* **Returns**: `True` if state transition succeeded or was already in target state.
-
-### `get_power_status() -> bool`
-Queries the adapter's power flag.
-* **Underlying Command**: `bluetoothctl show`
-* **Returns**: `True` if `"Powered: yes"` is found in output.
-
-### `scan_devices(duration: int = 8, allowed_icons: Optional[list[str]] = None) -> list[BluetoothDevice]`
-Runs a timed discovery scan for nearby devices.
-* **Sequence**:
-  1. Starts discovery: `bluetoothctl --timeout <duration> scan on`
-  2. Lists cached devices: `bluetoothctl devices`
-  3. Queries device metadata per MAC: `bluetoothctl info <mac>`
-  4. Parses device icon, pairing status, connection status, RSSI signal (dBm), and Class of Device (CoD).
-* **Returns**: List of `BluetoothDevice` Pydantic models.
-
-### `pair_device(mac_address: str) -> None`
-Pairs with and marks the device as trusted.
-* **Underlying Commands**:
-  * `bluetoothctl pair <mac_address>`
-  * `bluetoothctl trust <mac_address>`
-
-### `connect_device(mac_address: str) -> None`
-Establishes a baseband connection with a paired device.
-* **Underlying Command**: `bluetoothctl connect <mac_address>`
-
-### `send_file(mac_address: str, file_path: str | Path) -> None`
-Pushes a file directly to the remote device over the Bluetooth OBEX Object Push Profile (OPP).
-* **Underlying Command**: `bt-obex -p <mac_address> <file_path>`
-* **Use Case**: Allows exporting generated `.zip` 3D scans directly to a smartphone or tablet without network access.
-* **Raises**: `BluetoothConnectionError` if the device rejects the transfer or is unreachable.
-
----
-
-## 3. Ethernet (`system.ethernet`)
-
-Manages physical wired RJ45 connectivity.
-
-### `get_ethernet_interface() -> str`
-Auto-detects the active physical Ethernet interface name using `nmcli -t -f DEVICE,TYPE dev`.
-* **Fallback**: Returns `"eth0"` if no interface is explicitly discovered.
-
-### `get_status() -> dict`
-Performs a dual-layer status check:
-1. **Physical Link Layer (`sysfs`)**: Reads `/sys/class/net/<interface>/carrier` (`1` = cable inserted, `0` = unplugged).
-2. **Network Layer (`nmcli`)**: Checks connection state (`connected`, `connecting`, `disconnected`) and active profile name.
-* **Returns**:
-  ```python
-  {
-      "interface": "eth0",
-      "cable_plugged": True,
-      "state": "connected",
-      "connection": "Wired connection 1"
-  }
-  ```
-
-### `connect_secure_ethernet(details: NetworkCredentials) -> None`
-Configures and activates an 802.1X authenticated Ethernet connection for enterprise environments.
-* **Underlying Command**:
-  ```bash
-  nmcli connection add type ethernet con-name enterprise-wired ifname <iface> \
-      802-1x.eap peap 802-1x.phase2-auth mschapv2 \
-      802-1x.identity <identity> 802-1x.password <password>
-  nmcli connection up enterprise-wired
-  ```
+* `get_network_status()`: `{ethernet, wifi, bluetooth, restore}`; a part that fails is `{"error": ...}`.
+* `network_state.remember_*()` are called by the routes after a success; `restore()` makes the saved connections again (skips those already up, records each outcome in `last_restore`); `start_restore()` runs it in a daemon thread at startup (from `main_prod.lifespan`), not in development mode and not when nothing was saved.
 
 ---
 
@@ -167,10 +91,13 @@ All driver-level exceptions inherit from `SystemConnectionError`:
 
 ```
 Exception
- └── SystemConnectionError
+ └── SystemConnectionError (status_code 400)
       ├── WIFIConnectionError
+      │    └── WIFIAuthenticationError (401)
       ├── BluetoothConnectionError
-      └── EthernetConnectionError
+      ├── EthernetConnectionError
+      ├── CommandTimeoutError (504)
+      └── ToolUnavailableError (503)
 ```
 
 ### `check_and_raise_error(res: CompletedProcess, msg: str, err_type: type[Exception]) -> None`
