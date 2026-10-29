@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from system import status as system_status
-from . import bluetooth, wifi, ethernet
+from . import bluetooth, wifi, ethernet, reboot
 from .guard import network_change_allowed  # noqa: F401  (re-exported: the one rule for every route that changes the network)
 
 router = APIRouter(
@@ -18,7 +18,7 @@ def get_network_status():
     return system_status.get_network_status()
 
 
-routers = [bluetooth.router, wifi.router, ethernet.router]
+routers = [bluetooth.router, wifi.router, ethernet.router, reboot.router]
 
 for imported_router in routers:
     router.include_router(imported_router)
