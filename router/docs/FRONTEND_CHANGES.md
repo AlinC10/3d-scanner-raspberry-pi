@@ -10,10 +10,23 @@ The server listens on `127.0.0.1:8000` only (the page runs on the Pi); there is 
 
 ## 0. Changes of 2026-10-30
 
+### To do in the front-end (2026-10-30)
+
+1. **Object scan (`POST /scanner/start`)**: stop sending `cloud.resolution_mp`, `mode`, `depthmap_downscale`, `max_input_points` (now `422`). Send `job_id: null` or nothing (any other text is `422`). Add an optional "name" field -> `cloud.title`. The scan now always continues on RunPod: show `processing` with `phase_message` (can take up to an hour), then open `result_id` in the library.
+2. **Face scan**: optional "name" field -> `title` on `POST /scanner/face/capture`. After the photo the state is `processing` (phase `reconstructing_face`, ~10-20 s, show `phase_message`); `completed` -> open `result_id`; `error` -> show `error` (the reconstruction failed).
+3. **Status screen**: read the new `job_id`, `result_id`, `face_result.metrics` (face size, IPD).
+4. **Library, edit**: an edit form (title, description, length / width / height, volume) -> `PATCH /library/objects/{id}` with only the changed fields.
+5. **Library, USB export**: an "Export to USB" button -> `POST /library/objects/{id}/export/usb`; `503` = "Insert a USB stick"; then poll `GET /library/export/usb/status` every second (progress bar from `bytes_done / bytes_total`) and say "You can remove the stick" only when `safe_to_remove` is true.
+6. **Library, Bluetooth export**: "Send to phone" button -> `POST /library/objects/{id}/export/bluetooth`; `503` = "Connect a Bluetooth device first"; poll `GET /library/export/bluetooth/status` (spinner while `sending`, then `done` / `error` / `cancelled`); a "Cancel" button -> `POST /library/export/bluetooth/cancel`.
+7. **Bluetooth panel**: a "Disconnect" button per connected device -> `POST /system/bluetooth/disconnect` `{"mac_address": "..."}` (it also cancels a transfer to that device).
+8. **Removed:** `POST /system/bluetooth/send-file` (it sent any path of the Pi). Use the Bluetooth export of point 6.
+
+
 * **`POST /scanner/start`**: `cloud` is now `{launch_runpod, resolution_level (0..3, default 1), title}`. The Meshroom fields `resolution_mp`, `mode`, `depthmap_downscale`, `max_input_points` were **removed** (sending them = `422`). `job_id` is optional (`null` default; if sent it must be `YYYYMMDD-HHMMSS-xxxxxx`). `launch_runpod: true` now starts Turntable Studio on RunPod with no confirmation; the model lands in `/library`.
 * **`GET /scanner/status`**: new `job_id`, `result_id` (library id of the model just saved), new phase `reconstructing_face`; `face_result` has `result_id`, `metrics`, `reconstruction_error`.
 * **`POST /scanner/prepare`**: optional `z_delay` (default `0.0010`). **`POST /scanner/face/prepare`**: optional `z_delay` (default `0.005`, slower than before). **`POST /scanner/face/capture`**: optional `z_delay` (`null` = the prepare's) and `reconstruct` (default `true`: 3D face model on the Pi, ~10-20 s in `processing` / phase `reconstructing_face`; a failure ends in `error`).
 * **Defaults changed:** `cloud.launch_runpod` is now `true` (an object scan always goes to RunPod), `face/prepare.upload_r2` is now `false` (a face never leaves the Pi). The pod also gets the turntable `angle` (`step_deg`).
+* **Library:** `PATCH /library/objects/{id}` edits `title`, `description`, `dimensions_mm`, `volume_cm3`; USB export: `GET /library/usb`, `POST /library/objects/{id}/export/usb` (`202`, `503` without a stick), `GET /library/export/usb/status` (`safe_to_remove`). Untitled objects (no `cloud.title`, no `title` on the face capture, new) are named after their id. See `LIBRARY_API.md`.
 * New `POST /test/cloud/runpod-dry-run`: checks the cloud configuration and shows the pod request, without creating a pod.
 
 ## 1. Breaking changes (must be adapted)
@@ -214,7 +227,7 @@ Planned (not yet available): export of selected models as a QR download link or 
 
 ### 5.1 Rule during a scan
 
-While a scan is `preparing` / `running` / `processing` / `downloading` (or still uploading), these answer **`409`**: `wifi/scan`, `wifi/power`, `wifi/connect`, `DELETE wifi/saved/...`, `bluetooth/scan`, `bluetooth/power`, `bluetooth/connect`, `bluetooth/send-file`, `ethernet/connect`. Disable those controls while `GET /scanner/status` says a scan runs. Reading is always allowed.
+While a scan is `preparing` / `running` / `processing` / `downloading` (or still uploading), these answer **`409`**: `wifi/scan`, `wifi/power`, `wifi/connect`, `DELETE wifi/saved/...`, `bluetooth/scan`, `bluetooth/power`, `bluetooth/connect`, `ethernet/connect`. Disable those controls while `GET /scanner/status` says a scan runs. Reading is always allowed.
 
 ### 5.2 `GET /system/status` (new): poll it every 5-15 s
 

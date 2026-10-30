@@ -53,7 +53,7 @@ Complete image capture and optical parameter block.
 Turntable Studio on RunPod after the scan (`extra="forbid"`, `cloud/job.py`).
 * `launch_runpod`: `bool` (default: `true`; object scans are always reconstructed on RunPod) — `false`: the scan stops (`completed`) once the photos are verified in R2. `true`: one pod is started automatically (no confirmation), its result extracted into `results/<job_id>/`, the R2 job folder deleted; `/start` is refused with `400` when the RunPod / Cloudflare / image variables are missing.
 * `resolution_level`: `int` (default: `1`) — `0..3`, Turntable Studio dense level (each level halves both photo sides); also sizes the pod RAM.
-* `title`: `str | null` (default: `null`) — Model name in `object.json` (max 120).
+* `title`: `str | null` (default: `null` = the job id, the folder name) — Model name in `object.json` (max 120).
 * Removed 2026-10-30 (Meshroom): `resolution_mp`, `mode`, `depthmap_downscale`, `max_input_points` (now `422`).
 * `StartRequest.job_id`: `str | null` (default `null` = new id) — pattern `YYYYMMDD-HHMMSS-xxxxxx` (the `/library` id).
 
@@ -95,6 +95,7 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
 * `manual_z`: `float | null` (default `null`, `200 <= v <= 475`): skips the search.
 * `settle_s`: `float` (default `0.15`, `0.05 <= v <= 2`).
 * `z_delay`: `float | null` (default `null` = the prepare's value).
+* `title`: `str | null` (default `null` = the job id) — name of the face model.
 * `reconstruct`: `bool` (default `true`) — local 3D face model on the Pi (`hardware/face_reconstruction.py`, FACE-20); state `processing` while it runs, `error` if it fails.
 * Every distance must be a whole number of Z motor steps (multiples of `0.01` mm): `422` before anything moves.
 
@@ -196,7 +197,6 @@ Model for discovered and paired Bluetooth targets.
 * `rssi`: `Optional[int]` — Signal strength in dBm.
 * `device_class`: `Optional[int]` — 24-bit Bluetooth Class of Device (CoD).
 
-### `SendFileRequest` (`schemas/system/bluetooth.py`)
-Payload for `POST /system/bluetooth/send-file`.
-* `device`: `BluetoothDevice` — Destination Bluetooth target.
-* `file_path`: `str | Path` — Local path to the file/archive being pushed via OBEX.
+#### Library (`schemas/library.py`)
+* `UpdateObjectRequest` (`PATCH /library/objects/{id}`, `extra="forbid"`): `title` (1..120), `description` (<= 2000), `dimensions_mm` (`ObjectDimensions`: `length` / `width` / `height` > 0), `volume_cm3` (> 0); all optional.
+* `UsbExportRequest`: `device` (`/dev/...`, optional). `UsbDrive`, `UsbExportStatus` (`state`, `bytes_done`, `bytes_total`, `safe_to_remove`, ...).

@@ -77,7 +77,7 @@ class TestFaceScanSchemas(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(self.r["capture_defaults"], {
             "strategy": "sweep_best_score", "search_range_mm": 150.0, "step_mm": 8.0, "manual_z": None,
-            "settle_s": 0.150, "z_delay": None, "reconstruct": True,
+            "settle_s": 0.150, "z_delay": None, "title": None, "reconstruct": True,
         })
         self.assertEqual(self.r["prepare_defaults"], {
             "enable_stream": True, "illumination_brightness": 0.5, "start_z_mm": 180.0, "upload_r2": False,

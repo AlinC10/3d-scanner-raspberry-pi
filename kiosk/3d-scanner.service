@@ -1,0 +1,23 @@
+# FastAPI server of the scanner, started early at boot, before (and independently of) any graphical session.
+# Install: see kiosk/README.md. Edit User / paths if the project is not in /home/ducks/3d-scanner-raspberry-pi.
+[Unit]
+Description=3D scanner server (FastAPI, 127.0.0.1:8000)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ducks
+Group=ducks
+# gpio / i2c / serial / camera access
+SupplementaryGroups=gpio i2c dialout video
+WorkingDirectory=/home/ducks/3d-scanner-raspberry-pi
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ducks/3d-scanner-raspberry-pi/.venv/bin/python main_prod.py
+Restart=on-failure
+RestartSec=3
+# The scan hardware must be released before a new start: give the server time to clean up
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

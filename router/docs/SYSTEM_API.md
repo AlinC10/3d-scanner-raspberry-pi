@@ -30,7 +30,7 @@ FastAPI App (/main_prod.py)
 | **Bluetooth** | `POST` (or `GET`) | `/system/bluetooth/power/{on\|off}` | yes | Adapter on or off |
 | **Bluetooth** | `GET` | `/system/bluetooth/scan?duration=8` | yes | Named devices in range now |
 | **Bluetooth** | `POST` | `/system/bluetooth/connect` | yes | Pair (if needed) and connect |
-| **Bluetooth** | `POST` | `/system/bluetooth/send-file` | yes | OBEX file push |
+| **Bluetooth** | `POST` | `/system/bluetooth/disconnect` | no | Disconnect a device (cancels a Bluetooth export to it) |
 | **Ethernet** | `GET` | `/system/ethernet/status` | no | Cable, state, profile, IP |
 | **Ethernet** | `POST` | `/system/ethernet/connect` | yes | 802.1X wired network |
 
@@ -65,7 +65,6 @@ The commands run in the C locale, so the success checks work whatever the langua
 | `wifi/connect` | 50 s (NetworkManager may take 40 s) |
 | `bluetooth/scan` | `duration` + 10 s for the discovery, + 10 s for all the device details |
 | `bluetooth/connect` | pair 40 s, connect 30 s |
-| `bluetooth/send-file` | 300 s |
 
 ### Connections made again at startup
 Every successful connection (`wifi/connect`, `ethernet/connect`, `bluetooth/connect`) and every power switch is remembered in `state/network.json` (only *which* profiles and devices; the passwords stay in NetworkManager, the pairings in BlueZ). When the server starts, a background task makes them again: a connection already up is left alone, a failure is only logged, and the server works as before. The outcome is in `GET /system/status` → `restore`. Forgetting a network removes it from the list. Nothing is restored in development mode (`MOCK_HARDWARE=1`).
@@ -183,8 +182,11 @@ Runs a discovery and lists the devices **seen during it** that have a **real nam
 ### `POST /system/bluetooth/connect`
 Body: a `BluetoothDevice` (only `mac_address` is needed). Pairs only when the device is not paired yet, then connects; the device is reconnected when the server starts. Answer: the device.
 
-### `POST /system/bluetooth/send-file`
-Body: `{"device": {"mac_address": "..."}, "file_path": "..."}`. `204` when sent. (Known issue SYS-2: any path on the Pi is accepted; see `PROBLEME_RAMASE.md`.)
+### `POST /system/bluetooth/disconnect`
+Body: `{"mac_address": "AA:BB:CC:DD:EE:FF"}`. Disconnects the device and stops reconnecting it at server start; a
+Bluetooth export to that device is cancelled first. Answer `{"status": "disconnected", "mac_address": "...",
+"transfer_cancelled": false}`. Allowed during a scan. To send a 3D object use `POST /library/objects/{id}/export/bluetooth`
+(`LIBRARY_API.md`); the old `send-file` (any path on the Pi) was removed on 2026-10-30.
 
 ---
 
@@ -208,4 +210,4 @@ Body: `{"device": {"mac_address": "..."}, "file_path": "..."}`. `204` when sent.
 * `SavedNetwork` (`../../schemas/system/wifi.py`): `name`, `ssid`, `autoconnect`.
 * `BluetoothDevice` (`../../schemas/system/bluetooth.py`): `mac_address`, `name`, `icon`, `paired`, `connected`, `rssi`, `device_class`.
 
-Open problems of this layer (XSS through SSID names in the front-end, passwords in the process arguments, `send-file` paths, 802.1X certificate validation) are listed in `PROBLEME_RAMASE.md` (levels 4 and 5).
+Open problems of this layer (XSS through SSID names in the front-end, passwords in the process arguments, 802.1X certificate validation) are listed in `PROBLEME_RAMASE.md` (levels 4 and 5).

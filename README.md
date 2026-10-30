@@ -16,6 +16,7 @@ The scanner is meant to be used **from the Raspberry Pi itself**: the server lis
 * `fastapi run` (production mode of the FastAPI CLI) listens on `0.0.0.0` by default, which makes the API visible to the whole network. If you use it, add `--host 127.0.0.1`.
 * Check what the server listens on: `ss -ltn | grep 8000` shows `127.0.0.1:8000` when it is local only.
 * Open `http://127.0.0.1:8000/docs` for the interactive API documentation.
+* On the Pi the server runs as a systemd service and the UI in a `cage` kiosk without the desktop: setup in `kiosk/README.md`.
 * The hardware can only be owned by one process: run a single worker.
 * The server starts without the **Arduino**: every request that moves a motor answers `503` until the Arduino answers again (it is reconnected at every such request). It also starts without the **ToF sensor** (only the object scan needs it; it is reinitialised at `/scanner/prepare`) and without the **AI assistant** (`GET /api/ai/status` says why it is off).
 

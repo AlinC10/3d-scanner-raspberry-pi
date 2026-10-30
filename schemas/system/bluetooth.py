@@ -18,7 +18,3 @@ class BluetoothDevice(BaseModel):
     rssi: Annotated[Optional[int], Field(description="Received Signal Strength Indicator in dBm (signed int)")] = None
     device_class: Annotated[
         Optional[int], Field(description="24-bit unsigned integer representing Bluetooth Class of Device (CoD)")] = None
-
-class SendFileRequest(BaseModel):
-    device: BluetoothDevice
-    file_path: Annotated[str | Path, Field(description="File Path of the requested files.")]

@@ -3,7 +3,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Response, status
 
 from schemas.system.bluetooth import *
-from system import bluetooth, network_state
+from system import bluetooth, bluetooth_export, network_state
 from system.bluetooth import BluetoothConnectionError
 from .guard import network_change_allowed
 
@@ -52,14 +52,14 @@ def connect_bluetooth(device: BluetoothDevice) -> BluetoothDevice:
     network_state.remember_bluetooth_device(mac_address)
     return device
 
-@router.post("/send-file", dependencies=[Depends(network_change_allowed)])
-def send_file(payload: SendFileRequest):
-    try:
-        mac_address = payload.device.mac_address
-        file_path = payload.file_path
-        bluetooth.send_file(mac_address, file_path)
 
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    except BluetoothConnectionError as e:
-        raise BluetoothConnectionError(f"Transfer failed: {str(e)}")
+@router.post("/disconnect")
+def disconnect_bluetooth(device: BluetoothDevice) -> dict:
+    """
+    Disconnects the device and stops reconnecting it when the server starts. A Bluetooth export running to this
+    device is cancelled first. Allowed during a scan (it only ends a connection).
+    """
+    cancelled = bluetooth_export.cancel(device.mac_address)
+    bluetooth.disconnect_device(device.mac_address)
+    network_state.forget_bluetooth_device(device.mac_address)
+    return {"status": "disconnected", "mac_address": device.mac_address, "transfer_cancelled": cancelled}

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Scanner</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #10141a; color: #e6e9ef;
+               font-family: system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; }
+  .ring { width: 56px; height: 56px; border: 5px solid #2a3240; border-top-color: #4f9cf9; border-radius: 50%;
+          animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  p { margin: 0; font-size: 18px; opacity: 0.8; }
+</style>
+</head>
+<body>
+  <div class="ring"></div>
+  <p id="msg">Starting the scanner...</p>
+<script>
+  // Shown at once by the kiosk browser (a local file, no server needed). Polls the server and opens it as soon as
+  // the port answers. "no-cors": the answer is opaque, but the request only resolves when the server is up.
+  const URL_ = "http://127.0.0.1:8000/";
+  const started = Date.now();
+  async function poll() {
+    try {
+      await fetch(URL_ + "scanner/status", { mode: "no-cors", cache: "no-store" });
+      location.replace(URL_);
+      return;
+    } catch (e) { /* not up yet */ }
+    if (Date.now() - started > 60000) {
+      document.getElementById("msg").textContent = "The server is not answering yet (sudo systemctl status 3d-scanner)...";
+    }
+    setTimeout(poll, 300);
+  }
+  poll();
+</script>
+</body>
+</html>

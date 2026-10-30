@@ -9,7 +9,9 @@ Nothing here imports FastAPI or pydantic: the router maps the errors to HTTP cod
 """
 import json
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -84,6 +86,78 @@ def get_result(root: Path, result_id: str) -> ResultEntry:
     if entry is None:
         raise ResultNotFoundError(f"Object {result_id} is not a finished result.")
     return entry
+
+
+def finished_folder(root: Path, result_id: str) -> Path:
+    """
+    The folder of a finished object (for the USB export).
+
+    :raises ResultNotFoundError: the id is invalid, the folder is missing or it is not a finished result.
+    """
+    folder = _result_folder(root, result_id)
+    if _read_entry(folder) is None:
+        raise ResultNotFoundError(f"Object {result_id} is not a finished result.")
+    return folder
+
+
+# Fields of object.json the user may edit; everything else (created_at, job_id, units, faces_*, ...) is never touched
+EDITABLE_FIELDS = ("title", "description", "dimensions_mm", "volume_cm3")
+_object_write_lock = threading.Lock()
+
+
+def update_object(root: Path, result_id: str, changes: dict) -> ResultEntry:
+    """
+    Merges `changes` (only EDITABLE_FIELDS; ``dimensions_mm`` is merged key by key) into ``object.json`` and saves it
+    atomically (temporary file + rename). Returns the updated entry.
+
+    :raises ResultNotFoundError: the id is invalid, the folder is missing or it is not a finished result.
+    :raises ValueError: a field that may not be edited.
+    """
+    unknown = sorted(set(changes) - set(EDITABLE_FIELDS))
+    if unknown:
+        raise ValueError(f"These fields cannot be edited: {', '.join(unknown)}")
+    folder = _result_folder(root, result_id)
+    with _object_write_lock:
+        get_result(root, result_id)   # a finished result only
+        path = folder / "object.json"
+        obj = _read_json(path) or {}
+        for key, value in changes.items():
+            if key == "dimensions_mm" and isinstance(value, dict):
+                dims = dict(obj.get("dimensions_mm") or {})
+                dims.update(value)
+                obj["dimensions_mm"] = dims
+            else:
+                obj[key] = value
+        tmp = folder / "object.json.tmp"
+        tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    return get_result(root, result_id)
+
+
+# Sub-folder of a result that keeps the scan photos it was built from (not served, not in the USB export)
+PHOTOS_DIR = "photos"
+
+
+def copy_photos(images_dir: Path, folder: Path) -> int:
+    """
+    Copies the scan photos (``rig/0|1/*.jpg`` and ``manifest.json``) into ``folder/photos/rig/``: the layout Turntable
+    Studio reads, so the folder can be reconstructed again. Returns the number of files copied; never raises (the model is already saved: a failure is logged).
+    """
+    import shutil
+    images_dir = Path(images_dir)
+    dest = Path(folder) / PHOTOS_DIR / images_dir.name
+    copied = 0
+    try:
+        for path in sorted(p for p in images_dir.rglob("*") if p.is_file()):
+            if path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".json"):
+                continue
+            target = dest / path.relative_to(images_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            copied += 1
+    except OSError as e:
+        log.warning("Could not copy the photos of %s into %s: %s", images_dir, dest, e)
+    return copied
 
 
 def list_results(root: Path, offset: int = 0, limit: int = 20) -> ResultPage:

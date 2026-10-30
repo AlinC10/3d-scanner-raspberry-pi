@@ -2325,6 +2325,7 @@ class Scanner:
         begun: bool = False,
         z_delay: Optional[float] = None,
         reconstruct: bool = True,
+        title: Optional[str] = None,
     ) -> dict:
         """
         Face capture, after a face prepare (`POST /scanner/face/prepare`: homing, climb to the start height, lights,
@@ -2353,6 +2354,7 @@ class Scanner:
         :param begun: True when `begin_face_scan()` already validated the request and set RUNNING.
         :param z_delay: Step delay of this capture's Z moves (None keeps the face prepare's value, FACE-19).
         :param reconstruct: Build the 3D face model on the Pi after the photo (FACE-20).
+        :param title: Name of the face model in object.json (None = the job id).
         :return: Dict with status, optimal_z_mm, best_score, face_detected, warning, photos and r2_uploaded.
         :raises ScannerError: the face scan failed (the state is then ERROR).
         """
@@ -2510,7 +2512,7 @@ class Scanner:
             with self._lock:
                 if self.state == ScannerState.RUNNING:
                     self.state = ScannerState.PROCESSING
-            result.update(self._reconstruct_face(paths))
+            result.update(self._reconstruct_face(paths, title))
             if self._cancel_event.is_set():
                 self._set_phase(ScanPhase.CANCELLED)
                 return outcome("cancelled", "Face scan was cancelled during the 3D reconstruction", bool(upload_r2))
@@ -2531,7 +2533,7 @@ class Scanner:
                 self.state = finish_state
         return result
 
-    def _reconstruct_face(self, paths: list) -> dict:
+    def _reconstruct_face(self, paths: list, title: Optional[str] = None) -> dict:
         """
         Builds the 3D face model of the stereo pair on the Pi (phase ``reconstructing_face``). Never raises: a failure
         is returned as ``reconstruction_error`` and `face_scan` turns it into the ERROR state.
@@ -2550,11 +2552,14 @@ class Scanner:
                 by_camera["0"], by_camera["1"], Path(results_directory()), self.job_id or r2.new_job_id(),
                 cancel_event=self._cancel_event,
                 on_progress=lambda message: self._set_phase(ScanPhase.RECONSTRUCTING_FACE, message),
+                title=title,
             )
         except Exception as e:
             log.error("[Scanner Face] 3D reconstruction failed: %s", e)
             return {"reconstruction_error": str(e)}
         self.result_id = self.job_id
+        from storage.results import copy_photos
+        copy_photos(Path(self.images_dir), Path(results_directory()) / self.result_id)   # kept beside the model
         metrics = {k: info.get(k) for k in ("dimensions_mm", "interpupillary_distance_mm", "fit_rms_mm")}
         return {"result_id": self.result_id, "metrics": metrics}
 

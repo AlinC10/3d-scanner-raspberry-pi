@@ -630,7 +630,6 @@ Reads all connections in one call (poll every 5 to 15 s). It never disturbs a sc
 | POST | `/system/bluetooth/power/{on\|off}` (guarded) | | `{"powered": "on"}` |
 | GET | `/system/bluetooth/scan?duration=8` (guarded) | `duration` 1 to 20 s; `include_unnamed`, `include_out_of_range` (debug) | list of devices |
 | POST | `/system/bluetooth/connect` (guarded) | `{"mac_address": "AA:BB:CC:DD:EE:FF"}` | the device |
-| POST | `/system/bluetooth/send-file` (guarded) | `{"device": {"mac_address": "..."}, "file_path": "..."}` | 204 |
 
 Device object:
 

@@ -59,7 +59,7 @@ def reconstruct_face(
     :param result_id: Folder name; must match the library id pattern to be listed.
     :param cancel_event: Set -> the child process is killed and FaceReconstructionError raised.
     :param on_progress: Called with a human readable step ("Detecting face landmarks...", ...).
-    :param title: Written to object.json (default "Face <date time>").
+    :param title: Written to object.json (default: ``result_id``, the folder name).
     :return: The content of object.json (dimensions_mm, interpupillary_distance_mm, ...).
     :raises FaceReconstructionError: the reconstruction did not produce a model.
     """
@@ -132,7 +132,7 @@ def reconstruct_face(
         log.error("[FaceReconstruct] %s (log kept in %s)", failure, work_dir)
         raise FaceReconstructionError(failure)
 
-    info["title"] = title or time.strftime("Face %Y-%m-%d %H:%M")
+    info["title"] = title or result_id
     (work_dir / "object.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     (work_dir / "status.json").write_text(json.dumps({
         "state": "ok", "mode": "mediapipe_face_mesh", "elapsed_s": round(time.monotonic() - started, 1),

@@ -36,6 +36,7 @@ else:
     from hardware.scanner import Scanner, ScannerState
 from pathlib import Path
 from app_paths import results_directory
+from storage.results import copy_photos
 # cloud.job / cloud.runpod are imported lazily (see _load_cloud_job): a missing RunPod configuration must not affect scans
 # that do not launch RunPod.
 
@@ -364,8 +365,8 @@ def _orchestrate_pipeline(req: StartRequest):
             "step_deg": req.mechanical.turntable.angle,   # turntable step: the pod derives the camera poses from it
             "texturing_engine": "texrecon",
         }
-        if req.cloud.title:
-            options["title"] = req.cloud.title
+        # Untitled: the object is named after its folder (the job id), the same name as in results/ and on a USB export
+        options["title"] = req.cloud.title or job_id
 
         def _progress(message: str) -> None:
             log.info("[Cloud %s] %s", job_id, message)
@@ -394,7 +395,8 @@ def _orchestrate_pipeline(req: StartRequest):
             raise RuntimeError(f"Turntable Studio job {job_id} failed: {status.get('state') or 'no pod result'} "
                                f"{status.get('error', '')}".strip())
 
-        # 4. The result is already extracted in results/<job_id>/ (served by /library)
+        # 4. The result is already extracted in results/<job_id>/ (served by /library); the photos are kept beside it
+        copy_photos(Path(scanner.images_dir), results_directory() / job_id)
         scanner.result_id = job_id
         if _set_state_unless_cancelled(ScannerState.COMPLETED):
             log.info("Full pipeline completed: model in %s (cost estimate %s).",

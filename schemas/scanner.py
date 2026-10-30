@@ -406,7 +406,10 @@ class CloudConfig(BaseModel):
     )] = 1
     title: Annotated[str | None, Field(
         max_length=120,
-        description="Optional name of the 3D model, written by the pod to object.json (shown by /library)."
+        description=(
+            "Name of the 3D model, written by the pod to object.json (shown by /library, editable later with "
+            "PATCH /library/objects/{id}). Null = the job id (the folder name, e.g. 20261030-101500-a1b2c3)."
+        )
     )] = None
 
 
@@ -602,6 +605,11 @@ class FaceCaptureRequest(BaseModel):
         ge=STEP_DELAY_MIN,
         le=STEP_DELAY_MAX,
         description="Step delay in seconds of the Z moves of this capture; null (default) keeps the prepare's value."
+    )] = None
+
+    title: Annotated[str | None, Field(
+        max_length=120,
+        description="Name of the face model in /library; null = the job id (the folder name)."
     )] = None
 
     reconstruct: Annotated[bool, Field(

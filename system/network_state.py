@@ -96,6 +96,12 @@ def remember_bluetooth_power(powered: bool) -> None:
     update(lambda s: s["bluetooth"].update(powered=powered))
 
 
+def forget_bluetooth_device(mac: str) -> None:
+    """The device is no longer reconnected when the server starts (the user disconnected it)."""
+    update(lambda s: s["bluetooth"].update(devices=[
+        d for d in s["bluetooth"].get("devices", []) if isinstance(d, str) and d.upper() != mac.upper()]))
+
+
 def remember_bluetooth_device(mac: str) -> None:
     def change(s):
         devices = [d for d in s["bluetooth"].get("devices", []) if isinstance(d, str) and d.upper() != mac.upper()]

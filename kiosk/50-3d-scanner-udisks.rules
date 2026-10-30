@@ -1,0 +1,10 @@
+// Lets the scanner server (user "ducks", a systemd service, not a desktop session) mount and unmount USB sticks
+// with udisksctl for the USB export (system/usb.py). Copy to /etc/polkit-1/rules.d/.
+polkit.addRule(function (action, subject) {
+    if (subject.user == "ducks" &&
+        (action.id.indexOf("org.freedesktop.udisks2.filesystem-mount") == 0 ||
+         action.id == "org.freedesktop.udisks2.filesystem-unmount-others" ||
+         action.id == "org.freedesktop.udisks2.power-off-drive")) {
+        return polkit.Result.YES;
+    }
+});

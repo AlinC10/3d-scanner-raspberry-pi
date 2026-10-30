@@ -57,7 +57,7 @@ The HTTP side (routes, the 409 guard during a scan, error codes) is documented i
 * `run_bluetoothctl(args, timeout)`: deadline (`BLUETOOTHCTL_TIMEOUT_S` 10, pair 40, connect 30); timeout -> `BluetoothConnectionError` with `status_code` 504; missing tool -> 503.
 * `scan_devices(duration=8, include_unnamed=False, include_out_of_range=False)`: discovery of `duration` s (max 20) whose output (`[NEW]` / `[CHG] Device ...`) tells which devices are in range; a device with an RSSI or connected also counts. Unnamed devices (`is_unnamed`: no name or the address as name) are left out. The `info` calls share one `INFO_BUDGET_S` (10 s). RSSI parsed from `-60` and `0xffffffc4 (-60)`.
 * `connected_devices()`: `bluetoothctl devices Connected`.
-* `is_paired(mac)`, `pair_device(mac)` (pair + trust), `connect_device(mac)`, `send_file(mac, path)` (300 s deadline).
+* `is_paired(mac)`, `pair_device(mac)` (pair + trust), `connect_device(mac)`.
 
 ## 3b. Ethernet (`system.ethernet`)
 
@@ -102,3 +102,10 @@ Exception
 
 ### `check_and_raise_error(res: CompletedProcess, msg: str, err_type: type[Exception]) -> None`
 Helper function that inspects a `subprocess.CompletedProcess` instance. If `res.returncode != 0`, it extracts `stderr` (or `stdout`) and raises the specified error type with the command output attached.
+
+## USB sticks (`usb.py`)
+
+`list_drives()` (lsblk, USB disks only), `mount` / `unmount` (udisksctl, `sync` first) and the background export of one
+object to `<id>.zip` (`start_export`, `export_status`). Used by `/library/usb` and `/library/objects/{id}/export/usb`
+(`router/docs/LIBRARY_API.md`). Without a desktop session the server needs the polkit rule
+`kiosk/50-3d-scanner-udisks.rules`.

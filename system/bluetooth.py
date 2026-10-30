@@ -22,7 +22,6 @@ SCAN_GRACE_S = 10.0             # extra time on top of the discovery duration
 INFO_BUDGET_S = 10.0            # all the `info` calls of one scan together
 SCAN_DURATION_DEFAULT_S = 8
 SCAN_DURATION_MAX_S = 20
-SEND_FILE_TIMEOUT_S = 300.0     # an OBEX push of a large file
 
 _MAC_RE = re.compile(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}")
 # Lines printed by `bluetoothctl scan on` for a device seen during this discovery
@@ -210,21 +209,12 @@ def connect_device(mac_address: str) -> None:
     check_and_raise_error(res, "Error on connecting to requested device")
 
 
+def disconnect_device(mac_address: str) -> None:
+    res = run_bluetoothctl(["disconnect", mac_address], timeout=CONNECT_TIMEOUT_S, capture_output=True, text=True)
+    check_and_raise_error(res, "Error on disconnecting from the device")
+
+
 def is_paired(mac_address: str) -> bool:
     res = run_bluetoothctl(["info", mac_address], capture_output=True, text=True)
     return res.returncode == 0 and "Paired: yes" in res.stdout
 
-
-def send_file(mac_address: str, file_path: str | Path):
-    """Uses bt-obex for 1-command OBEX push transfer."""
-    cmd = ["bt-obex", "-p", mac_address, str(file_path)]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=SEND_FILE_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        raise CommandTimeoutError(f"The file transfer did not finish within {SEND_FILE_TIMEOUT_S:g} s")
-    except FileNotFoundError:
-        raise ToolUnavailableError("`bt-obex` is not installed on this system (apt install bluez-tools).")
-
-    check_and_raise_error(res, "File transfer failed")
-
-    # print("File transfer completed successfully!")

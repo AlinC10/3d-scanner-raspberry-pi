@@ -527,6 +527,7 @@ class ScannerMock:
         begun: bool = False,
         z_delay: Optional[float] = None,
         reconstruct: bool = True,
+        title: Optional[str] = None,
     ) -> dict:
         """
         Simulated face capture from the prepared height: sweeps or moves directly, and captures mock photos. The mock
