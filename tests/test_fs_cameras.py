@@ -533,6 +533,44 @@ class TestAutofocus(RealModeCase):
         with self.assertRaises(ValueError):
             drv.prepare_scan(focus="near")
 
+    def test_coarse_sweep_stops_right_after_the_peak(self):
+        drv = self.driver()
+        visited = []
+        original = FakeFocuser.set_position
+
+        def record(focuser, pos, settle=True):
+            if focuser is drv.cam1.focuser:
+                visited.append(pos)
+            original(focuser, pos, settle)
+
+        with patch.object(FakeFocuser, "set_position", record):
+            drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0)
+        # coarse 0, 30, ..., 630 (best), 660 (first drop) -> stop; then 11 fine positions and the final set
+        coarse = visited[:visited.index(660) + 1]
+        self.assertEqual(coarse, list(range(0, 661, 30)))
+        self.assertEqual(len(visited), len(coarse) + 11 + 1)
+        self.assertEqual(drv.autofocus_positions, [642, 642])
+
+    def test_each_lens_stops_at_its_own_peak(self):
+        drv = self.driver()
+        peaks = {0.0: 300, 0.5: 900}            # cam1 box starts at x=0, cam2 box at x=0.5
+        cams = {0.0: drv.cam1, 0.5: drv.cam2}
+
+        def sharpness(frame, roi):
+            return 2000 - abs(cams[roi[0]].focuser.position - peaks[roi[0]])
+
+        with patch.object(FakeCam, "_sharpness", create=True, new=staticmethod(sharpness)):
+            drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0,
+                             autofocus_roi=((0.0, 0.3, 0.4, 0.4), (0.5, 0.3, 0.4, 0.4)))
+        self.assertEqual(drv.autofocus_positions, [300, 900])
+
+    def test_peak_passed_needs_a_rise_before_a_drop(self):
+        passed = self.driver()._peak_passed
+        self.assertFalse(passed({0: 100.0, 30: 99.0}))               # flat blurred start: noise, not a peak
+        self.assertFalse(passed({0: 100.0, 30: 150.0, 60: 149.0}))   # within the tolerance
+        self.assertTrue(passed({0: 100.0, 30: 150.0, 60: 140.0}))
+        self.assertFalse(passed({0: 100.0, 30: 150.0, 60: 160.0}))   # still rising
+
     def test_sweep_frame_collection_is_switched_off_afterwards(self):
         drv = self.driver()
         drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0)

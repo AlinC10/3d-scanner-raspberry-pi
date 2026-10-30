@@ -30,11 +30,11 @@ REST_URL = "https://rest.runpod.io/v1"
 # Cheap CUDA GPUs first: GPU speed barely matters (2.3 of 30 min are GPU compute), host RAM and vCPUs do.
 # Exact ids are RunPod's gpuTypeIds enum (some contain double spaces there): check with --dry_run.
 DEFAULT_GPU_TYPES = (
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA GeForce RTX 4090",
     "NVIDIA RTX A4000",
     "NVIDIA RTX A4500",
-    "NVIDIA GeForce RTX 3090",
     "NVIDIA RTX A5000",
-    "NVIDIA GeForce RTX 4090",
     "NVIDIA L4",
     "NVIDIA A40",
 )
@@ -244,11 +244,15 @@ def run_pod(
     on_progress: Optional[Callable[[str], None]] = None,
     read_started: Optional[Callable[[], bool]] = None,
     boot_timeout_s: Optional[float] = None,
+    on_phase: Optional[Callable[[str], None]] = None,
+    read_progress: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[PodRun]:
     """
     Creates one pod, waits until its status.json appears in R2 (or the pod exits, is cancelled, runs too long,
     never starts its pipeline within boot_timeout_s or cannot be queried) and ALWAYS terminates it afterwards.
     read_started() says whether the pod's pipeline has started (started.json in R2); None disables the check.
+    on_progress gets every technical message (pod polling, heartbeat); on_phase only the milestones (pod created,
+    pipeline started, and each new step that read_progress() returns once the pipeline runs).
     Returns None when no pod could be created.
     """
     def wait(seconds: float) -> bool:
@@ -258,15 +262,18 @@ def run_pod(
         return False
 
     say = on_progress or logger.info
+    phase = on_phase or (lambda message: None)
     boot_timeout_s = BOOT_TIMEOUT_S if boot_timeout_s is None else boot_timeout_s
     created = create_pod_with_retries(client, body, wait)
     if not created:
         return None
     run = PodRun(pod_id=created["id"], started_at=time.time(), pod_info=_pod_summary(created))
     say(f"Created pod {run.pod_id}: {run.pod_info}")
+    phase("Cloud server created: loading the reconstruction software")
     try:
         errors = 0
         started = read_started is None
+        last_step: Optional[str] = None
         while True:
             if wait(poll_s):
                 say("Job cancelled: terminating the pod.")
@@ -292,11 +299,21 @@ def run_pod(
                     say(f"Could not read started.json: {e}")
                 if started:
                     say(f"Pipeline started in the pod after {run.elapsed_s:.0f} s (image pull + boot).")
+                    phase("3D reconstruction started in the cloud")
                 elif run.elapsed_s > boot_timeout_s:
                     say(f"Pipeline not started after {boot_timeout_s / 60:g} minutes (image pull stuck on this host?): "
                         "terminating the pod. Its log is on console.runpod.io until then.")
                     run.outcome = "boot_timeout"
                     break
+            if started and read_progress is not None:
+                try:
+                    step = read_progress()
+                except Exception as e:
+                    step = None
+                    say(f"Could not read progress.json: {e}")
+                if step and step != last_step:
+                    last_step = step
+                    phase(step)
             try:
                 pod = client.get_pod(run.pod_id)
                 errors = 0
@@ -331,6 +348,8 @@ def run_job_pods(
     on_progress: Optional[Callable[[str], None]] = None,
     before_retry: Optional[Callable[[], None]] = None,
     read_started: Optional[Callable[[], bool]] = None,
+    on_phase: Optional[Callable[[str], None]] = None,
+    read_progress: Optional[Callable[[], Optional[str]]] = None,
 ) -> List[PodRun]:
     """
     Runs the job on at most MAX_POD_ATTEMPTS pods. A new pod is started only when the previous one
@@ -345,8 +364,10 @@ def run_job_pods(
         if attempt > 1 and before_retry is not None:
             before_retry()
         say(f"--- Pod attempt {attempt} of {MAX_POD_ATTEMPTS} (min RAM {ram} GB per GPU) ---")
+        if attempt > 1 and on_phase is not None:
+            on_phase(f"Retrying the reconstruction on a new cloud server (attempt {attempt} of {MAX_POD_ATTEMPTS})")
         run = run_pod(client, make_body(ram), read_status, cancel_event, max_runtime_s, on_progress=say,
-                      read_started=read_started)
+                      read_started=read_started, on_phase=on_phase, read_progress=read_progress)
         if run is None:
             say("No pod could be created with these filters.")
             break

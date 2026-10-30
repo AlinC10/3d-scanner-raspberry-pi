@@ -110,7 +110,7 @@ When a driver gains a feature that the scanner or a router uses, declare it in `
   * `focus_set(position: int | Tuple[int, int])`: Sets absolute focal positions (0 = infinity, 1023 = macro). Accepts integer for symmetric focus or 2-tuple for independent lens tuning.
   * `focus_step(delta: int | Tuple[int, int])`: Incremental relative adjustments.
   * `focus_reset()`: Relaxes springs back to infinity (`0`).
-  * `focus_sweep_autofocus()`: Concurrent contrast-detection autofocus sweep using Laplacian variance scoring.
+  * `focus_sweep_autofocus()`: Concurrent contrast-detection autofocus sweep using Laplacian variance scoring. The coarse pass starts at 0 and each lens stops right after its peak (first score more than `AF_DROP_FRACTION` below its best, once the score has risen `AF_MIN_RISE` over position 0; otherwise the whole range), then a fine pass of 11 positions around the best one.
 * **Image Controls & Transformations**:
   * `rotate(direction: str)`: Software rotation dispatched concurrently.
   * `apply_settings(**kwargs)`: Dynamic controls (`brightness`, `contrast`, `exposure_time`, etc.) forwarded concurrently.

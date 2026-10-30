@@ -91,6 +91,59 @@ class ResultsStoreTest(unittest.TestCase):
             results.get_result(self.root, "20261029-000000-bbbbbb")
 
 
+class CategoryAndFilterTest(unittest.TestCase):
+    """LIB-CAT / LIB-FILTER: the category of an object and the filters applied before the page is cut."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        make_result(self.root, "20261020-000000-000001", obj=json.dumps({"title": "Mug", "description": "blue cup"}))
+        make_result(self.root, "20261021-000000-000002",
+                    obj=json.dumps({"title": "Ana", "mode": "mediapipe_face_mesh"}))
+        make_result(self.root, "20261022-000000-000003", obj=json.dumps({"title": "Bob", "category": "face"}))
+        make_result(self.root, "20261023-000000-000004", obj=json.dumps({"title": "Screwdriver", "category": "x"}))
+        face_status = self.root / "20261024-000000-000005"
+        make_result(self.root, face_status.name, title="Old face")
+        (face_status / "status.json").write_text(json.dumps({"state": "ok", "mode": "mediapipe_face_mesh"}))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def ids(self, **kwargs):
+        return [e.id[-1] for e in results.list_results(self.root, **kwargs).items]
+
+    def test_category_is_read_or_inferred(self):
+        categories = {e.id[-1]: e.category for e in results.list_results(self.root).items}
+        self.assertEqual(categories, {"1": "object", "2": "face", "3": "face", "4": "object", "5": "face"})
+        self.assertEqual(results.get_result(self.root, "20261021-000000-000002").as_dict()["category"], "face")
+
+    def test_category_filter(self):
+        self.assertEqual(self.ids(category="face"), ["5", "3", "2"])
+        self.assertEqual(self.ids(category="object"), ["4", "1"])
+        self.assertEqual(self.ids(category="all"), ["5", "4", "3", "2", "1"])
+
+    def test_search_in_title_description_and_id_any_case(self):
+        self.assertEqual(self.ids(search="MUG"), ["1"])
+        self.assertEqual(self.ids(search="cup"), ["1"])
+        self.assertEqual(self.ids(search="-000004"), ["4"])
+        self.assertEqual(self.ids(search="   "), ["5", "4", "3", "2", "1"])
+        self.assertEqual(self.ids(search="o", category="face"), ["5", "3"])
+
+    def test_filter_is_applied_before_the_page(self):
+        page = results.list_results(self.root, offset=1, limit=1, category="face")
+        self.assertEqual(page.total, 3)
+        self.assertEqual([e.id[-1] for e in page.items], ["3"])
+        self.assertEqual(page.next_offset, 2)
+
+    def test_set_category_writes_object_json_and_keeps_the_rest(self):
+        oid = "20261020-000000-000001"
+        self.assertTrue(results.set_category(self.root, oid, "object"))
+        obj = json.loads((self.root / oid / "object.json").read_text())
+        self.assertEqual(obj, {"title": "Mug", "description": "blue cup", "category": "object"})
+        self.assertFalse(results.set_category(self.root, oid, "car"))
+        self.assertFalse(results.set_category(self.root, "20261020-000000-999999", "object"))
+
+
 # Real FastAPI and pydantic in a subprocess (tests/__init__.py replaces them with mocks in this process)
 API_PROGRAM = r"""
 import json, os, sys
@@ -121,6 +174,9 @@ print(json.dumps({
     "list": call("/library/objects?limit=1"),
     "list_bad_limit": call("/library/objects?limit=101")["status"],
     "list_bad_offset": call("/library/objects?offset=-1")["status"],
+    "list_face": call("/library/objects?category=face"),
+    "list_search": call("/library/objects?search=PARK&category=object"),
+    "list_bad_category": call("/library/objects?category=car")["status"],
     "one": call(f"/library/objects/{oid}"),
     "missing": call("/library/objects/20261027-202750-000000")["status"],
     "model": call(f"/library/objects/{oid}/model?format=stl&lod=high"),
@@ -139,6 +195,7 @@ class LibraryApiTest(unittest.TestCase):
         root = Path(cls._tmp.name)
         make_result(root, "20261027-202750-21d2de", title="Parkside")
         make_result(root, "20261026-000000-000001")
+        make_result(root, "20261025-000000-000002", obj=json.dumps({"title": "Ana", "category": "face"}))
         env = {**os.environ, "RESULTS_DIR": str(root)}
         out = subprocess.run([sys.executable, "-c", API_PROGRAM % ROOT], capture_output=True, text=True, env=env,
                              timeout=120)
@@ -159,14 +216,23 @@ class LibraryApiTest(unittest.TestCase):
     def test_list_pages_without_model_files(self):
         listed = self.r["list"]
         self.assertEqual(listed["status"], 200)
-        self.assertEqual(listed["body"]["total"], 2)
+        self.assertEqual(listed["body"]["total"], 3)
         self.assertEqual(listed["body"]["next_offset"], 1)
         item = listed["body"]["items"][0]
         self.assertEqual(item["id"], "20261027-202750-21d2de")
         self.assertEqual(item["object"], {"title": "Parkside"})
+        self.assertEqual(item["category"], "object")
         self.assertEqual(item["models"], {".glb": ["low", "high"], ".stl": ["low", "high"]})
         self.assertEqual(self.r["list_bad_limit"], 422)
         self.assertEqual(self.r["list_bad_offset"], 422)
+
+    def test_list_filters(self):
+        face = self.r["list_face"]["body"]
+        self.assertEqual((face["total"], [i["id"] for i in face["items"]]), (1, ["20261025-000000-000002"]))
+        self.assertEqual(face["items"][0]["category"], "face")
+        found = self.r["list_search"]["body"]
+        self.assertEqual((found["total"], [i["id"] for i in found["items"]]), (1, ["20261027-202750-21d2de"]))
+        self.assertEqual(self.r["list_bad_category"], 422)
 
     def test_one_object(self):
         self.assertEqual(self.r["one"]["status"], 200)

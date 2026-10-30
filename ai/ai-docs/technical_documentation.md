@@ -236,7 +236,7 @@ where E is exposure time, G is gain and Φ is luminous flux. Scanning starts onl
 
 ### 6.2 Autofocus
 
-A contrast-based sweep tests voice-coil codes across **P = {0, 30, ..., 1020}** (35 positions **(derived)**) and selects the code that maximizes the **variance of the Laplacian** inside a central **40% × 40% region of interest**.
+A contrast-based sweep tests voice-coil codes from 0 upwards in steps of 30 (**P = {0, 30, ..., 1020}**, at most 35 positions **(derived)**). Each lens stops as soon as its score drops below its best so far, once the score has risen at least 20% over the first position, so it usually visits only the positions up to just past the peak. A fine pass around the best code (step 6) then selects the code that maximizes the **variance of the Laplacian** inside a central **40% × 40% region of interest**.
 
 For face scans, `focus: "auto"` autofocuses on the face at capture time; the subject must hold still for about 10 s after the search while autofocus and exposure lock.
 
@@ -288,7 +288,7 @@ A single stereo capture at the best height for a face, in **two steps** (prepare
   - `sweep_best_score`: sweep the search range and return to the best-scoring height.
   - `direct_stop`: stop as soon as the face is centred.
   - `none`: photograph where the carriage currently is.
-- `manual_z` (200 to 475 mm) goes straight to a height without a search.
+- `manual_z` (150 to 250 mm) goes straight to a height without a search.
 - Constraint: `start_z_mm + search_range_mm ≤ 475`, otherwise `422`.
 
 ### 7.5 Cancellation
@@ -350,7 +350,8 @@ A single stereo capture at the best height for a face, in **two steps** (prepare
 | `mode` | `"object"`, `"face"` or `null`: what the last prepare was for (stays set after the run) |
 | `stream_urls` | MJPEG preview URLs (`null` when no stream) |
 | `phase` | See section 7.2 |
-| `phase_message` | Text for the user (also face scan warnings) |
+| `phase_message` | Text for the user (also face scan warnings). In `processing` on RunPod: the last finished phase (steady, changes a few times) |
+| `cloud_message` | In `processing` on RunPod: technical detail (pod state, minutes), changes every few seconds; show small or in a "details" line. `null` otherwise |
 | `level` | Current ring (object scan) |
 | `photos_captured` / `photos_uploaded` | Progress counters |
 | `missing` | Photos missing in the cloud after verification (with `state: "error"`, at most 50) |
@@ -453,7 +454,7 @@ Needs `state: "prepared"` and `mode: "face"`.
 | `strategy` | `"sweep_best_score"` | `sweep_best_score`, `direct_stop`, `none` |
 | `search_range_mm` | 150.0 | 10 to 250; `start_z_mm + search_range_mm ≤ 475` |
 | `step_mm` | 8.0 | 1 to 25 |
-| `manual_z` | `null` | 200 to 475: go there, no search |
+| `manual_z` | `null` | 150 to 250: go there, no search |
 | `settle_s` | 0.15 | 0.05 to 2 |
 
 Answer: `{"status": "accepted", "message": "...", "state": "running"}`. Errors: `400` not prepared for a face scan; `409`; `422`; `503`. Old keys (`start_z_mm`, `home`, `illumination_brightness`, `upload_r2`) on capture now give `422`.
@@ -536,12 +537,13 @@ The final GLB uses `KHR_draco_mesh_compression` with **14 quantization bits**. O
 
 Finished models are stored on the Pi and served by the library endpoints.
 
-### 10.1 `GET /library/objects?offset=0&limit=20`
+### 10.1 `GET /library/objects?offset=0&limit=20&category=all&search=`
 
 ```json
 {
   "items": [{
     "id": "20261027-202750-21d2de",
+    "category": "object",
     "object": {"title": "Parkside", "description": "", "created_at": "2026-10-28T14:44:17+00:00",
                "dimensions_mm": {"length": 71.0, "width": 54.3, "height": 226.9},
                "volume_cm3": 363.74, "surface_area_cm2": 377.2, "watertight": true},
@@ -554,6 +556,7 @@ Finished models are stored on the Pi and served by the library endpoints.
 - Newest first; `limit` 1 to 100; next page with `offset = next_offset` until it is `null`.
 - `object` is the reconstruction's `object.json`.
 - `models` lists only files that exist; disable buttons for the missing ones.
+- `category` is `"object"` (turntable scan) or `"face"` (face scan). `category=all|object|face` and `search=<text>` (title, description or id, any case) filter before the paging, so `total` counts only matching objects.
 
 ### 10.2 `GET /library/objects/{id}`
 
@@ -676,6 +679,9 @@ For a service / calibration page. Every motion endpoint answers `409` while a sc
 | GET | `/test/tof` | | `{"status": "success", "distance_mm": 412, "valid": true, "available": true}` (`status: "invalid"`, `distance_mm: null` without a reading) |
 | POST | `/test/lights/enable` | `{"brightness": 0.5}` (optional, 0 to 1) | `{"status": "success", "state": "enabled", "brightness": 0.5, "message": "..."}` |
 | POST | `/test/lights/disable` | | `{"status": "success", "state": "disabled", "message": "..."}` |
+| GET | `/test/buzzer` | | `{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "success", "error"]}` |
+| POST | `/test/buzzer/play` | `{"pattern": "success"}` | `{"status": "success", "pattern": "success"}`; `503` without buzzer |
+| POST | `/test/buzzer/tone` | `{"frequency_hz": 880, "duration_s": 0.5}` (110-1760 Hz, up to 5 s) | `{"status": "success", "frequency_hz": 880.0, "duration_s": 0.5}` |
 | GET | `/test/motor/status` | | `{"turntable": "enabled", "z_axis": "disabled"}` |
 | POST | `/test/motor/enable?target=all` | `target`: `turntable`, `z_axis`, `all` | `{"status": "success", "target": "all", "state": "enabled"}` |
 | POST | `/test/motor/disable?target=all` | same | same, `"state": "disabled"` |

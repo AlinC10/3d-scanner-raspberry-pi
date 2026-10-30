@@ -41,7 +41,7 @@ Python 3.13. All tests must pass before you finish; the suite takes about 30 sec
 | Request / response models and their validation | `schemas/README.md`, `schemas/scanner.py` |
 | Dual camera drivers (`rpi_sync` is the production one), the `BaseDualCamera` interface and its capability flags | `hardware/docs/DUAL_CAMERAS.md`, `hardware/docs/CAMERA.md` |
 | Motors, Arduino bridge and serial protocol, firmware | `hardware/docs/MOTOR.md`, `hardware/docs/ARDUINO_BRIDGE.md`, `hardware/docs/ARDUINO_PROTOCOL.md`, `hardware/arduino_control/README.md` |
-| ToF sensor and the object / backdrop threshold, lights | `hardware/docs/TOF.md`, `hardware/docs/LIGHTS.md` |
+| ToF sensor and the object / backdrop threshold, lights, buzzer | `hardware/docs/TOF.md`, `hardware/docs/LIGHTS.md`, `hardware/docs/BUZZER.md` |
 | Wi-Fi / Bluetooth / Ethernet (status, saved networks, guard during a scan, restore at startup) | `system/README.md`, `router/docs/SYSTEM_API.md` |
 | Every endpoint for the front-end, and what changed (keep both updated when an endpoint changes) | `router/docs/FRONTEND_API_REFERENCE.md`, `router/docs/FRONTEND_CHANGES.md` |
 | Mechanical limits of the rig | `hardware/rig_limits.py` |

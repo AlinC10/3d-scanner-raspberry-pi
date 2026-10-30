@@ -460,7 +460,8 @@ class StatusResponse(BaseModel):
 
     # Progress and failure detail (API-11). All optional so an older scanner object still produces a valid response.
     phase: str | None = None            # preparing / scanning / uploading / verifying / done ...
-    phase_message: str | None = None    # human readable detail of the phase
+    phase_message: str | None = None    # human readable detail of the phase (in `processing`: the last milestone)
+    cloud_message: str | None = None    # `processing` on RunPod: last technical message (pod state, time, retries)
     level: int = 0                      # current ring (0 = bottom)
     photos_captured: int = 0
     photos_uploaded: int = 0
@@ -590,9 +591,9 @@ class FaceCaptureRequest(BaseModel):
     )] = 8.0
 
     manual_z: Annotated[float | None, Field(
-        ge=200.0,
-        le=Z_DISTANCE_MAX_MM,
-        description="Optional explicit height in mm (>= 200 mm). Skips the search when set."
+        ge=150.0,
+        le=250.0,
+        description="Optional explicit height in mm (150 to 250 mm). Skips the search when set."
     )] = None
 
     settle_s: Annotated[float, Field(

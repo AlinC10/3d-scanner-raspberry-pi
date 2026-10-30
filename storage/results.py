@@ -26,6 +26,11 @@ MODEL_FORMATS = {".glb": "glb", ".stl": "stl"}
 MODEL_LODS = ("low", "high")
 MEDIA_TYPES = {".glb": "model/gltf-binary", ".stl": "model/stl"}
 
+# Kind of scan an object comes from: "category" in object.json. Older objects have none; it is inferred from the
+# "mode" the face reconstruction writes (`infer_category`).
+CATEGORIES = ("object", "face")
+FACE_MODE = "mediapipe_face_mesh"
+
 
 class ResultNotFoundError(LookupError):
     """The object, or the model asked for, does not exist (or is not a finished result)."""
@@ -37,9 +42,10 @@ class ResultEntry:
     id: str
     object: dict
     models: dict = field(default_factory=dict)   # {".glb": ["low", "high"], ".stl": [...]}
+    category: str = "object"                      # one of CATEGORIES
 
     def as_dict(self) -> dict:
-        return {"id": self.id, "object": self.object, "models": self.models}
+        return {"id": self.id, "category": self.category, "object": self.object, "models": self.models}
 
 
 @dataclass
@@ -53,6 +59,19 @@ class ResultPage:
     def next_offset(self) -> Optional[int]:
         following = self.offset + len(self.items)
         return following if following < self.total else None
+
+
+def infer_category(obj: dict, status: Optional[dict] = None) -> str:
+    """
+    The category of an object: its ``category`` when it is a known one, else ``"face"`` when the face reconstruction
+    made it (``mode`` ``mediapipe_face_mesh`` in object.json or status.json), else ``"object"``.
+    """
+    category = obj.get("category")
+    if category in CATEGORIES:
+        return category
+    if obj.get("mode") == FACE_MODE or (status or {}).get("mode") == FACE_MODE:
+        return "face"
+    return "object"
 
 
 def is_valid_id(result_id: str) -> bool:
@@ -128,10 +147,37 @@ def update_object(root: Path, result_id: str, changes: dict) -> ResultEntry:
                 obj["dimensions_mm"] = dims
             else:
                 obj[key] = value
-        tmp = folder / "object.json.tmp"
-        tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        _write_object_json(folder, obj)
     return get_result(root, result_id)
+
+
+def set_category(root: Path, result_id: str, category: str) -> bool:
+    """
+    Writes ``category`` into the ``object.json`` of a finished object (the scanner calls it once the model is saved).
+    Returns True when written; never raises (an object without it still gets one from `infer_category`).
+    """
+    if category not in CATEGORIES:
+        log.warning("Not writing unknown category %r for %s.", category, result_id)
+        return False
+    try:
+        folder = _result_folder(root, result_id)
+        with _object_write_lock:
+            obj = _read_json(folder / "object.json")
+            if obj is None:
+                return False
+            obj["category"] = category
+            _write_object_json(folder, obj)
+        return True
+    except (ResultNotFoundError, OSError) as e:
+        log.warning("Could not write the category of %s: %s", result_id, e)
+        return False
+
+
+def _write_object_json(folder: Path, obj: dict) -> None:
+    """Saves object.json atomically (temporary file + rename); the caller holds _object_write_lock."""
+    tmp = folder / "object.json.tmp"
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, folder / "object.json")
 
 
 # Sub-folder of a result that keeps the scan photos it was built from (not served, not in the USB export)
@@ -160,9 +206,13 @@ def copy_photos(images_dir: Path, folder: Path) -> int:
     return copied
 
 
-def list_results(root: Path, offset: int = 0, limit: int = 20) -> ResultPage:
+def list_results(root: Path, offset: int = 0, limit: int = 20, category: str = "all",
+                 search: Optional[str] = None) -> ResultPage:
     """
     The finished objects, newest first (the folder name starts with the date), one page of them.
+
+    `category` (``"all"`` or one of CATEGORIES) and `search` (case-insensitive text in the title, the description or
+    the id) are applied before the page is cut, so ``total`` is the number of matching objects.
 
     A folder that is not a finished result (no valid `object.json`, `status.json` not ``ok``, still being written) is
     skipped and logged: it never fails the whole list. A missing results folder is an empty list.
@@ -173,10 +223,20 @@ def list_results(root: Path, offset: int = 0, limit: int = 20) -> ResultPage:
             if not folder.is_dir() or not is_valid_id(folder.name):
                 continue
             entry = _read_entry(folder)
-            if entry is not None:
+            if entry is not None and _matches(entry, category, search):
                 entries.append(entry)
     offset = max(0, offset)
     return ResultPage(items=entries[offset:offset + limit], total=len(entries), offset=offset, limit=limit)
+
+
+def _matches(entry: ResultEntry, category: str, search: Optional[str]) -> bool:
+    if category != "all" and entry.category != category:
+        return False
+    needle = (search or "").strip().casefold()
+    if not needle:
+        return True
+    haystack = (entry.id, entry.object.get("title"), entry.object.get("description"))
+    return any(isinstance(text, str) and needle in text.casefold() for text in haystack)
 
 
 def _result_folder(root: Path, result_id: str) -> Path:
@@ -211,4 +271,4 @@ def _read_entry(folder: Path) -> Optional[ResultEntry]:
         lods = [lod for lod in MODEL_LODS if (folder / sub / f"{lod}_model{fmt}").is_file()]
         if lods:
             models[fmt] = lods
-    return ResultEntry(id=folder.name, object=obj, models=models)
+    return ResultEntry(id=folder.name, object=obj, models=models, category=infer_category(obj, status))

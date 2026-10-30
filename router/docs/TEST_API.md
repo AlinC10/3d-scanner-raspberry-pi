@@ -28,6 +28,9 @@ Interactive OpenAPI docs are accessible at: `http://127.0.0.1:8000/docs#/Hardwar
 | **Sensors** | `GET` | `/test/tof` | Read the VL53L1X time-of-flight distance (mm) |
 | **Lighting** | `POST` | `/test/lights/enable` | Turn illumination LEDs ON (optional JSON body `{"brightness": 0.0-1.0}`) |
 | **Lighting** | `POST` | `/test/lights/disable` | Turn illumination LEDs OFF |
+| **Buzzer** | `GET` | `/test/buzzer` | Whether the buzzer works, its pin, the names of the sounds |
+| **Buzzer** | `POST` | `/test/buzzer/play` | Play one of the scanner's sounds (`{"pattern": "success"}`) |
+| **Buzzer** | `POST` | `/test/buzzer/tone` | Play one tone (`{"frequency_hz": 880, "duration_s": 0.5}`) |
 | **Motor State** | `GET` | `/test/motor/status` | Torque state (`enabled` / `disabled`) of both steppers |
 | **Motor State** | `POST` | `/test/motor/enable` | Energize the coils (`?target=turntable\|z_axis\|all`) |
 | **Motor State** | `POST` | `/test/motor/disable` | Release the coils (`?target=turntable\|z_axis\|all`) |
@@ -101,6 +104,26 @@ Turns the LED panels OFF (relay cut, PWM to 0). Refused with `409` while a scan 
        -H "Content-Type: application/json" \
        -d '{"brightness": 0.25}'
   ```
+
+---
+
+## 2b. Buzzer
+
+Allowed in any state (no motor and no light is involved); a test sound interrupts the sound playing. The answer comes at once, the sound plays in the background. `503` when the buzzer is not available (`BUZZER_GPIO_PIN=off`, gpiozero missing, pin busy); see `hardware/docs/BUZZER.md`.
+
+### `GET /test/buzzer`
+
+```json
+{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "success", "error"]}
+```
+
+### `POST /test/buzzer/play`
+
+Body `{"pattern": "success"}`: one of `ready`, `start`, `hold_still`, `success`, `error` (another value: `422`). Answer `{"status": "success", "pattern": "success"}`.
+
+### `POST /test/buzzer/tone`
+
+Body (optional) `{"frequency_hz": 880, "duration_s": 0.5}`: `110..1760` Hz (the range of the TonalBuzzer), `0 < duration_s <= 5`; out of range is a `422`. Answer `{"status": "success", "frequency_hz": 880.0, "duration_s": 0.5}`. Use it to check the wiring and the volume (try 440, 880 and 1760 Hz: a passive buzzer is loudest near its resonance, often 2-4 kHz, so the high tones may sound louder).
 
 ---
 

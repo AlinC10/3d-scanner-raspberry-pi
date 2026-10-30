@@ -75,6 +75,21 @@ or died without writing a status (likely OOM, asks for 1.5× RAM). `pipeline_err
  "error": "...", "required_gb": 0, "available_gb": 0, "resources": {...}, "timings_s": {...}}
 ```
 
+## progress.json (optional, written by the pod after each finished step)
+
+```json
+{"step": "3. Bridge SFM & Image Undistortion", "updated_at": 1761830000.0}
+```
+
+`step` is the name of the **last finished** pipeline step, as `telemetry.step(...)` names it in Turntable Studio's
+`main.py`. Once `started.json` is there the client reads it at every poll; each new step becomes one milestone
+(`on_phase`, mapped by its leading number in `job.POD_STEP_LABELS`, e.g. `3` -> "structure from motion (SfM) done").
+The scanner shows the milestones in `phase_message` and the polling / heartbeat lines in `cloud_message` (CLOUD-24).
+Without the file (an image built before it) only the client-side milestones appear: photos checked, cloud server
+created, reconstruction started, model downloaded. `clear_status()` removes it with `status.json` before a retry.
+**Not written yet by the Turntable Studio image**: the pod entry point (`runpod_job.py`) must upload it (output
+credentials, `r2.put_json`) at the end of each step, then the image must be rebuilt.
+
 ## Test from the laptop
 
 ```bash

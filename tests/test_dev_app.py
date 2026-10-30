@@ -95,6 +95,20 @@ with TestClient(app) as client:
     out["lights_during_scan"] = client.post("/test/lights/enable").status_code
     out["tof"] = client.get("/test/tof").json()["valid"]
     out["endstops"] = client.get("/test/endstops").json()
+    out["buzzer_status"] = client.get("/test/buzzer").json()
+    out["buzzer_play"] = client.post("/test/buzzer/play", json={"pattern": "success"}).status_code
+    out["buzzer_bad_pattern"] = client.post("/test/buzzer/play", json={"pattern": "siren"}).status_code
+    out["buzzer_tone"] = client.post("/test/buzzer/tone").json()
+    out["buzzer_bad_tone"] = client.post("/test/buzzer/tone", json={"frequency_hz": 5000}).status_code
+    out["buzzer_played"] = [p if isinstance(p, str) else list(p) for p in router.scanner.scanner.buzzer.played]
+    from hardware.buzzer import PATTERNS
+    from router.test import BuzzerPattern
+    import typing
+    out["buzzer_patterns_match"] = sorted(PATTERNS) == sorted(typing.get_args(BuzzerPattern))
+    router.scanner.scanner.buzzer.available = False
+    out["buzzer_missing"] = [client.post("/test/buzzer/play", json={"pattern": "ready"}).status_code,
+                             client.get("/test/buzzer").json()["available"]]
+    router.scanner.scanner.buzzer.available = True
 
     # scan -> completed
     start = client.post("/scanner/start", json={"job_id": None, "cloud": {"launch_runpod": False}})
@@ -173,6 +187,17 @@ class DevAppTest(unittest.TestCase):
         self.assertEqual((self.r["quality_query"], self.r["quality_body"]), (40, 70))
         self.assertEqual(self.r["quality_none"], 400)
         self.assertEqual(self.r["sync"], [True, True])
+
+    def test_buzzer_endpoints(self):
+        self.assertEqual(self.r["buzzer_status"],
+                         {"available": True, "pin": None, "patterns": ["ready", "start", "hold_still", "success", "error"]})
+        self.assertEqual(self.r["buzzer_play"], 200)
+        self.assertEqual(self.r["buzzer_bad_pattern"], 422)
+        self.assertEqual(self.r["buzzer_tone"], {"status": "success", "frequency_hz": 880.0, "duration_s": 0.5})
+        self.assertEqual(self.r["buzzer_bad_tone"], 422)
+        self.assertEqual(self.r["buzzer_played"], ["success", ["tone", 880.0, 0.5]])
+        self.assertTrue(self.r["buzzer_patterns_match"])
+        self.assertEqual(self.r["buzzer_missing"], [503, False])
 
     def test_the_manual_light_endpoint_is_refused_while_the_scan_owns_the_rig(self):
         self.assertEqual(self.r["lights_during_scan"], 409)

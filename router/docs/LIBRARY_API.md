@@ -10,7 +10,7 @@ A missing results folder is an empty list.
 
 | Method | Path | Answer |
 |---|---|---|
-| `GET` | `/library/objects?offset=0&limit=20` | One page of objects, newest first, without model files |
+| `GET` | `/library/objects?offset=0&limit=20&category=all&search=` | One page of objects, newest first, without model files (filtered by category / text) |
 | `GET` | `/library/objects/{id}` | One object (404 when it does not exist or is not finished) |
 | `GET` | `/library/objects/{id}/model?format=.glb&lod=low` | One model file |
 
@@ -19,11 +19,14 @@ A missing results folder is an empty list.
 `offset` >= 0 (default 0), `limit` 1..100 (default 20); another value is a 422. Continue with `offset=next_offset`
 until `next_offset` is `null`.
 
+`category` (`all` default, `object`, `face`) and `search` (text, max 120 chars, any case, found in the title, the description or the id) filter **before** the page is cut, so `total` and `next_offset` count only the matching objects; another `category` is a 422. Every item has `category`: `"object"` (turntable scan) or `"face"` (face scan), written in `object.json` by the scanner since 2026-10-30 and inferred for older objects (`"face"` when the face reconstruction made it, else `"object"`).
+
 ```json
 {
   "items": [
     {
       "id": "20261027-202750-21d2de",
+      "category": "object",
       "object": {"title": "Parkside", "dimensions_mm": {"length": 71.0, "width": 54.3, "height": 226.9}, "...": "..."},
       "models": {".glb": ["low", "high"], ".stl": ["low", "high"]}
     }

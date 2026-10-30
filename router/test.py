@@ -11,6 +11,7 @@ from router.scanner import scanner, ScannerState
 from hardware.endstop import TopEndstopTriggered, BottomEndstopTriggered
 from hardware.scanner import ScannerError
 from hardware.lights import LightLockedError
+from hardware.buzzer import PATTERNS as BUZZER_PATTERNS, MIN_FREQUENCY_HZ, MAX_FREQUENCY_HZ, MAX_TONE_S
 
 from hardware.motor import STEP_DELAY_MIN, STEP_DELAY_MAX
 from hardware.scanner import ScannerBusyError
@@ -64,6 +65,20 @@ class MotorTarget(str, Enum):
 
 
 from schemas.scanner import ZMoveRequest, TurntableRotateRequest
+
+# The sounds the scanner plays (hardware/buzzer.py PATTERNS; tests check that both lists are the same)
+BuzzerPattern = Literal["ready", "start", "hold_still", "success", "error"]
+
+
+class BuzzerPlayRequest(BaseModel):
+    pattern: Annotated[BuzzerPattern, Field(description="Sound to play: ready, start, hold_still, success, error.")]
+
+
+class BuzzerToneRequest(BaseModel):
+    frequency_hz: Annotated[float, Field(ge=MIN_FREQUENCY_HZ, le=MAX_FREQUENCY_HZ,
+                                         description="Tone frequency (110-1760 Hz).")] = 880.0
+    duration_s: Annotated[float, Field(gt=0.0, le=MAX_TONE_S, description="Tone length (at most 5 s).")] = 0.5
+
 
 class BrightnessRequest(BaseModel):
     brightness: Annotated[float, Field(
@@ -157,6 +172,50 @@ def test_lights_disable():
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to turn off lights: {str(e)}")
+
+
+# ── 2b. Buzzer ───────────────────────────────────────────────────────────────
+# Allowed in any state (no motor, no light): a test sound only interrupts the sound playing.
+
+def _buzzer():
+    """The scanner's buzzer, or 503 when it is missing or could not be opened."""
+    buzzer = getattr(scanner, "buzzer", None)
+    if buzzer is None or not getattr(buzzer, "available", False):
+        raise HTTPException(
+            status_code=503,
+            detail="The buzzer is not available (BUZZER_GPIO_PIN off, gpiozero missing or the pin could not be opened)."
+        )
+    return buzzer
+
+
+@router.get("/buzzer")
+def get_buzzer_status():
+    """Whether the buzzer works (`available`), its GPIO pin and the names of the sounds the scanner plays."""
+    buzzer = getattr(scanner, "buzzer", None)
+    return {
+        "available": bool(getattr(buzzer, "available", False)),
+        "pin": getattr(buzzer, "pin", None),
+        "patterns": list(BUZZER_PATTERNS),
+    }
+
+
+@router.post("/buzzer/play")
+def test_buzzer_play(req: BuzzerPlayRequest):
+    """Plays one of the scanner's sounds now (in the background: the answer does not wait for it). 503 without buzzer."""
+    buzzer = _buzzer()
+    buzzer.play(req.pattern)
+    return {"status": "success", "pattern": req.pattern}
+
+
+@router.post("/buzzer/tone")
+def test_buzzer_tone(req: BuzzerToneRequest = BuzzerToneRequest()):
+    """Plays one tone (default 880 Hz for 0.5 s) to check the wiring and the volume. 503 without buzzer."""
+    buzzer = _buzzer()
+    try:
+        buzzer.tone(req.frequency_hz, req.duration_s)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"status": "success", "frequency_hz": req.frequency_hz, "duration_s": req.duration_s}
 
 
 # ── 3. Motor State (Torque) ──────────────────────────────────────────────────

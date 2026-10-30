@@ -200,7 +200,7 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
      * The state becomes `COMPLETED` as soon as the photos are verified in R2. `cloud.runpod` is not imported or called, so a missing RunPod key or package does not matter. Download the photos from the bucket for the reconstruction (Turntable Studio).
    * **Stage 2 (Turntable Studio on RunPod - `PROCESSING`)** (only when `cloud.launch_runpod = true`, no confirmation asked):
      * `cloud.job.run_cloud_job(skip_upload=True)`: R2 preflight, plan of the pod (photo count and size -> RAM estimate `cloud/resources.py` x 1.3, vCPU, disk), termination of every `turntable-*` pod left by an older job, then one pod (`gpuTypePriority: "custom"`, GPU list `RUNPOD_GPU_TYPES`) with temporary R2 credentials limited to `jobs/<job_id>/` (read-only `input/`, read-write `output/`) that expire with the pod's runtime cap (`RUNPOD_POD_MAX_RUNTIME_S`, 1 h).
-     * Completion is read from `jobs/<job_id>/output/status.json`. Every pod is terminated in a `finally` (success, failure, timeout, cancel); at most `RUNPOD_MAX_POD_ATTEMPTS` (2) pods per job. `phase_message` shows the progress lines.
+     * Completion is read from `jobs/<job_id>/output/status.json`. Every pod is terminated in a `finally` (success, failure, timeout, cancel); at most `RUNPOD_MAX_POD_ATTEMPTS` (2) pods per job. `phase_message` changes only at milestones (photos checked, cloud server created, reconstruction started, each finished pipeline step the pod writes in `progress.json`, model downloading); the pod polling / heartbeat lines go to `cloud_message` (CLOUD-24).
      * `output.zip` is downloaded and extracted into `results/<job_id>/`, then `jobs/<job_id>/` is deleted from R2. On a failure the photos stay in R2 (retry) and the pod's `run_log.txt` is saved in `results/<job_id>/`.
    * **Stage 3 (Completion - `COMPLETED`)**: `result_id` in `/status` is the `/library` id of the model (= `job_id`). A failed job ends in `error` with `error` set.
 
@@ -375,7 +375,8 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
 | `mode` | `string \| null` | What the last prepare readied the rig for: `object` (`/scanner/prepare`), `face` (`/scanner/face/prepare`), `null` (none, or a manual `/test` session). Stays set after the run. |
 | `total_photos` | `int` | Photos captured so far (kept for backward compatibility). |
 | `phase` | `string \| null` | Finer progress inside a state, e.g. `preparing`, `scanning`, `uploading`, `verifying`, `done`. `null` when the scanner does not report it. |
-| `phase_message` | `string \| null` | Human readable detail of the phase. |
+| `phase_message` | `string \| null` | Human readable detail of the phase. In `processing` on RunPod: the last milestone (changes a few times per job). |
+| `cloud_message` | `string \| null` | In `processing` on RunPod: the last technical message (pod state, minutes elapsed, retries), updated every few seconds. `null` otherwise. |
 | `level` | `int` | Current ring (`0` = first). |
 | `photos_captured` | `int` | Photos taken by the cameras. |
 | `photos_uploaded` | `int` | Photos confirmed uploaded to R2. |
@@ -597,7 +598,7 @@ What it does: checks that MediaPipe, OpenCV and the face model are there (`400` 
 | `strategy` | `"sweep_best_score"` | `sweep_best_score`: climbs through the range and returns to the best height; `direct_stop`: stops as soon as both cameras see the face vertically centred; `none`: photo at the prepared height, no search. |
 | `search_range_mm` | `150.0` | How far above the prepared height the search goes (`10..250`); prepared height + range must stay `<= 475` mm (`422`). |
 | `step_mm` | `8.0` | Climb between two evaluations (`1..25`). |
-| `manual_z` | `null` | Explicit height (`200..475` mm); skips the search. |
+| `manual_z` | `null` | Explicit height (`150..250` mm); skips the search. |
 | `settle_s` | `0.150` | Pause before the photo (`0.05..2`). |
 | `z_delay` | `null` | Step delay (s) of this capture's Z moves; `null` keeps the prepare's `z_delay`. |
 | `reconstruct` | `true` | Build the 3D face model on the Pi after the photo (`rpi_face_mesh`); `false` = photos only. |

@@ -50,7 +50,7 @@ _FALLBACK_JPEG = base64.b64decode(
 _OBJECT_HEIGHT_MM = 220.0
 _TOF_OBJECT_MM = 300.0
 _TOF_BACKDROP_MM = 520.0
-_TOF_THRESHOLD_MM = 350.0   # same meaning as TOF_BACKGROUND_DISTANCE_MM in hardware/scanner.py
+_TOF_THRESHOLD_MM = 440.0   # same meaning as TOF_BACKGROUND_DISTANCE_MM in hardware/scanner.py
 _SIM_STEP_S = 0.05          # how long one simulated shot or short motion takes
 
 
@@ -151,6 +151,29 @@ class _FakeLights:
 
     def close(self):
         self._is_on = False
+
+
+class _FakeBuzzer:
+    """Stands for hardware/buzzer.py: logs the sounds instead of playing them (the manual /test/buzzer endpoints)."""
+    available = True
+    pin = None
+
+    def __init__(self):
+        self.played: list = []
+
+    def play(self, pattern: str) -> None:
+        log.info("[ScannerMock] Buzzer: %s", pattern)
+        self.played.append(pattern)
+
+    def tone(self, frequency_hz: float, duration_s: float) -> None:
+        from hardware.buzzer import MAX_FREQUENCY_HZ, MAX_TONE_S, MIN_FREQUENCY_HZ
+        if not MIN_FREQUENCY_HZ <= frequency_hz <= MAX_FREQUENCY_HZ or not 0 < duration_s <= MAX_TONE_S:
+            raise ValueError("Tone out of range.")
+        log.info("[ScannerMock] Buzzer: %.0f Hz for %.2f s", frequency_hz, duration_s)
+        self.played.append(("tone", frequency_hz, duration_s))
+
+    def close(self) -> None:
+        pass
 
 
 class _FakeToF:
@@ -271,6 +294,7 @@ class ScannerMock:
         self.down_endstop = _FakeEndstop()
         self.lights = _FakeLights()
         self.tof = _FakeToF(self)
+        self.buzzer = _FakeBuzzer()
         self.dual_cameras: Optional[_FakeCameras] = None
         self._update_endstops()
 
@@ -496,8 +520,8 @@ class ScannerMock:
             if strategy not in ("sweep_best_score", "direct_stop", "none"):
                 raise ValueError(f"Unknown strategy {strategy!r}")
             if manual_z is not None:
-                if manual_z < 200.0 or manual_z > Z_TRAVEL_MAX_MM:
-                    raise ValueError(f"manual_z must be between 200.0 mm and {Z_TRAVEL_MAX_MM} mm (got {manual_z})")
+                if manual_z < 150.0 or manual_z > 250.0:
+                    raise ValueError(f"manual_z must be between 150.0 mm and 250.0 mm (got {manual_z})")
             elif strategy != "none" and self.z_mm + search_range_mm > Z_TRAVEL_MAX_MM:
                 raise ValueError(
                     f"The search ends above the Z travel: carriage at {self.z_mm:g} mm + search_range_mm "

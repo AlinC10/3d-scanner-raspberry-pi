@@ -24,6 +24,7 @@ from .endstop import Endstop, TopEndstopTriggered, BottomEndstopTriggered
 from .motor import Motor, TURNTABLE_END_DELAY_DEFAULT, TURNTABLE_STEP_TYPE, Z_STEP_TYPE, angle_to_steps
 from .lights import DimmableLight
 from .tof import ToFSensor
+from .buzzer import Buzzer
 import cloud.cloudflare_r2 as r2
 from system import file_control as fc
 import statistics
@@ -100,7 +101,9 @@ MIN_FREE_DISK_MB = _env_float("SCAN_MIN_FREE_DISK_MB", 2048.0)
 # The attribute exposed in /status keeps only the first entries of the missing list; the manifest keeps all of them.
 MISSING_STATUS_CAP = 50
 
-TOF_BACKGROUND_DISTANCE_MM = 350
+# ToF threshold: a valid reading below it is the object, at or above it the backdrop. Between the far edge of the
+# turntable (~400-430 mm) and the enclosure door (~520 mm, measured on the rig), so an object anywhere on the plate counts.
+TOF_BACKGROUND_DISTANCE_MM = 440
 # Minimum pause after each turntable move before the next photo, so the object stops vibrating.
 TURNTABLE_SETTLE_S = 0.2
 # How often the Z-axis watchdog samples the limit switch in the direction of travel while the carriage moves.
@@ -209,8 +212,39 @@ class ScanPhase:
 
 T8_THREADED_ROD_STEP = 8 # mm
 
+# Buzzer pattern (hardware/buzzer.py PATTERNS) played when the scanner enters a state
+STATE_SOUNDS = {
+    ScannerState.PREPARED: "ready",
+    ScannerState.RUNNING: "start",
+    ScannerState.COMPLETED: "success",
+    ScannerState.ERROR: "error",
+    ScannerState.CANCELLED: "error",
+}
+
 
 class Scanner:
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        # Every state change goes through here, so the buzzer follows them all (routers set CANCELLED directly too)
+        changed = getattr(self, "_state", None) != value
+        self._state = value
+        if changed:
+            self._sound(STATE_SOUNDS.get(value))
+
+    def _sound(self, pattern: Optional[str]) -> None:
+        """Plays a buzzer pattern in the background; a missing buzzer or a failing sound is ignored."""
+        buzzer = getattr(self, "buzzer", None)
+        if pattern is None or buzzer is None:
+            return
+        try:
+            buzzer.play(pattern)
+        except Exception as e:
+            log.warning("[Scanner] Buzzer: %s", e)
+
     def __init__(self, xvs: Optional[bool] = None, camera_mode: Optional[str] = None):
         # A part that fails to open (for example the PWM chip when the overlay is missing) must not leave the parts
         # opened before it claimed: the pins, the I2C bus and the serial port would stay busy for the next attempt
@@ -232,6 +266,9 @@ class Scanner:
             log.error("[Scanner] Could not open the hardware (%s); releasing what was already opened.", e)
             self.close_hardware()
             raise
+
+        # Optional: never raises, silent when the pin or gpiozero is missing (see hardware/buzzer.py)
+        self.buzzer = Buzzer()
 
         self.dual_cameras: Optional[BaseDualCamera] = None
 
@@ -306,6 +343,7 @@ class Scanner:
         self.job_id: Optional[str] = None  # R2 prefix jobs/<job_id>/ and results/<job_id>/ of the current photo set
         self.result_id: Optional[str] = None  # /library id of the 3D model saved by the last run (cloud or face)
         self.phase_message: Optional[str] = None
+        self.cloud_message: Optional[str] = None   # technical detail of the RunPod job (router), apart from phase_message
         self.photos_uploaded = 0
         self.missing: list[str] = []
         self.error: Optional[str] = None
@@ -1291,6 +1329,7 @@ class Scanner:
         self.upload_verified = None
         self._phase_note = None
         self.phase_message = None
+        self.cloud_message = None
         self.face_result = None
         self.result_id = None
 
@@ -2124,8 +2163,8 @@ class Scanner:
         if strategy not in self.FACE_STRATEGIES:
             raise ValueError(f"strategy must be one of {self.FACE_STRATEGIES} (got {strategy!r})")
         if manual_z is not None:
-            if manual_z < 200.0 or manual_z > Z_TRAVEL_MAX_MM:
-                raise ValueError(f"manual_z must be between 200.0 mm and {Z_TRAVEL_MAX_MM} mm (got {manual_z})")
+            if manual_z < 150.0 or manual_z > 250.0:
+                raise ValueError(f"manual_z must be between 150.0 mm and 250.0 mm (got {manual_z})")
         elif strategy != "none" and current_z + search_range_mm > Z_TRAVEL_MAX_MM:
             raise ValueError(
                 f"The search ends above the Z travel: carriage at {current_z:g} mm + search_range_mm "
@@ -2347,7 +2386,7 @@ class Scanner:
         :param strategy: ``sweep_best_score``, ``direct_stop`` or ``none``.
         :param search_range_mm: How far above the prepared height the search goes.
         :param step_mm: Climb between two framing checks (whole motor steps).
-        :param manual_z: Explicit height in mm (>= 200); skips the search.
+        :param manual_z: Explicit height in mm (150 to 250); skips the search.
         :param settle_s: Mechanical damping pause in seconds before the photo (interrupted by a cancel).
         :param finish_state: State after a face scan that completed (default COMPLETED).
         :param analyzer: Optional StereoFramingAnalyzer (dependency injection; then nothing is built or closed here).
@@ -2425,6 +2464,7 @@ class Scanner:
                 roi = self._face_af_roi(best_eval)
                 if roi is not None:
                     lock_kwargs["autofocus_roi"] = roi
+                self._sound("hold_still")
                 self._lock_cameras(lock_kwargs, copy_colour_gains, f"face at Z={target_z:g} mm")
 
                 # Stabilization pause (a cancel ends it at once)
@@ -2741,6 +2781,7 @@ class Scanner:
             ("down_endstop", getattr(self, "down_endstop", None)),
             ("lights", getattr(self, "lights", None)),
             ("tof", getattr(self, "tof", None)),
+            ("buzzer", getattr(self, "buzzer", None)),
         )
         for name, component in components:
             if component and hasattr(component, "close"):

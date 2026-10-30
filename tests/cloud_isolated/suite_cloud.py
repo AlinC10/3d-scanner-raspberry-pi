@@ -278,6 +278,38 @@ class TestRunPod(unittest.TestCase):
                          boot_timeout_s=-1)
         self.assertEqual(run.outcome, "finished")
 
+    def test_milestones_once_each_and_progress_only_after_the_start(self):
+        api = FakeRunPod()
+        statuses = iter([None, None, None, None, {"state": "ok"}])
+        started = iter([False, True])
+        steps = iter(["3D reconstruction: cameras found", "3D reconstruction: cameras found",
+                      "3D reconstruction: 3D mesh built"])
+        progress_reads, phases, messages = [], [], []
+
+        def read_progress():
+            progress_reads.append(1)
+            return next(steps, "3D reconstruction: 3D mesh built")
+
+        run = rp.run_pod(api, self.body(), lambda: next(statuses), poll_s=0, read_started=lambda: next(started, True),
+                         on_phase=phases.append, read_progress=read_progress, on_progress=messages.append)
+        self.assertEqual(run.outcome, "finished")
+        self.assertEqual(phases, ["Cloud server created: loading the reconstruction software",
+                                  "3D reconstruction started in the cloud",
+                                  "3D reconstruction: cameras found", "3D reconstruction: 3D mesh built"])
+        self.assertEqual(len(progress_reads), 3)          # not before started.json
+        self.assertTrue(any(m.startswith("Pod ") for m in messages))
+        self.assertFalse(any(m.startswith("Pod ") for m in phases))
+
+    def test_pod_step_label(self):
+        from cloud.job import pod_step_label
+        self.assertEqual(pod_step_label({"step": "3. Bridge SFM & Image Undistortion"}),
+                         "3D reconstruction: structure from motion (SfM) done")
+        self.assertEqual(pod_step_label({"step": "4.2b Visual Hull Cloud Refinement"}),
+                         "3D reconstruction: dense point cloud computed")
+        self.assertEqual(pod_step_label({"step": "7. Something new"}), "3D reconstruction: 7. Something new")
+        for empty in (None, {}, {"step": ""}, {"step": 3}):
+            self.assertIsNone(pod_step_label(empty))
+
     def test_create_retries_then_gives_up(self):
         api = FakeRunPod(fail_creates=99)
         self.assertIsNone(rp.run_pod(api, self.body(), lambda: None, poll_s=0))

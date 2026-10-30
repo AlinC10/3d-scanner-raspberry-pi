@@ -98,6 +98,7 @@ Hardware constants and operational presets are centralized in [`hardware/camera/
 * `DEFAULT_QUALITY = 95`: High-quality JPEG compression level.
 * `AF_STEP = 30`: DAC step size during contrast-detection autofocus sweep.
 * `AF_ROI = (0.3, 0.3, 0.4, 0.4)`: Center 40% region of interest for Laplacian variance sharpness scoring.
+* `AF_DROP_FRACTION = 0.03`, `AF_MIN_RISE = 0.20`: early stop of the coarse sweep in `DualCameraRPISync`: a lens stops at the first position more than 3% below its best score so far, once that best is at least 20% above the score at position 0 (the flat blurred start of the range cannot stop it). The single-camera `ArducamIMX477.focus_sweep_autofocus` still sweeps the whole range.
 
 ---
 

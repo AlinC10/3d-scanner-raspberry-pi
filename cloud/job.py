@@ -94,6 +94,40 @@ def plan_job(input_dir: str, resolution_level: int = 1, min_vcpu: int = DEFAULT_
     }
 
 
+# Pipeline steps of Turntable Studio (the name it logs and writes in jobs/<id>/output/progress.json as "step", e.g.
+# "3. Bridge SFM & Image Undistortion") -> the milestone shown to the user when that step is finished. Matched by the
+# number the step name starts with; a step that is not listed is shown by its own name.
+POD_STEP_LABELS = {
+    "1": "cameras found",
+    "2": "turntable camera poses computed",
+    "2.5": "object masks computed",
+    "2.6": "visual hull computed",
+    "3": "structure from motion (SfM) done",
+    "4.1": "dense reconstruction prepared",
+    "4.2": "dense point cloud computed",
+    "4.3": "3D mesh built",
+    "4.4": "texturing done",
+    "5": "base sealed (watertight mesh)",
+    "5.5": "texturing images prepared",
+    "6": "models exported",
+}
+
+
+def pod_step_label(progress: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    The milestone message for a progress.json of the pod (``{"step": "<last finished step>", ...}``), or None when
+    there is none yet. Only the finished step is reported, so the message changes once per phase.
+    """
+    step = (progress or {}).get("step")
+    if not isinstance(step, str) or not step.strip():
+        return None
+    step = step.strip()
+    number = step.split(" ", 1)[0].rstrip(".")
+    number = number[:-1] if number[-1:].isalpha() else number   # "4.2b" -> "4.2"
+    label = POD_STEP_LABELS.get(number)
+    return f"3D reconstruction: {label or step}"
+
+
 def run_cloud_job(
     input_dir: str,
     results_dir: str = "results",
@@ -109,6 +143,7 @@ def run_cloud_job(
     on_progress: Optional[Callable[[str], None]] = None,
     image_prefix: str = "",
     terminate_old_pods: bool = True,
+    on_phase: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Runs one scan in the cloud. pipeline_options go to run_pipeline() in the pod (e.g. {"rig_mode": True,
@@ -116,10 +151,18 @@ def run_cloud_job(
     delete_stale_after_s: first delete the jobs/<id>/ folders left in R2 by older jobs untouched for that long
     (r2.delete_stale_jobs; 0 = every older job, None = keep them). This job and anything outside jobs/ (e.g. the
     scanner's own folder) are never touched.
+    on_progress gets every message (technical detail: pod polling, uploads...); on_phase only the milestones (photos
+    checked, cloud server created, reconstruction started, each finished pipeline step the pod reports in
+    progress.json, model downloaded), each one once.
     image_prefix: see plan_job. terminate_old_pods: first terminate every "turntable-*" pod of the account (an
     earlier job's pod left alive by a crash), so a new scan never runs next to a forgotten, billed pod.
     """
     say = on_progress or logger.info
+
+    def phase(message: str) -> None:
+        if on_phase is not None:
+            on_phase(message)
+
     options = dict(pipeline_options or {})
     image = image or os.environ.get(DEFAULT_IMAGE_ENV)
     bucket = r2.bucket_from_env()
@@ -162,6 +205,7 @@ def run_cloud_job(
         if missing:
             raise r2.R2Error(f"{len(missing)} photo(s) missing in R2, not starting a pod: {missing[:5]}")
         say("All photos are in R2.")
+        phase("Photos checked in the cloud storage: starting a cloud server")
 
     ttl = int(rp.POD_MAX_RUNTIME_S)
     job_spec = dict(options, job_id=job_id)
@@ -198,6 +242,7 @@ def run_cloud_job(
 
     status_key = r2.output_key(job_id, "status.json")
     started_key = r2.output_key(job_id, "started.json")
+    progress_key = r2.output_key(job_id, "progress.json")
 
     def read_status():
         return r2.get_json(status_key, bucket, client=client)
@@ -205,8 +250,11 @@ def run_cloud_job(
     def read_started() -> bool:
         return r2.get_json(started_key, bucket, client=client) is not None
 
+    def read_progress() -> Optional[str]:
+        return pod_step_label(r2.get_json(progress_key, bucket, client=client))
+
     def clear_status():
-        for key in (status_key, started_key):
+        for key in (status_key, started_key, progress_key):
             try:
                 client.delete_object(Bucket=bucket, Key=key)
             except (ClientError, BotoCoreError) as e:
@@ -222,7 +270,7 @@ def run_cloud_job(
     t0 = time.time()
     runs = rp.run_job_pods(rp_client, make_body, plan["min_ram_gb"], read_status,
                            cancel_event=cancel_event, on_progress=say, before_retry=clear_status,
-                           read_started=read_started)
+                           read_started=read_started, on_phase=on_phase, read_progress=read_progress)
     t["pods"] = round(time.time() - t0, 2)
     report["pods"] = [{
         "pod_id": r.pod_id, "outcome": r.outcome, "terminated": r.terminated, "elapsed_s": round(r.elapsed_s, 1),
@@ -243,6 +291,7 @@ def run_cloud_job(
                          str(Path(results_dir) / job_id / "run_log.txt"), bucket, client=client)
         return report
 
+    phase("3D reconstruction finished: downloading the model")
     t0 = time.time()
     dest = r2.download_job_output(job_id, str(Path(results_dir) / job_id), bucket, client=client)
     t["download"] = round(time.time() - t0, 2)

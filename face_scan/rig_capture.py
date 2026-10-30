@@ -78,7 +78,7 @@ Ready to be processed by photogrammetry (locally on Windows PC or on RunPod Clou
         "--manual-z",
         type=float,
         default=None,
-        help="Skip auto-framing and move carriage directly to a specified Z height in mm (>= 200.0 mm)",
+        help="Skip auto-framing and move carriage directly to a specified Z height in mm (150.0 to 250.0 mm)",
     )
     parser.add_argument(
         "--step-mm",

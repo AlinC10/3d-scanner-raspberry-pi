@@ -133,6 +133,7 @@ def reconstruct_face(
         raise FaceReconstructionError(failure)
 
     info["title"] = title or result_id
+    info["category"] = "face"
     (work_dir / "object.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     (work_dir / "status.json").write_text(json.dumps({
         "state": "ok", "mode": "mediapipe_face_mesh", "elapsed_s": round(time.monotonic() - started, 1),

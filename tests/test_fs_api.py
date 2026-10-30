@@ -137,7 +137,7 @@ class TestRequestSchemas(unittest.TestCase):
     def test_status_response_defaults_and_fields(self):
         self.assertEqual(self.r["status"], {
             "state": "idle", "mode": None, "total_photos": 0, "stream_urls": None, "phase": None, "phase_message": None,
-            "level": 0, "photos_captured": 0, "photos_uploaded": 0, "missing": [], "error": None,
+            "cloud_message": None, "level": 0, "photos_captured": 0, "photos_uploaded": 0, "missing": [], "error": None,
             "tof_warnings": [], "face_result": None, "job_id": None, "result_id": None, "seconds_since_last_upload": None,
             "upload_drain_timeout_s": None,
         })
@@ -544,6 +544,25 @@ class TestPipelineWithRunPod(_RouterCase):
         self.assertIs(kwargs["pipeline_options"]["rig_mode"], True)
         self.assertEqual(self.scanner.state, _State.COMPLETED)
         self.assertEqual(self.scanner.result_id, "20261030-101500-a1b2c3")
+
+    def test_pod_messages_go_to_cloud_message_and_only_milestones_to_phase_message(self):
+        seen = []
+
+        def run(kw):
+            kw["on_progress"]("Pod RUNNING | 2.5 min | ...")
+            seen.append((self.scanner.phase_message, self.scanner.cloud_message))
+            kw["on_phase"]("3D reconstruction: structure from motion (SfM) done")
+            kw["on_progress"]("Pod RUNNING | 3.0 min | ...")
+            seen.append((self.scanner.phase_message, self.scanner.cloud_message))
+            return {"result": "ok"}
+
+        job = _fake_cloud_job(run=run)
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=job)
+        self.assertEqual(seen, [
+            ("Preparing the 3D reconstruction in the cloud", "Pod RUNNING | 2.5 min | ..."),
+            ("3D reconstruction: structure from motion (SfM) done", "Pod RUNNING | 3.0 min | ..."),
+        ])
+        self.assertEqual(self.scanner.state, _State.COMPLETED)
 
     def test_flag_false_never_touches_the_cloud_job(self):
         job = _fake_cloud_job()

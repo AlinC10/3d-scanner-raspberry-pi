@@ -17,6 +17,8 @@ from hardware.camera.config import (
     DEFAULT_PREVIEW_RESOLUTION,
     AF_STEP,
     AF_ROI,
+    AF_DROP_FRACTION,
+    AF_MIN_RISE,
     VCM_MIN_POS,
     VCM_MAX_POS,
 )
@@ -838,24 +840,57 @@ class DualCameraRPISync(BaseDualCamera):
                     return None
                 self._cond.wait(min(remaining, 0.2))
 
+    def _sweep_step(self, targets: Dict[int, int], roi: tuple) -> Dict[int, float]:
+        """Moves the lenses in `targets` ({camera index: position}) together and scores one fresh frame of each."""
+        if not self._running or self._closing:
+            raise RuntimeError("Autofocus aborted: the cameras are being closed.")
+        moves = [self._executor.submit(self.cameras[c].focuser.set_position, pos, True) for c, pos in targets.items()]
+        for m in moves:
+            m.result()
+        scores = {}
+        for c, pos in targets.items():
+            # The frame in flight while the lens moved is not valid: wait for one that starts afterwards
+            frame = self._wait_af_frame(c, self._latest[c] + 2)
+            if frame is None:
+                raise RuntimeError(f"Autofocus: no fresh frame from camera {c + 1} at position {pos}.")
+            scores[c] = ArducamIMX477._sharpness(frame, _camera_roi(roi, c))
+        return scores
+
     def _sweep(self, positions: List[List[int]], roi: tuple) -> List[Dict[int, float]]:
         """Moves each lens through its own list of positions (same length) and scores a fresh frame at each stop."""
         scores: List[Dict[int, float]] = [{}, {}]
         for i in range(len(positions[0])):
-            if not self._running or self._closing:
-                raise RuntimeError("Autofocus aborted: the cameras are being closed.")
-            moves = [
-                self._executor.submit(cam.focuser.set_position, positions[c][i], True)
-                for c, cam in enumerate(self.cameras)
-            ]
-            for m in moves:
-                m.result()
-            for c in range(2):
-                # The frame in flight while the lens moved is not valid: wait for one that starts afterwards
-                frame = self._wait_af_frame(c, self._latest[c] + 2)
-                if frame is None:
-                    raise RuntimeError(f"Autofocus: no fresh frame from camera {c + 1} at position {positions[c][i]}.")
-                scores[c][positions[c][i]] = ArducamIMX477._sharpness(frame, _camera_roi(roi, c))
+            for c, score in self._sweep_step({c: positions[c][i] for c in range(2)}, roi).items():
+                scores[c][positions[c][i]] = score
+        return scores
+
+    @staticmethod
+    def _peak_passed(scores: Dict[int, float]) -> bool:
+        """
+        True when the last score of a coarse sweep is below the best one so far (by more than AF_DROP_FRACTION), after
+        the curve has risen by at least AF_MIN_RISE over its first score: the lens has just gone past the peak.
+        """
+        values = list(scores.values())
+        if len(values) < 2:
+            return False
+        first, best, last = values[0], max(values), values[-1]
+        risen = best - first >= AF_MIN_RISE * abs(first)
+        return risen and last < best - AF_DROP_FRACTION * abs(best)
+
+    def _coarse_sweep(self, positions: List[int], roi: tuple) -> List[Dict[int, float]]:
+        """
+        Sweeps both lenses from the start of `positions`; each lens stops as soon as its score drops after the peak
+        (`_peak_passed`), the other one goes on alone. A lens that never sees a drop visits every position.
+        """
+        scores: List[Dict[int, float]] = [{}, {}]
+        active = [True, True]
+        for pos in positions:
+            for c, score in self._sweep_step({c: pos for c in range(2) if active[c]}, roi).items():
+                scores[c][pos] = score
+                if self._peak_passed(scores[c]):
+                    active[c] = False
+            if not any(active):
+                break
         return scores
 
     def focus_sweep_autofocus(self, step: int = AF_STEP, roi: tuple = AF_ROI) -> List[int]:
@@ -863,9 +898,10 @@ class DualCameraRPISync(BaseDualCamera):
         ``roi`` is one (x, y, w, h) frame-fraction box for both cameras, or a pair of boxes (cam1, cam2), e.g. the face
         as each camera sees it.
 
-        Software autofocus over the RUNNING pipeline: both lenses sweep the VCM range (coarse step, then a fine pass
-        around each best position), scoring the Laplacian sharpness of the ROI in the lores frames the grab workers
-        already deliver (the cameras cannot be read twice). Each lens is left on its sharpest position, which is also
+        Software autofocus over the RUNNING pipeline: both lenses sweep the VCM range from 0 with a coarse step, each
+        stopping as soon as its score drops after the peak (`_coarse_sweep`), then a fine pass around each best
+        position, scoring the Laplacian sharpness of the ROI in the lores frames the grab workers already deliver (the
+        cameras cannot be read twice). Each lens is left on its sharpest position, which is also
         saved, so the focus found stays locked for the whole scan.
 
         :raises RuntimeError: if OpenCV or the stream is not available, no frame arrives, or the cameras close.
@@ -876,13 +912,15 @@ class DualCameraRPISync(BaseDualCamera):
             raise RuntimeError("Autofocus needs the cameras to be streaming (call prepare_scan first).")
         step = max(1, int(step))
         coarse = list(range(VCM_MIN_POS, VCM_MAX_POS + 1, step))
-        log.info("DualCameraRPISync: Autofocus sweep over %d positions (step %d)...", len(coarse), step)
+        log.info("DualCameraRPISync: Autofocus sweep over up to %d positions (step %d)...", len(coarse), step)
 
         self._af_frame = [None, None]
         self._af_active = [True, True]
         try:
-            first = self._sweep([coarse, coarse], roi)
+            first = self._coarse_sweep(coarse, roi)
             best = [max(s, key=s.get) for s in first]
+            log.info("DualCameraRPISync: Coarse sweep visited %d / %d positions (cam1, cam2 = %d, %d)",
+                     max(len(s) for s in first), len(coarse), len(first[0]), len(first[1]))
 
             fine_step = max(1, step // 5)
             offsets = list(range(-step, step + 1, fine_step))

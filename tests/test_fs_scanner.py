@@ -106,7 +106,17 @@ def record_history(scanner):
     history = {"state": [], "phase": []}
 
     def prop(name):
+        base = getattr(type(scanner), name, None)
+        if isinstance(base, property):
+            # Already a property (Scanner.state, which plays the buzzer): record and keep its behaviour
+            def set_base(self, value):
+                base.fset(self, value)
+                history[name].append(value)
+
+            return property(base.fget, set_base)
+
         slot = f"_rec_{name}"
+        scanner.__dict__[slot] = scanner.__dict__.pop(name)
 
         def get(self):
             return self.__dict__[slot]
@@ -118,8 +128,6 @@ def record_history(scanner):
         return property(get, set_)
 
     cls = type("RecordingScanner", (type(scanner),), {"state": prop("state"), "phase": prop("phase")})
-    scanner.__dict__["_rec_state"] = scanner.__dict__.pop("state")
-    scanner.__dict__["_rec_phase"] = scanner.__dict__.pop("phase")
     scanner.__class__ = cls
     return history
 

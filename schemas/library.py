@@ -23,6 +23,9 @@ def normalize_model_format(value: Any) -> Any:
 
 ModelFormat = Annotated[Literal[".glb", ".stl"], BeforeValidator(normalize_model_format)]
 ModelLod = Literal["low", "high"]
+# Kind of scan an object comes from (storage.results.CATEGORIES); "all" in the list filter
+ObjectCategory = Literal["object", "face"]
+CategoryFilter = Literal["all", "object", "face"]
 
 
 class ModelRequest(BaseModel):
@@ -34,6 +37,9 @@ class ModelRequest(BaseModel):
 class LibraryObject(BaseModel):
     """One finished object: `id` is its folder name, `object` its `object.json`, `models` the files present."""
     id: str
+    category: ObjectCategory = Field(
+        "object", description='"object" (turntable scan) or "face" (face scan); inferred for older objects.'
+    )
     object: dict[str, Any]
     models: dict[str, list[ModelLod]] = Field(
         default_factory=dict, description='Formats present and their levels of detail, e.g. {".glb": ["low", "high"]}.'
@@ -43,7 +49,7 @@ class LibraryObject(BaseModel):
 class LibraryPage(BaseModel):
     """`GET /library/objects`: one page of the finished objects, newest first."""
     items: list[LibraryObject]
-    total: int
+    total: int   # objects matching the category / search filter (all of them without a filter)
     offset: int
     limit: int
     next_offset: int | None = None   # offset of the next page; None when this is the last one

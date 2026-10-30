@@ -32,12 +32,12 @@ result = {
 
     "strategy_none": ok(lambda: FaceCaptureRequest(strategy="none")),
     "strategy_bad": ok(lambda: FaceCaptureRequest(strategy="fast")),
-    "manual_z_200": ok(lambda: FaceCaptureRequest(manual_z=200.0)),
-    "manual_z_199": ok(lambda: FaceCaptureRequest(manual_z=199.9)),
-    "manual_z_max": ok(lambda: FaceCaptureRequest(manual_z=float(Z_TRAVEL_MAX_MM))),
-    "manual_z_over_max": ok(lambda: FaceCaptureRequest(manual_z=float(Z_TRAVEL_MAX_MM) + 1.0)),
+    "manual_z_150": ok(lambda: FaceCaptureRequest(manual_z=150.0)),
+    "manual_z_149": ok(lambda: FaceCaptureRequest(manual_z=149.9)),
+    "manual_z_250": ok(lambda: FaceCaptureRequest(manual_z=250.0)),
+    "manual_z_251": ok(lambda: FaceCaptureRequest(manual_z=250.1)),
     "step_mm_0": ok(lambda: FaceCaptureRequest(step_mm=0.0)),
-    "manual_z_not_whole_steps": ok(lambda: FaceCaptureRequest(manual_z=200.005)),
+    "manual_z_not_whole_steps": ok(lambda: FaceCaptureRequest(manual_z=150.005)),
     "search_range_not_whole_steps": ok(lambda: FaceCaptureRequest(search_range_mm=100.001)),
     "step_not_whole_steps": ok(lambda: FaceCaptureRequest(step_mm=8.005)),
     # Moved to the face prepare (or removed): refused by the capture
@@ -88,10 +88,10 @@ class TestFaceScanSchemas(unittest.TestCase):
     def test_capture_validation(self):
         self.assertTrue(self.r["strategy_none"])
         self.assertFalse(self.r["strategy_bad"])
-        self.assertTrue(self.r["manual_z_200"])
-        self.assertFalse(self.r["manual_z_199"])
-        self.assertTrue(self.r["manual_z_max"])
-        self.assertFalse(self.r["manual_z_over_max"])
+        self.assertTrue(self.r["manual_z_150"])
+        self.assertFalse(self.r["manual_z_149"])
+        self.assertTrue(self.r["manual_z_250"])
+        self.assertFalse(self.r["manual_z_251"])
         self.assertFalse(self.r["step_mm_0"])
         self.assertFalse(self.r["manual_z_not_whole_steps"])
         self.assertFalse(self.r["search_range_not_whole_steps"])
@@ -416,7 +416,7 @@ class TestFaceScanScanner(unittest.TestCase):
         scanner = self._scanner()
         with patch.object(scanner, "move_z_up_distance", side_effect=scanner_module.TopEndstopTriggered("top")):
             with self.assertRaises(ScannerError):
-                self._run(scanner, manual_z=300.0)
+                self._run(scanner, manual_z=240.0)
         self.assertIn("top endstop was reached", scanner.error)
 
     def test_manual_z_and_none_need_no_face_detection(self):
@@ -457,7 +457,9 @@ class TestFaceScanScanner(unittest.TestCase):
         from hardware.scanner import ScannerBusyError, ScannerModeError, ScannerPreflightError, ScannerState
         scanner = self._scanner()
         with self.assertRaises(ValueError):
-            scanner.begin_face_scan(manual_z=150.0)
+            scanner.begin_face_scan(manual_z=140.0)
+        with self.assertRaises(ValueError):
+            scanner.begin_face_scan(manual_z=260.0)
         with self.assertRaises(ValueError):
             scanner.begin_face_scan(search_range_mm=300.0)     # 180 + 300 > travel
         with patch.object(scanner, "_face_detection_problem", return_value="MediaPipe is not installed"):

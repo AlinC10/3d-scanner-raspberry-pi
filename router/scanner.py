@@ -36,7 +36,7 @@ else:
     from hardware.scanner import Scanner, ScannerState
 from pathlib import Path
 from app_paths import results_directory
-from storage.results import copy_photos
+from storage.results import copy_photos, set_category
 # cloud.job / cloud.runpod are imported lazily (see _load_cloud_job): a missing RunPod configuration must not affect scans
 # that do not launch RunPod.
 
@@ -368,10 +368,20 @@ def _orchestrate_pipeline(req: StartRequest):
         # Untitled: the object is named after its folder (the job id), the same name as in results/ and on a USB export
         options["title"] = req.cloud.title or job_id
 
+        # Technical detail (pod polling every few seconds, uploads, retries) goes to `cloud_message`; `phase_message`
+        # changes only when a phase of the reconstruction is finished, so the screen shows a steady progress (CLOUD-24)
         def _progress(message: str) -> None:
             log.info("[Cloud %s] %s", job_id, message)
             if scanner.state == ScannerState.PROCESSING:
+                scanner.cloud_message = message
+
+        def _phase(message: str) -> None:
+            log.info("[Cloud %s] Phase: %s", job_id, message)
+            if scanner.state == ScannerState.PROCESSING:
                 scanner.phase_message = message
+
+        scanner.cloud_message = None
+        _phase("Preparing the 3D reconstruction in the cloud")
 
         report = cloud_job.run_cloud_job(
             input_dir=str(Path(scanner.images_dir).parent),
@@ -383,6 +393,7 @@ def _orchestrate_pipeline(req: StartRequest):
             skip_upload=True,
             cancel_event=scanner._cancel_event,
             on_progress=_progress,
+            on_phase=_phase,
         )
 
         if _cancel_requested() or scanner.state == ScannerState.CANCELLED:
@@ -397,6 +408,7 @@ def _orchestrate_pipeline(req: StartRequest):
 
         # 4. The result is already extracted in results/<job_id>/ (served by /library); the photos are kept beside it
         copy_photos(Path(scanner.images_dir), results_directory() / job_id)
+        set_category(results_directory(), job_id, "object")
         scanner.result_id = job_id
         if _set_state_unless_cancelled(ScannerState.COMPLETED):
             log.info("Full pipeline completed: model in %s (cost estimate %s).",
@@ -572,6 +584,7 @@ def get_status():
         face_result=_face_result(),
         job_id=_text("job_id"),
         result_id=_text("result_id"),
+        cloud_message=_text("cloud_message"),
         **_upload_progress(),
     )
 

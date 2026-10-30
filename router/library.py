@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from app_paths import results_directory
-from schemas.library import (LibraryObject, LibraryPage, ModelRequest, UpdateObjectRequest, UsbDrive,
+from schemas.library import (CategoryFilter, LibraryObject, LibraryPage, ModelRequest, UpdateObjectRequest, UsbDrive,
                              UsbExportRequest, UsbExportStatus, BluetoothExportRequest, BluetoothExportStatus)
 from storage import results
 from system import bluetooth as bt, bluetooth_export, usb
@@ -22,12 +22,15 @@ MAX_PAGE_SIZE = 100
 def list_objects(
     offset: Annotated[int, Query(ge=0, description="Index of the first object to return.")] = 0,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE, description="How many objects to return.")] = 20,
+    category: Annotated[CategoryFilter, Query(description='"all", "object" or "face".')] = "all",
+    search: Annotated[str | None, Query(max_length=120, description="Text in the title, description or id (any case).")] = None,
 ):
     """
-    The finished 3D objects, newest first: their id and `object.json`, and which models exist. No model file is
-    sent here; ask for one with `GET /library/objects/{id}/model`. Continue with `offset=next_offset` until it is null.
+    The finished 3D objects, newest first: their id, category and `object.json`, and which models exist. No model file
+    is sent here; ask for one with `GET /library/objects/{id}/model`. Continue with `offset=next_offset` until it is
+    null. `category` and `search` filter before the page is cut: `total` counts the matching objects.
     """
-    page = results.list_results(results_directory(), offset=offset, limit=limit)
+    page = results.list_results(results_directory(), offset=offset, limit=limit, category=category, search=search)
     return LibraryPage(
         items=[LibraryObject(**entry.as_dict()) for entry in page.items],
         total=page.total, offset=page.offset, limit=page.limit, next_offset=page.next_offset,

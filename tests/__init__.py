@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 
 # No pause after the homing in the tests (the real one is 1 s); the tests of the pause itself patch the constant
 os.environ.setdefault("SCAN_Z_HOME_SETTLE_S", "0")
+# No buzzer in the tests (no GPIO on a PC; tests/test_buzzer.py uses a fake device)
+os.environ.setdefault("BUZZER_GPIO_PIN", "off")
 
 # Mock hardware, camera, and cloud dependencies for test runs without hardware
 for mod in [

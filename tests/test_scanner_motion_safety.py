@@ -512,5 +512,26 @@ class TestFoundBugs(unittest.TestCase):
         self.s._end_z_motion(None)
 
 
+class TestStateSounds(unittest.TestCase):
+    """Every state change plays its buzzer pattern once; a broken buzzer never breaks the state change."""
+
+    def setUp(self):
+        self.s = make_scanner()
+        self.s.buzzer = MagicMock()
+
+    def test_each_state_plays_its_pattern_once(self):
+        S = scanner_module.ScannerState
+        for state in (S.PREPARING, S.PREPARED, S.PREPARED, S.RUNNING, S.PROCESSING, S.COMPLETED, S.ERROR,
+                      S.CANCELLED):
+            self.s.state = state
+        played = [c.args[0] for c in self.s.buzzer.play.call_args_list]
+        self.assertEqual(played, ["ready", "start", "success", "error", "error"])
+
+    def test_buzzer_failure_is_ignored(self):
+        self.s.buzzer.play.side_effect = RuntimeError("gpio")
+        self.s.state = scanner_module.ScannerState.ERROR
+        self.assertEqual(self.s.state, scanner_module.ScannerState.ERROR)
+
+
 if __name__ == "__main__":
     unittest.main()
