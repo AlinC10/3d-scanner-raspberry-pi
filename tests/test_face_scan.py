@@ -77,10 +77,11 @@ class TestFaceScanSchemas(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(self.r["capture_defaults"], {
             "strategy": "sweep_best_score", "search_range_mm": 150.0, "step_mm": 8.0, "manual_z": None,
-            "settle_s": 0.150,
+            "settle_s": 0.150, "z_delay": None, "reconstruct": True,
         })
         self.assertEqual(self.r["prepare_defaults"], {
-            "enable_stream": True, "illumination_brightness": 0.5, "start_z_mm": 180.0, "upload_r2": True,
+            "enable_stream": True, "illumination_brightness": 0.5, "start_z_mm": 180.0, "upload_r2": False,
+            "z_delay": 0.005,
         })
         self.assertEqual(self.r["prepare_focus"], "auto")
 
@@ -113,7 +114,7 @@ class TestFaceScanSchemas(unittest.TestCase):
         self.assertEqual(self.r["response_state"], "running")
         self.assertEqual(self.r["result_default"], {
             "optimal_z_mm": None, "best_score": None, "face_detected": None, "warning": None, "photos": [],
-            "r2_uploaded": False,
+            "r2_uploaded": False, "result_id": None, "metrics": None, "reconstruction_error": None,
         })
         self.assertEqual(self.r["status_face_result"]["mode"], "face")
         self.assertFalse(self.r["status_face_result"]["face_result"]["face_detected"])
@@ -260,8 +261,54 @@ class TestFaceScanScanner(unittest.TestCase):
         with patch.object(scanner, "_register_photos"), patch.object(scanner, "_drain_and_verify") as drain, \
                 patch.object(scanner, "start_upload_worker"), patch.object(scanner, "stop_upload_worker"), \
                 patch.object(scanner, "_face_detection_problem", return_value=None):
+            kwargs.setdefault("reconstruct", False)   # the 3D reconstruction has its own tests (TestFaceReconstruction)
             result = scanner.face_scan(**kwargs)
         return result, drain
+
+    def test_z_moves_use_the_prepare_delay_and_a_capture_may_override_it(self):
+        from hardware.scanner import FACE_Z_DELAY_DEFAULT_S
+        scanner = self._scanner()
+        self.assertEqual(scanner._face_z_delay, FACE_Z_DELAY_DEFAULT_S)
+        delays = []
+        with patch.object(scanner, "move_z_up_distance",
+                          side_effect=lambda distance, delay, acceleration: (delays.append(delay), True)[1]):
+            self._run(scanner, strategy="none", manual_z=200.0, z_delay=0.01)
+        self.assertTrue(delays)
+        self.assertEqual(set(delays), {0.01})
+
+    def test_reconstruction_runs_on_the_pair_in_processing_and_its_result_is_published(self):
+        scanner = self._scanner()
+        info = {"dimensions_mm": {"width": 150.0}, "interpupillary_distance_mm": 63.0, "fit_rms_mm": {}}
+        seen = []
+
+        def reconstruct(*args, **kwargs):
+            seen.append((scanner.state, scanner.phase))
+            return info
+
+        with patch("hardware.face_reconstruction.reconstruct_face", side_effect=reconstruct) as rec:
+            result, _ = self._run(scanner, strategy="none", reconstruct=True)
+        self.assertEqual(seen, [("processing", "reconstructing_face")])
+        left, right = rec.call_args.args[:2]
+        self.assertEqual((left, right), ("/tmp/rig/0/f_180.jpg", "/tmp/rig/1/f_180.jpg"))
+        self.assertEqual(rec.call_args.args[3], scanner.job_id)
+        self.assertEqual(result["result_id"], scanner.job_id)
+        self.assertEqual(scanner.result_id, scanner.job_id)
+        self.assertEqual(scanner.face_result["metrics"]["interpupillary_distance_mm"], 63.0)
+        self.assertEqual(scanner.state, "completed")
+
+    def test_a_failed_reconstruction_ends_in_error_with_the_reason(self):
+        from hardware.face_reconstruction import FaceReconstructionError
+        from hardware.scanner import ScannerError
+        scanner = self._scanner()
+        with patch("hardware.face_reconstruction.reconstruct_face", side_effect=FaceReconstructionError("no face")):
+            with self.assertRaises(ScannerError):
+                self._run(scanner, strategy="none", reconstruct=True)
+        self.assertEqual(scanner.state, "error")
+        self.assertEqual(scanner.phase, "error")
+        self.assertIn("no face", scanner.error)
+        self.assertEqual(scanner.face_result["reconstruction_error"], "no face")
+        self.assertEqual(len(scanner.face_result["photos"]), 2)   # the photos are kept
+        self.assertIsNone(scanner.result_id)
 
     def test_sweep_starts_from_the_prepared_height_without_homing_and_locks_on_the_face(self):
         from face_scan.core.framing_analyzer import StereoFramingAnalyzer
@@ -559,3 +606,66 @@ class TestFaceScanRouter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFaceReconstruction(unittest.TestCase):
+    """hardware.face_reconstruction with a scripted reconstruct_3d.py (no MediaPipe needed)."""
+
+    SCRIPT = (
+        "import argparse, json, os, sys, time\n"
+        "p = argparse.ArgumentParser(); p.add_argument('-l'); p.add_argument('-r'); p.add_argument('-o')\n"
+        "p.add_argument('--name'); a = p.parse_args()\n"
+        "mode = os.environ.get('FAKE_MODE', 'ok')\n"
+        "print('Scanning stereo face pair: x and y...', flush=True)\n"
+        "if mode == 'fail': sys.exit(3)\n"
+        "if mode == 'hang': time.sleep(30)\n"
+        "print('Deforming 3D facial geometry from stereo landmarks...', flush=True)\n"
+        "os.makedirs(os.path.join(a.o, 'glb'), exist_ok=True)\n"
+        "open(os.path.join(a.o, 'glb', 'low_' + a.name + '.glb'), 'wb').write(b'g')\n"
+        "json.dump({'title': a.name, 'interpupillary_distance_mm': 63.0}, open(os.path.join(a.o, 'object.json'), 'w'))\n"
+    )
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        import hardware.face_reconstruction as fr
+        self.fr = fr
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "mesh").mkdir()
+        (self.tmp / "mesh" / "reconstruct_3d.py").write_text(self.SCRIPT)
+        self.results = self.tmp / "results"
+        self.patch = patch.object(fr, "FACE_MESH_DIR", self.tmp / "mesh")
+        self.patch.start()
+
+    def tearDown(self):
+        import shutil
+        self.patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_it(self, mode, **kwargs):
+        with patch.dict(os.environ, {"FAKE_MODE": mode}):
+            return self.fr.reconstruct_face("l.jpg", "r.jpg", self.results, "20261030-101500-abcdef", **kwargs)
+
+    def test_success_is_a_library_entry_and_the_steps_are_reported(self):
+        steps = []
+        info = self.run_it("ok", on_progress=steps.append)
+        folder = self.results / "20261030-101500-abcdef"
+        self.assertEqual(json.loads((folder / "status.json").read_text())["state"], "ok")
+        self.assertTrue((folder / "glb" / "low_model.glb").is_file())
+        self.assertEqual(info["interpupillary_distance_mm"], 63.0)
+        self.assertIn("Detecting face landmarks...", steps)
+        self.assertIn("Computing 3D geometry & depth...", steps)
+        self.assertFalse((self.results / ".20261030-101500-abcdef.partial").exists())
+
+    def test_failure_leaves_no_library_entry(self):
+        with self.assertRaises(self.fr.FaceReconstructionError):
+            self.run_it("fail")
+        self.assertFalse((self.results / "20261030-101500-abcdef").exists())
+
+    def test_cancel_kills_the_process(self):
+        import threading
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        with self.assertRaises(self.fr.FaceReconstructionError) as ctx:
+            self.run_it("hang", cancel_event=cancel)
+        self.assertIn("cancelled", str(ctx.exception))

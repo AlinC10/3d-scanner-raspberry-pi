@@ -50,8 +50,12 @@ print(json.dumps({
     "unknown_turntable": ok(lambda: TurntableScanConfig(angel=18.0)),
     "unknown_z_axis": ok(lambda: ZAxisScanConfig(distnce_mm=10.0)),
     "known_keys_ok": ok(lambda: StartRequest(
-        job_id="x", mechanical={"turntable": {"angle": 18.0}, "z_axis": {"distance_mm": 50.0}},
-        cloud={"launch_runpod": True, "resolution_mp": 12.33})),
+        job_id="20261030-101500-a1b2c3", mechanical={"turntable": {"angle": 18.0}, "z_axis": {"distance_mm": 50.0}},
+        cloud={"launch_runpod": True, "resolution_level": 2, "title": "vase"})),
+    "job_id_library_format": ok(lambda: StartRequest(job_id="20261030-101500-a1b2c3")),
+    "job_id_other_format": ok(lambda: StartRequest(job_id="job-1")),
+    "job_id_default": StartRequest().job_id,
+    "meshroom_field_refused": ok(lambda: CloudConfig(resolution_mp=12.0)),
 
     "legacy_clockwise": ok(lambda: TurntableScanConfig(clockwise=True)),
     "legacy_direction": ok(lambda: ZAxisScanConfig(direction="up")),
@@ -64,12 +68,10 @@ print(json.dumps({
     "test_z_unchanged": ok(lambda: ZMoveRequest(distance_mm=10.0, direction="down")),
     "camera_extra_keys_ok": ok(lambda: DualCameraConfig(some_frontend_key=1)),
 
-    "mp_12": ok(lambda: CloudConfig(resolution_mp=12.0)),
-    "mp_12_33": ok(lambda: CloudConfig(resolution_mp=12.33)),
-    "mp_13": ok(lambda: CloudConfig(resolution_mp=13.0)),
-    "mp_13_5": ok(lambda: CloudConfig(resolution_mp=13.5)),
-    "mp_0": ok(lambda: CloudConfig(resolution_mp=0.0)),
-    "mp_default": CloudConfig().resolution_mp,
+    "level_0": ok(lambda: CloudConfig(resolution_level=0)),
+    "level_3": ok(lambda: CloudConfig(resolution_level=3)),
+    "level_4": ok(lambda: CloudConfig(resolution_level=4)),
+    "level_default": CloudConfig().resolution_level,
 
     "brightness_0": ok(lambda: PrepareRequest(illumination_brightness=0.0, camera_config={})),
     "brightness_small": ok(lambda: PrepareRequest(illumination_brightness=0.05, camera_config={})),
@@ -92,9 +94,9 @@ class TestRequestSchemas(unittest.TestCase):
             raise RuntimeError(done.stderr[-2000:])
         cls.r = json.loads(done.stdout.strip().splitlines()[-1])
 
-    def test_launch_runpod_defaults_to_false_and_accepts_both_values(self):
-        self.assertIs(self.r["launch_default"], False)
-        self.assertIs(self.r["start_default_launch"], False)
+    def test_launch_runpod_defaults_to_true_and_accepts_both_values(self):
+        self.assertIs(self.r["launch_default"], True)
+        self.assertIs(self.r["start_default_launch"], True)
         self.assertIs(self.r["launch_true"], True)
         self.assertIs(self.r["launch_false"], False)
 
@@ -116,13 +118,15 @@ class TestRequestSchemas(unittest.TestCase):
         self.assertTrue(self.r["test_z_unchanged"])
         self.assertTrue(self.r["camera_extra_keys_ok"])
 
-    def test_resolution_accepts_the_real_sensor_value(self):
-        self.assertTrue(self.r["mp_12"])
-        self.assertTrue(self.r["mp_12_33"])
-        self.assertTrue(self.r["mp_13"])
-        self.assertFalse(self.r["mp_13_5"])
-        self.assertFalse(self.r["mp_0"])
-        self.assertEqual(self.r["mp_default"], 12.0)
+    def test_cloud_resolution_level_and_job_id(self):
+        self.assertTrue(self.r["level_0"])
+        self.assertTrue(self.r["level_3"])
+        self.assertFalse(self.r["level_4"])
+        self.assertEqual(self.r["level_default"], 1)
+        self.assertFalse(self.r["meshroom_field_refused"])
+        self.assertTrue(self.r["job_id_library_format"])
+        self.assertFalse(self.r["job_id_other_format"])
+        self.assertIsNone(self.r["job_id_default"])
 
     def test_zero_brightness_is_rejected(self):
         self.assertFalse(self.r["brightness_0"])
@@ -134,7 +138,7 @@ class TestRequestSchemas(unittest.TestCase):
         self.assertEqual(self.r["status"], {
             "state": "idle", "mode": None, "total_photos": 0, "stream_urls": None, "phase": None, "phase_message": None,
             "level": 0, "photos_captured": 0, "photos_uploaded": 0, "missing": [], "error": None,
-            "tof_warnings": [], "face_result": None, "seconds_since_last_upload": None,
+            "tof_warnings": [], "face_result": None, "job_id": None, "result_id": None, "seconds_since_last_upload": None,
             "upload_drain_timeout_s": None,
         })
         full = self.r["status_full"]
@@ -203,6 +207,10 @@ class _FakeScanner:
 
     def __init__(self):
         self.state = _State.PREPARED
+        self.job_id = "20261030-101500-a1b2c3"
+        self.images_dir = "/tmp/input_images/rig"
+        self.phase_message = None
+        self.error = None
         self._lock = threading.Lock()
         self._cancel_event = threading.Event()
         self._stopping = False
@@ -235,17 +243,22 @@ class _FakeScanner:
             self._cancel_event.set()
 
 
-def _fake_runpod(api_key="key", image="me/meshroom:1", launch=None):
-    mod = types.ModuleType("cloud.runpod")
-    mod.RUNPOD_API_KEY = api_key
-    mod.IMAGE_NAME = image
-    mod.launch_calls = []
+_CLOUD_ENV = {name: "x" for name in ("RUNPOD_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_R2_API_TOKEN",
+                                       "R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+                                       "TURNTABLE_IMAGE")}
 
-    def launch_job(job, cancel_event=None):
-        mod.launch_calls.append(job)
-        return launch(job) if launch else True
 
-    mod.launch_job = launch_job
+def _fake_cloud_job(run=None):
+    """Stands in for cloud.job: run_cloud_job records its arguments; `run(kwargs)` scripts the report."""
+    mod = types.ModuleType("cloud.job")
+    mod.DEFAULT_IMAGE_ENV = "TURNTABLE_IMAGE"
+    mod.calls = []
+
+    def run_cloud_job(**kwargs):
+        mod.calls.append(kwargs)
+        return run(kwargs) if run else {"result": "ok", "results_dir": "results/x", "cost_estimate": 0.1}
+
+    mod.run_cloud_job = run_cloud_job
     return mod
 
 
@@ -295,9 +308,8 @@ def _start_req(launch_runpod=False):
                                 decel_percent=None, end_delay=0.015)
     z_axis = SimpleNamespace(distance_mm=100.0, delay=0.001, acceleration=False, start_delay=None, ramp_percent=0.2,
                              decel_percent=None, end_delay=None)
-    cloud = SimpleNamespace(launch_runpod=launch_runpod, resolution_mp=12.0, mode="rig", depthmap_downscale=2,
-                            max_input_points=10_000_000)
-    return SimpleNamespace(job_id="job-1", mechanical=SimpleNamespace(turntable=turntable, z_axis=z_axis),
+    cloud = SimpleNamespace(launch_runpod=launch_runpod, resolution_level=1, title=None)
+    return SimpleNamespace(job_id=None, mechanical=SimpleNamespace(turntable=turntable, z_axis=z_axis),
                            cloud=cloud)
 
 
@@ -305,12 +317,11 @@ class _RouterCase(unittest.TestCase):
     def setUp(self):
         self.scanner = _FakeScanner()
         self.r2 = MagicMock()
-        self.r2.download_generated_obj.return_value = True
         self.mod = _load_router(self.scanner, self.r2)
 
-    def run_pipeline(self, req, runpod=None):
-        """Runs the orchestrator; `runpod=None` makes `import cloud.runpod` fail like a missing package would."""
-        with patch.dict(sys.modules, {"cloud.runpod": runpod}):
+    def run_pipeline(self, req, cloud_job=None):
+        """Runs the orchestrator; `cloud_job=None` makes `import cloud.job` fail like a missing package would."""
+        with patch.dict(sys.modules, {"cloud.job": cloud_job}):
             self.mod._orchestrate_pipeline(req)
 
 
@@ -437,17 +448,15 @@ class TestFocusValidation(unittest.TestCase):
 
 class TestPipelineWithoutRunPod(_RouterCase):
     def test_flag_false_completes_without_touching_runpod(self):
-        self.run_pipeline(_start_req(launch_runpod=False), runpod=None)  # importing cloud.runpod would raise
+        self.run_pipeline(_start_req(launch_runpod=False), cloud_job=None)  # importing cloud.job would raise
         self.assertEqual(self.scanner.state, _State.COMPLETED)
         self.assertEqual(len(self.scanner.scan_calls), 1)
-        self.r2.download_generated_obj.assert_not_called()
         self.assertFalse(self.mod._start_state["pending"])
 
     def test_flag_false_ignores_a_broken_runpod_module(self):
-        broken = _fake_runpod(api_key=None, image="yourdockerhubuser/meshroom-runner:latest")
-        self.run_pipeline(_start_req(launch_runpod=False), runpod=broken)
+        broken = types.ModuleType("cloud.job")   # no run_cloud_job at all
+        self.run_pipeline(_start_req(launch_runpod=False), cloud_job=broken)
         self.assertEqual(self.scanner.state, _State.COMPLETED)
-        self.assertEqual(broken.launch_calls, [])
 
     def test_cancel_during_the_scan_stays_cancelled(self):
         self.scanner.on_scan = lambda s: s.cancel()
@@ -474,7 +483,7 @@ class TestUploadVerificationFailure(_RouterCase):
     def test_upload_error_ends_in_error(self):
         self._raise(_ScannerUploadError("2 photos missing", missing=["rig/a.jpg", "rig/b.jpg"]))
         with self.assertLogs(self.mod.log, level="ERROR") as logs:
-            self.run_pipeline(_start_req(launch_runpod=True), runpod=_fake_runpod())
+            self.run_pipeline(_start_req(launch_runpod=True), cloud_job=_fake_cloud_job())
         self.assertEqual(self.scanner.state, _State.ERROR)
         self.assertIn("rig/a.jpg", "\n".join(logs.output))
         self.assertFalse(self.mod._start_state["pending"])
@@ -518,55 +527,53 @@ class TestUploadVerificationFailure(_RouterCase):
 
 
 class TestPipelineWithRunPod(_RouterCase):
-    def test_flag_true_runs_the_whole_old_flow(self):
-        runpod = _fake_runpod()
+    def test_flag_true_runs_turntable_studio_on_the_uploaded_photos(self):
         seen = []
-        runpod.launch_job = lambda job, cancel_event=None: (seen.append((dict(job), self.scanner.state)), True)[1]
-        self.run_pipeline(_start_req(launch_runpod=True), runpod=runpod)
-        job, state_during = seen[0]
-        self.assertEqual(state_during, _State.PROCESSING)
-        self.assertEqual(job["job_id"], "job-1")
-        self.assertEqual(job["photo_count"], 40)
-        self.assertEqual(job["mode"], "rig")
-        self.r2.download_generated_obj.assert_called_once()
-        self.assertEqual(self.r2.download_generated_obj.call_args.kwargs["object_name"], "output.zip")
+        job = _fake_cloud_job(run=lambda kw: (seen.append(self.scanner.state), {"result": "ok"})[1])
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=job)
+        kwargs = job.calls[0]
+        self.assertEqual(seen, [_State.PROCESSING])
+        self.assertEqual(kwargs["job_id"], "20261030-101500-a1b2c3")
+        self.assertIs(kwargs["skip_upload"], True)       # the scan already uploaded and verified them
+        self.assertIs(kwargs["dry_run"], False)          # no confirmation
+        self.assertEqual((kwargs["input_dir"], kwargs["image_prefix"]), ("/tmp/input_images", "rig/"))
+        self.assertIs(kwargs["cancel_event"], self.scanner._cancel_event)
+        self.assertEqual(kwargs["pipeline_options"]["resolution_level"], 1)
+        self.assertEqual(kwargs["pipeline_options"]["lift_mm"], 100.0)
+        self.assertEqual(kwargs["pipeline_options"]["step_deg"], 18.0)
+        self.assertIs(kwargs["pipeline_options"]["rig_mode"], True)
+        self.assertEqual(self.scanner.state, _State.COMPLETED)
+        self.assertEqual(self.scanner.result_id, "20261030-101500-a1b2c3")
+
+    def test_flag_false_never_touches_the_cloud_job(self):
+        job = _fake_cloud_job()
+        self.run_pipeline(_start_req(launch_runpod=False), cloud_job=job)
+        self.assertEqual(job.calls, [])
         self.assertEqual(self.scanner.state, _State.COMPLETED)
 
-    def test_runpod_failure_ends_in_error(self):
-        self.run_pipeline(_start_req(launch_runpod=True), runpod=_fake_runpod(launch=lambda job: False))
+    def test_failed_job_ends_in_error_with_the_reason(self):
+        job = _fake_cloud_job(run=lambda kw: {"result": "failed", "status": {"state": "pipeline_error",
+                                                                              "error": "no poses"}})
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=job)
         self.assertEqual(self.scanner.state, _State.ERROR)
-        self.r2.download_generated_obj.assert_not_called()
+        self.assertIn("pipeline_error", self.scanner.error)
 
-    def test_download_failure_ends_in_error(self):
-        self.r2.download_generated_obj.return_value = False
-        self.run_pipeline(_start_req(launch_runpod=True), runpod=_fake_runpod())
-        self.assertEqual(self.scanner.state, _State.ERROR)
-
-    def test_cancel_during_runpod_stays_cancelled_and_skips_the_download(self):
-        def launch(job):
+    def test_cancel_during_the_job_stays_cancelled(self):
+        def run(kw):
             self.scanner.cancel()
-            return True
-        self.run_pipeline(_start_req(launch_runpod=True), runpod=_fake_runpod(launch=launch))
-        self.assertEqual(self.scanner.state, _State.CANCELLED)
-        self.r2.download_generated_obj.assert_not_called()
-
-    def test_cancel_during_the_download_is_not_overwritten_by_completed(self):
-        def download(**kwargs):
-            self.scanner.cancel()
-            return True
-        self.r2.download_generated_obj.side_effect = download
-        self.run_pipeline(_start_req(launch_runpod=True), runpod=_fake_runpod())
+            return {"result": "failed", "status": {}}
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=_fake_cloud_job(run=run))
         self.assertEqual(self.scanner.state, _State.CANCELLED)
 
     def test_error_after_cancel_is_not_written(self):
-        def launch(job):
+        def run(kw):
             self.scanner.cancel()
             raise RuntimeError("pod vanished")
-        self.run_pipeline(_start_req(launch_runpod=True), runpod=_fake_runpod(launch=launch))
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=_fake_cloud_job(run=run))
         self.assertEqual(self.scanner.state, _State.CANCELLED)
 
-    def test_runpod_package_missing_with_flag_true_ends_in_error(self):
-        self.run_pipeline(_start_req(launch_runpod=True), runpod=None)
+    def test_cloud_package_missing_with_flag_true_ends_in_error(self):
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=None)
         self.assertEqual(self.scanner.state, _State.ERROR)
 
 
@@ -666,7 +673,7 @@ class TestPrepare(_RouterCase):
     def _req(self, brightness=0.5, z_start_mm=30.0):
         camera = SimpleNamespace(model_dump=lambda: {"quality": 95})
         return SimpleNamespace(enable_stream=True, bitrate=2_000_000, illumination_brightness=brightness,
-                               z_start_mm=z_start_mm, camera_config=camera)
+                               z_start_mm=z_start_mm, z_delay=0.001, camera_config=camera)
 
     def test_refused_state_does_not_touch_the_brightness(self):
         for state in (_State.RUNNING, _State.PREPARED, _State.PREPARING, _State.PROCESSING):
@@ -699,7 +706,7 @@ class TestPrepare(_RouterCase):
         tasks = MagicMock()
         self.mod.prepare_scan(self._req(z_start_mm=12.5), tasks)
         worker_kwargs = tasks.add_task.call_args.args[1]
-        self.assertEqual(worker_kwargs, {"quality": 95, "z_start_mm": 12.5})
+        self.assertEqual(worker_kwargs, {"quality": 95, "z_start_mm": 12.5, "z_delay": 0.001})
         # the camera settings given to setup_and_stream() do not carry it
         self.assertNotIn("z_start_mm", self.scanner.setup_calls[0])
 
@@ -729,56 +736,45 @@ class TestPrepare(_RouterCase):
 
 
 class TestRunPodPreflight(_RouterCase):
-    def start(self, launch_runpod, runpod):
+    def start(self, launch_runpod, cloud_job, env=None):
         tasks = MagicMock()
-        with patch.dict(sys.modules, {"cloud.runpod": runpod}):
+        with patch.dict(sys.modules, {"cloud.job": cloud_job}), patch.dict(os.environ, env or {}, clear=False):
             result = self.mod.start_scan(_start_req(launch_runpod), tasks)
         return result, tasks
 
-    def test_missing_key_with_flag_true_is_400_and_nothing_is_queued(self):
-        tasks = MagicMock()
-        with patch.dict(sys.modules, {"cloud.runpod": _fake_runpod(api_key=None)}):
-            with self.assertRaises(_HTTPException) as ctx:
-                self.mod.start_scan(_start_req(True), tasks)
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("RUNPOD_API_KEY", ctx.exception.detail)
-        tasks.add_task.assert_not_called()
-        self.assertFalse(self.mod._start_state["pending"])
+    def test_each_missing_variable_with_flag_true_is_400_and_nothing_is_queued(self):
+        for name in _CLOUD_ENV:
+            env = dict(_CLOUD_ENV, **{name: "  "})
+            tasks = MagicMock()
+            with self.subTest(name=name), patch.dict(sys.modules, {"cloud.job": _fake_cloud_job()}), \
+                    patch.dict(os.environ, env):
+                with self.assertRaises(_HTTPException) as ctx:
+                    self.mod.start_scan(_start_req(True), tasks)
+                self.assertEqual(ctx.exception.status_code, 400)
+                self.assertIn(name, ctx.exception.detail)
+                tasks.add_task.assert_not_called()
+                self.assertFalse(self.mod._start_state["pending"])
 
-    def test_empty_key_is_400(self):
-        with patch.dict(sys.modules, {"cloud.runpod": _fake_runpod(api_key="  ")}):
-            with self.assertRaises(_HTTPException) as ctx:
-                self.mod.start_scan(_start_req(True), MagicMock())
-        self.assertEqual(ctx.exception.status_code, 400)
-
-    def test_placeholder_image_is_400(self):
-        runpod = _fake_runpod(image="yourdockerhubuser/meshroom-runner:latest")
-        with patch.dict(sys.modules, {"cloud.runpod": runpod}):
-            with self.assertRaises(_HTTPException) as ctx:
-                self.mod.start_scan(_start_req(True), MagicMock())
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("image", ctx.exception.detail)
-
-    def test_runpod_package_import_failure_is_400(self):
-        with patch.dict(sys.modules, {"cloud.runpod": None}):
+    def test_cloud_package_import_failure_is_400(self):
+        with patch.dict(sys.modules, {"cloud.job": None}), patch.dict(os.environ, _CLOUD_ENV):
             with self.assertRaises(_HTTPException) as ctx:
                 self.mod.start_scan(_start_req(True), MagicMock())
         self.assertEqual(ctx.exception.status_code, 400)
 
-    def test_flag_false_needs_no_runpod_configuration(self):
-        result, tasks = self.start(False, runpod=None)
+    def test_flag_false_needs_no_cloud_configuration(self):
+        result, tasks = self.start(False, cloud_job=None)
         self.assertEqual(result.status, "accepted")
         tasks.add_task.assert_called_once()
 
     def test_flag_true_with_valid_configuration_is_accepted(self):
-        result, tasks = self.start(True, _fake_runpod())
+        result, tasks = self.start(True, _fake_cloud_job(), env=_CLOUD_ENV)
         self.assertEqual(result.status, "accepted")
         tasks.add_task.assert_called_once()
 
     def test_wrong_state_is_still_400(self):
         self.scanner.state = _State.IDLE
         with self.assertRaises(_HTTPException) as ctx:
-            self.start(False, runpod=None)
+            self.start(False, cloud_job=None)
         self.assertEqual(ctx.exception.status_code, 400)
 
 

@@ -4,7 +4,6 @@ import json
 import logging
 import random
 import shutil
-import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,14 +65,17 @@ def photo_file_stem(level: Union[int, str], shot: int) -> str:
     return f"f_{level}{int(shot):03d}"
 
 
-# Root of the photo tree: input_images/rig/0/f_1000.jpg, ... and manifest.json: the same "rig/<camera>/<name>"
-# layout Meshroom expects (and the one the R2 download code writes). The cloud key is "rig/" + the path relative to
-# it (see Scanner._cloud_key). Only this folder is wiped at the start of a scan, never input_images/ itself.
+# Root of the photo tree: input_images/rig/0/f_1000.jpg, ... and manifest.json: the "rig/<camera>/<name>" layout
+# Turntable Studio expects (rig_mode). The cloud key is jobs/<job_id>/input/rig/ + the path relative to it (see
+# Scanner._cloud_key, cloud.cloudflare_r2.input_key). Only this folder is wiped at the start of a scan.
 INPUT_IMAGES_DIR = str(Path(__file__).resolve().parent.parent / "input_images" / "rig")
 CLOUD_KEY_PREFIX = "rig/"
 MANIFEST_NAME = "manifest.json"
-# The manifest is uploaded under this key AFTER the verification (never inside the photo set), best effort.
-CLOUD_MANIFEST_KEY = "rig/_manifest.json"
+# The manifest is uploaded as jobs/<job_id>/<this name> AFTER the verification (outside input/), best effort.
+CLOUD_MANIFEST_NAME = "_manifest.json"
+# A new prepare deletes the R2 job folders (jobs/<id>/) untouched for longer than this (s), best effort; the folders
+# of recent jobs stay (a failed cloud job keeps its photos for a retry). 0 = every older job.
+R2_STALE_JOB_S = float(os.environ.get("SCAN_R2_STALE_JOB_S", str(24 * 3600)))
 
 # A photo whose mean luma (0-255) is below this is black: a closed lens cap, dead lights or a manual exposure of 0.
 # The first photo pair of a scan is checked so a whole scan of black photos is never taken (SCAN_BLACK_FRAME_CHECK=0
@@ -109,6 +111,8 @@ from hardware.rig_limits import Z_TRAVEL_MAX_MM, Z_HOMING_MARGIN_MM  # noqa: E40
 # Z moves of the preparation (homing, +30 mm climb, move to top): constant speed, no ramp, at the same step delay as
 # the manual z-move and the scan climb (the profile that runs smoothly on the rig).
 Z_PREPARE_DELAY_S = 0.0010
+# Face scan Z moves (FacePrepareRequest.z_delay default): 2 mm/s, so the camera lenses (VCM) are not shaken (FACE-19)
+FACE_Z_DELAY_DEFAULT_S = 0.005
 # Pause after the carriage has reached the bottom endstop in finish_preparation(), before it climbs to the start position
 # (lets the carriage and the endstop settle; a cancel ends it at once).
 Z_HOME_SETTLE_S = _env_float("SCAN_Z_HOME_SETTLE_S", 1.0)
@@ -198,6 +202,7 @@ class ScanPhase:
     SCANNING = "scanning"
     UPLOADING = "uploading"
     VERIFYING = "verifying"
+    RECONSTRUCTING_FACE = "reconstructing_face"   # local 3D face model on the Pi (FACE-20)
     DONE = "done"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -298,6 +303,8 @@ class Scanner:
 
         # Status data (read by the router with getattr). `photos_captured` is derived from total_photos.
         self.phase = ScanPhase.IDLE
+        self.job_id: Optional[str] = None  # R2 prefix jobs/<job_id>/ and results/<job_id>/ of the current photo set
+        self.result_id: Optional[str] = None  # /library id of the 3D model saved by the last run (cloud or face)
         self.phase_message: Optional[str] = None
         self.photos_uploaded = 0
         self.missing: list[str] = []
@@ -316,6 +323,8 @@ class Scanner:
         # Camera settings and upload choice of the face prepare, used when the face capture locks the cameras
         self._face_camera_settings: dict = {}
         self._face_upload_r2 = True
+        # Step delay of the face scan's Z moves (FACE-19): set by the face prepare, a capture may override it
+        self._face_z_delay = FACE_Z_DELAY_DEFAULT_S
         # Whether prepare_scan() of the selected camera driver accepts lock_auto (set by setup_and_stream)
         self._lock_auto_supported = False
         # True while the cameras/lights were started by a manual /test endpoint (setup_and_stream(preflight=False)),
@@ -480,13 +489,13 @@ class Scanner:
 
     def _cloud_key(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None) -> str:
         """
-        The R2 object key of a photo: "rig/" + its path relative to the photo root (e.g. "rig/0/f_1000.jpg"),
-        which keeps the camera sub-directories the downstream download code (rig_mode) expects.
+        The R2 object key of a photo: jobs/<job_id>/input/rig/ + its path relative to the photo root (e.g.
+        "jobs/20261030-101500-a1b2c3/input/rig/0/f_1000.jpg"), the layout Turntable Studio reads (rig_mode).
 
         :raises ValueError: if the path is not below the photo root.
         """
         rel = Path(path).relative_to(base_dir if base_dir is not None else self.images_dir)
-        return f"{CLOUD_KEY_PREFIX}{rel.as_posix()}"
+        return r2.input_key(self.job_id or "unassigned", f"{CLOUD_KEY_PREFIX}{rel.as_posix()}")
 
     def _enqueue_upload(self, path: str, key: str) -> None:
         with self._upload_lock:
@@ -707,10 +716,9 @@ class Scanner:
 
     # ── Manifest ───────────────────────────────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _new_manifest() -> dict:
+    def _new_manifest(self) -> dict:
         return {
-            "scan_id": f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}",
+            "scan_id": self.job_id,
             "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "expected_keys": [],
             "photos": [],
@@ -719,7 +727,12 @@ class Scanner:
             "complete": False,
         }
 
-    def _begin_manifest(self, images_dir: str) -> None:
+    def _begin_manifest(self, images_dir: str, job_id: Optional[str] = None) -> None:
+        """
+        Starts the manifest of a new photo set and gives the set its job id (the R2 prefix jobs/<job_id>/ and the
+        name of results/<job_id>/): `job_id`, or a new sortable id.
+        """
+        self.job_id = job_id or r2.new_job_id()
         with self._manifest_lock:
             self._manifest_dir = str(images_dir)
             self._manifest = self._new_manifest()
@@ -1279,6 +1292,7 @@ class Scanner:
         self._phase_note = None
         self.phase_message = None
         self.face_result = None
+        self.result_id = None
 
     def _lights_on_unless_cancelled(self) -> bool:
         """
@@ -1413,7 +1427,8 @@ class Scanner:
                 "needed for a scan."
             )
 
-    def finish_preparation(self, z_start_mm: float = Z_START_DEFAULT_MM, upload_r2: bool = True, **camera_kwargs):
+    def finish_preparation(self, z_start_mm: float = Z_START_DEFAULT_MM, upload_r2: bool = True,
+                           z_delay: Optional[float] = None, **camera_kwargs):
         """
         Phase 2 & 3: Homes carriage, climbs to the start position, cleans R2, recalibrates cameras in front of the
         object. Designed to run as a background task.
@@ -1424,9 +1439,16 @@ class Scanner:
 
         :param z_start_mm: Height of the scan start position above the bottom endstop (0 = stay on the endstop).
             Must be a whole number of Z steps (MotorError otherwise, before anything moves).
-        :param upload_r2: clean the bucket now (the photos will be uploaded). Only a face prepare may pass False.
+        :param upload_r2: the photos will be uploaded (old R2 job folders are cleaned now). Only a face prepare may pass
+            False.
+        :param z_delay: step delay of the climb to the start position (default Z_PREPARE_DELAY_S for an object scan,
+            FACE_Z_DELAY_DEFAULT_S for a face scan, which also keeps it for the capture's Z moves).
         """
         face = self.mode == ScanMode.FACE
+        if z_delay is None:
+            z_delay = FACE_Z_DELAY_DEFAULT_S if face else Z_PREPARE_DELAY_S
+        if face:
+            self._face_z_delay = float(z_delay)
         # This thread now runs the prepare sequence: the Z helpers honour a pending cancel for it (_cancel_applies)
         self._tls.automated = True
         try:
@@ -1466,7 +1488,7 @@ class Scanner:
             if z_start_mm > 0:
                 # Energize explicitly: homing ended with disable(), do not rely on the firmware's auto-enable
                 self.z_axis_motor.enable()
-                if not self.move_z_up_distance(distance=z_start_mm, delay=Z_PREPARE_DELAY_S, acceleration=False):
+                if not self.move_z_up_distance(distance=z_start_mm, delay=z_delay, acceleration=False):
                     # Never leave the Z driver energized on an abort or a cancel (it is idle now)
                     self.z_axis_motor.disable(settle_delay=0.0)
                     if self._cancel_event.is_set():
@@ -1481,14 +1503,15 @@ class Scanner:
             # have changed it since), and always BEFORE the bucket is wiped
             self._require_brightness()
 
-            # Clean up the cloud bucket before capturing new assets: a leftover key of an older scan would be
-            # ingested with the new set. An incomplete cleanup is an error, not a warning.
+            # Every scan uploads under its own prefix jobs/<job_id>/, so nothing of an older scan can be mixed into
+            # this one and the bucket is no longer wiped. Old job folders are removed here, best effort.
             if upload_r2 or not face:
                 try:
-                    removed = r2.delete_all_files_from_bucket()
+                    removed = r2.delete_stale_jobs(R2_STALE_JOB_S)
+                    if removed:
+                        log.info("[Scanner] Deleted %d old job folder(s) from R2: %s", len(removed), ", ".join(removed))
                 except Exception as e:
-                    raise ScannerError(f"Cloud sanitization failed: {e}")
-                log.info("[Scanner] Bucket cleaned before the scan (%s object(s) removed).", removed)
+                    log.warning("[Scanner] Could not delete old job folders from R2 (continuing): %s", e)
 
             if self._cancel_event.is_set(): return
 
@@ -1797,7 +1820,8 @@ class Scanner:
         z_decel_percent: Optional[float] = None,
         turntable_end_delay: Optional[float] = TURNTABLE_END_DELAY_DEFAULT,
         z_end_delay: Optional[float] = None,
-        finish_state: str = ScannerState.IDLE
+        finish_state: str = ScannerState.IDLE,
+        job_id: Optional[str] = None
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.
@@ -1880,7 +1904,7 @@ class Scanner:
             if Path(images_dir).is_dir() and any(Path(images_dir).iterdir()):
                 raise ScannerError(f"The local photo directory {images_dir} is not empty after the cleanup.")
 
-            self._begin_manifest(images_dir)
+            self._begin_manifest(images_dir, job_id)
             self.start_upload_worker()
 
             self._level = 1
@@ -2158,7 +2182,7 @@ class Scanner:
         self.z_axis_motor.enable()
         move = self.move_z_up_distance if up else self.move_z_down_distance
         try:
-            done = move(distance=distance_mm, delay=Z_PREPARE_DELAY_S, acceleration=False)
+            done = move(distance=distance_mm, delay=self._face_z_delay, acceleration=False)
         except (TopEndstopTriggered, BottomEndstopTriggered):
             self.z_position_mm = None   # stopped somewhere along the move
             raise
@@ -2299,6 +2323,8 @@ class Scanner:
         finish_state: str = ScannerState.COMPLETED,
         analyzer: Optional[Any] = None,
         begun: bool = False,
+        z_delay: Optional[float] = None,
+        reconstruct: bool = True,
     ) -> dict:
         """
         Face capture, after a face prepare (`POST /scanner/face/prepare`: homing, climb to the start height, lights,
@@ -2310,6 +2336,10 @@ class Scanner:
         2. Cameras locked on the face at that height: autofocus sweep on the face box (when the prepare asked for
            ``focus="auto"``) and AE/AWB settle and lock; values given at the prepare are applied instead.
         3. Settle pause, synchronized photo pair, upload and verification (if the prepare asked for the upload).
+        4. ``reconstruct``: the 3D face model is built on the Pi from the pair (phase ``reconstructing_face``, the
+           step in ``phase_message``) and saved in ``results/<job_id>/`` for ``/library``. A failed reconstruction
+           ends the scan in ERROR (state PROCESSING while it runs); the photos are kept and
+           ``face_result.reconstruction_error`` says why.
 
         The MediaPipe detector exists only during the search and is closed after it (FACE-14).
 
@@ -2321,6 +2351,8 @@ class Scanner:
         :param finish_state: State after a face scan that completed (default COMPLETED).
         :param analyzer: Optional StereoFramingAnalyzer (dependency injection; then nothing is built or closed here).
         :param begun: True when `begin_face_scan()` already validated the request and set RUNNING.
+        :param z_delay: Step delay of this capture's Z moves (None keeps the face prepare's value, FACE-19).
+        :param reconstruct: Build the 3D face model on the Pi after the photo (FACE-20).
         :return: Dict with status, optimal_z_mm, best_score, face_detected, warning, photos and r2_uploaded.
         :raises ScannerError: the face scan failed (the state is then ERROR).
         """
@@ -2328,6 +2360,8 @@ class Scanner:
             self.begin_face_scan(strategy=strategy, search_range_mm=search_range_mm, step_mm=step_mm,
                                  manual_z=manual_z)
 
+        if z_delay is not None:
+            self._face_z_delay = float(z_delay)
         upload_r2 = self._face_upload_r2
         scan_ok = False
         images_dir = str(self.images_dir)
@@ -2466,13 +2500,63 @@ class Scanner:
                 return outcome("cancelled", "Face scan was cancelled during the upload", False)
 
         result = outcome("success", "Face capture completed successfully", bool(upload_r2))
-        self.face_result = {k: result[k] for k in
-                            ("optimal_z_mm", "best_score", "face_detected", "warning", "photos", "r2_uploaded")}
+        def publish() -> None:
+            self.face_result = {k: result.get(k) for k in
+                                ("optimal_z_mm", "best_score", "face_detected", "warning", "photos", "r2_uploaded",
+                                 "result_id", "metrics", "reconstruction_error")}
+
+        if reconstruct:
+            # The rig is free (motors, lights and cameras are off): the run is now PROCESSING until the model is saved
+            with self._lock:
+                if self.state == ScannerState.RUNNING:
+                    self.state = ScannerState.PROCESSING
+            result.update(self._reconstruct_face(paths))
+            if self._cancel_event.is_set():
+                self._set_phase(ScanPhase.CANCELLED)
+                return outcome("cancelled", "Face scan was cancelled during the 3D reconstruction", bool(upload_r2))
+            if result.get("reconstruction_error"):
+                # The photos stay on disk (and in R2); face_result keeps their paths and the reason
+                message = "The 3D face reconstruction failed: " + result["reconstruction_error"]
+                result.update(status="error", message=message)
+                publish()
+                with self._lock:
+                    if self.state in (ScannerState.RUNNING, ScannerState.PROCESSING):
+                        self.state = ScannerState.ERROR
+                self._set_phase(ScanPhase.ERROR, error=message)
+                raise ScannerError(message)
+        publish()
         self._set_phase(ScanPhase.DONE, warning)
         with self._lock:
-            if self.state == ScannerState.RUNNING:
+            if self.state in (ScannerState.RUNNING, ScannerState.PROCESSING):
                 self.state = finish_state
         return result
+
+    def _reconstruct_face(self, paths: list) -> dict:
+        """
+        Builds the 3D face model of the stereo pair on the Pi (phase ``reconstructing_face``). Never raises: a failure
+        is returned as ``reconstruction_error`` and `face_scan` turns it into the ERROR state.
+
+        :return: ``result_id`` and ``metrics`` (object.json) on success, ``reconstruction_error`` otherwise.
+        """
+        from app_paths import results_directory
+        from hardware.face_reconstruction import reconstruct_face
+
+        by_camera = {Path(p).parent.name: str(p) for p in paths}
+        if "0" not in by_camera or "1" not in by_camera:
+            return {"reconstruction_error": f"The stereo pair is incomplete: {list(paths)}"}
+        self._set_phase(ScanPhase.RECONSTRUCTING_FACE, "Starting the face reconstruction...")
+        try:
+            info = reconstruct_face(
+                by_camera["0"], by_camera["1"], Path(results_directory()), self.job_id or r2.new_job_id(),
+                cancel_event=self._cancel_event,
+                on_progress=lambda message: self._set_phase(ScanPhase.RECONSTRUCTING_FACE, message),
+            )
+        except Exception as e:
+            log.error("[Scanner Face] 3D reconstruction failed: %s", e)
+            return {"reconstruction_error": str(e)}
+        self.result_id = self.job_id
+        metrics = {k: info.get(k) for k in ("dimensions_mm", "interpupillary_distance_mm", "fit_rms_mm")}
+        return {"result_id": self.result_id, "metrics": metrics}
 
     def _drain_and_verify(self) -> None:
         """
@@ -2496,7 +2580,7 @@ class Scanner:
             )
         verify_error = None
         try:
-            missing = sorted(r2.verify_keys(expected))
+            missing = sorted(r2.verify_keys(expected, prefix=r2.input_prefix(self.job_id)))
         except Exception as e:
             verify_error = f"The bucket could not be listed to verify the upload: {e}"
             log.error("[Scanner] %s", verify_error)
@@ -2532,15 +2616,16 @@ class Scanner:
             raise ScannerUploadError(message, missing)
 
     def _upload_manifest(self) -> None:
-        """Best effort: publishes manifest.json as rig/_manifest.json, outside the photo set (after verification)."""
-        if self._manifest_dir is None:
+        """Best effort: publishes manifest.json as jobs/<job_id>/_manifest.json, outside input/ (after verification)."""
+        if self._manifest_dir is None or not self.job_id:
             return
         path = str(Path(self._manifest_dir) / MANIFEST_NAME)
+        key = r2.job_prefix(self.job_id) + CLOUD_MANIFEST_NAME
         try:
-            if not r2.upload_file(path, object_name=CLOUD_MANIFEST_KEY):
-                log.warning("[Scanner] The manifest could not be uploaded to %s.", CLOUD_MANIFEST_KEY)
+            if not r2.upload_file(path, object_name=key):
+                log.warning("[Scanner] The manifest could not be uploaded to %s.", key)
         except Exception as e:
-            log.warning("[Scanner] The manifest could not be uploaded to %s: %s", CLOUD_MANIFEST_KEY, e)
+            log.warning("[Scanner] The manifest could not be uploaded to %s: %s", key, e)
 
     @staticmethod
     def _try_step(what: str, fn, *args, **kwargs) -> bool:

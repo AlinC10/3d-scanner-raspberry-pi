@@ -50,12 +50,12 @@ Complete image capture and optical parameter block.
 * Removed (nothing used them; still tolerated if a client sends them): `show_preview`, `keep_running`, `autofocus_step`, `autofocus_roi`, `video_resolution`.
 
 #### `CloudConfig`
-Controls the optional, legacy remote Meshroom photogrammetry on RunPod GPU workers (`extra="forbid"`). The reconstruction is now done by Turntable Studio (a separate project, see `router/docs/SCANNER_API.md`); leave `launch_runpod` off.
-* `launch_runpod`: `bool` (default: `false`) — When `false` the scan stops (`completed`) once the photos are verified in R2; when `true` the RunPod pipeline runs afterwards (and `/start` is refused with `400` if RunPod is not configured).
-* `resolution_mp`: `float` (default: `12.0`) — Image resolution in MP. Enforced `0.0 < resolution_mp <= 13.0` (12.0 nominal, 12.33 real sensor value).
-* `mode`: `Literal["single", "rig", "two-sides"]` (default: `"rig"`).
-* `depthmap_downscale`: `int` (default: `2`) — Enforced `ge=1`. (2 balances RAM usage with high fidelity).
-* `max_input_points`: `int` (default: `10000000`) — Maximum points considered during meshing (`ge=1000`).
+Turntable Studio on RunPod after the scan (`extra="forbid"`, `cloud/job.py`).
+* `launch_runpod`: `bool` (default: `true`; object scans are always reconstructed on RunPod) — `false`: the scan stops (`completed`) once the photos are verified in R2. `true`: one pod is started automatically (no confirmation), its result extracted into `results/<job_id>/`, the R2 job folder deleted; `/start` is refused with `400` when the RunPod / Cloudflare / image variables are missing.
+* `resolution_level`: `int` (default: `1`) — `0..3`, Turntable Studio dense level (each level halves both photo sides); also sizes the pod RAM.
+* `title`: `str | null` (default: `null`) — Model name in `object.json` (max 120).
+* Removed 2026-10-30 (Meshroom): `resolution_mp`, `mode`, `depthmap_downscale`, `max_input_points` (now `422`).
+* `StartRequest.job_id`: `str | null` (default `null` = new id) — pattern `YYYYMMDD-HHMMSS-xxxxxx` (the `/library` id).
 
 ---
 
@@ -66,6 +66,7 @@ Payload for `POST /scanner/prepare`.
 * `enable_stream`: `bool` (default: `true`) — Whether to start the MJPEG live preview and return its URLs. (There is no `bitrate`: the preview is MJPEG, not H.264.)
 * `illumination_brightness`: `float` (default: `1.0`) — LED brightness, enforced `0.0 < b <= 1.0` (`0` is refused: the scanner cannot scan in the dark).
 * `z_start_mm`: `float` (default: `30.0`, `0 <= z_start_mm <= 100`) — Height above the bottom endstop where the scan starts; `0` stays on the endstop. Must be a whole number of motor steps (multiples of `0.01` mm), validated with the same conversion the motor uses. Not part of `camera_config`.
+* `z_delay`: `float` (default `0.0010`, `0.0001..0.05`) — step delay of the climb to the start height.
 * `camera_config`: `DualCameraConfig` — Nested optical configuration block.
 
 #### `StreamActiveRequest` / `StreamQualityRequest`
@@ -82,6 +83,7 @@ Payload for `POST /scanner/face/prepare` (`extra="forbid"`).
 * `enable_stream`: `bool` (default `true`).
 * `illumination_brightness`: `float` (default `0.5`, `0 < b <= 1`).
 * `start_z_mm`: `float` (default `180.0`, `100 <= v <= 350`, whole Z steps): where the carriage waits and the search starts.
+* `z_delay`: `float` (default `0.005`, `0.0001..0.05`) — step delay of every Z move of the face scan (FACE-19); kept for the capture.
 * `upload_r2`: `bool` (default `true`): upload and verify the pair (the bucket is cleaned by the prepare).
 * `camera_config`: `DualCameraConfig`. `focus: "auto"` = saved position during the search, autofocus on the face at the height found; an integer or a pair = that position, no autofocus. Manual `exposure_time` / `analogue_gain` / `colour_gains` are used for the photo; otherwise AE/AWB are locked on the face.
 
@@ -92,6 +94,8 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
 * `step_mm`: `float` (default `8.0`, `1 <= v <= 25`).
 * `manual_z`: `float | null` (default `null`, `200 <= v <= 475`): skips the search.
 * `settle_s`: `float` (default `0.15`, `0.05 <= v <= 2`).
+* `z_delay`: `float | null` (default `null` = the prepare's value).
+* `reconstruct`: `bool` (default `true`) — local 3D face model on the Pi (`hardware/face_reconstruction.py`, FACE-20); state `processing` while it runs, `error` if it fails.
 * Every distance must be a whole number of Z motor steps (multiples of `0.01` mm): `422` before anything moves.
 
 ---
@@ -109,6 +113,7 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
 ```
 
 #### `StatusResponse` (`200 OK`)
+* New 2026-10-30: `job_id`, `result_id` (`/library` id of the saved model); `face_result` adds `result_id`, `metrics`, `reconstruction_error`; phase `reconstructing_face`.
 ```json
 {
   "state": "running",

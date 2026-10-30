@@ -34,6 +34,7 @@ docopt
 docx2txt
 dotenv
 durationpy
+DracoPy
 email-validator
 fastapi
 fastapi-cli
@@ -82,6 +83,7 @@ langgraph-prebuilt
 langgraph-sdk
 langsmith
 libarchive-c
+lxml
 markdown-it-py
 MarkupSafe
 marshmallow
@@ -206,6 +208,7 @@ types-s3transfer
 typing-inspect
 typing-inspection
 typing_extensions
+trimesh
 urllib3
 uuid_utils
 uvicorn

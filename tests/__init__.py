@@ -10,12 +10,25 @@ for mod in [
     "piexif", "cv2", "smbus2", "picamera2", "picamera2.encoders", "picamera2.outputs",
     "libcamera", "RPi", "RPi.GPIO", "serial",
     "pydantic", "fastapi", "fastapi.responses",
-    "cloud", "cloud.cloudflare_r2", "cloud.runpod",
+    "cloud", "cloud.cloudflare_r2", "cloud.runpod", "cloud.job",
     "system", "system.file_control",
     "hardware.motor", "hardware.endstop", "hardware.lights", "hardware.tof",
 ]:
     if mod not in sys.modules:
         sys.modules[mod] = MagicMock()
+
+# The R2 key helpers are pure functions: give the mock fixed ones (the key is the path relative to the job's input/
+# folder, "rig/0/f_1000.jpg", so the scanner tests read the same keys as before the per-job prefix)
+_r2 = sys.modules["cloud.cloudflare_r2"]
+if isinstance(_r2, MagicMock):
+    _r2.new_job_id = lambda: "20261030-101500-abcdef"
+    _r2.input_key = lambda job_id, relative_path: relative_path
+    _r2.input_prefix = lambda job_id: ""
+    _r2.job_prefix = lambda job_id: "rig/"
+    _r2.delete_stale_jobs = MagicMock(return_value=[])
+    # `import cloud.cloudflare_r2 as r2` reads the attribute of the (mocked) `cloud` package, not sys.modules
+    if isinstance(sys.modules["cloud"], MagicMock):
+        sys.modules["cloud"].cloudflare_r2 = _r2
 
 # Configure serial mock so subpackages like serial.tools.list_ports resolve
 mock_serial = sys.modules["serial"]

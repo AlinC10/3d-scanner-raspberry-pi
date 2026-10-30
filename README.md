@@ -1,6 +1,6 @@
 # 3D Scanner - Raspberry Pi 5 & Arduino Uno
 
-A photogrammetry scanner with a turntable: a Raspberry Pi 5 runs the FastAPI server, the two Arducam IMX477 cameras (libcamera `rpi.sync`), the ToF sensor, the lights and the endstops, and an Arduino Uno generates the step pulses of the two NEMA 17 motors (turntable and vertical Z axis). The photos are uploaded to Cloudflare R2 and verified there. The 3D reconstruction is done by **Turntable Studio** (`../template_meshroom/turntable_studio`, a separate project: OpenMVS on camera poses locked from the AprilTag disc); the scanner's own RunPod launch (`cloud.launch_runpod`) still starts the old Meshroom image and is off by default. A face scan (`POST /scanner/face/prepare`, then `POST /scanner/face/capture`) frames a face with MediaPipe and takes one stereo pair. The finished 3D objects in `results/` are served by `/library`.
+A photogrammetry scanner with a turntable: a Raspberry Pi 5 runs the FastAPI server, the two Arducam IMX477 cameras (libcamera `rpi.sync`), the ToF sensor, the lights and the endstops, and an Arduino Uno generates the step pulses of the two NEMA 17 motors (turntable and vertical Z axis). The photos are uploaded to Cloudflare R2 and verified there. The 3D reconstruction is done by **Turntable Studio** (`../template_meshroom/turntable_studio`, a separate project: OpenMVS on camera poses locked from the AprilTag disc); with `cloud.launch_runpod: true` the scanner starts it on RunPod itself (`cloud/job.py`, photos under `jobs/<job_id>/` in R2, result extracted into `results/<job_id>/`); off by default. A face scan is reconstructed on the Pi (`rpi_face_mesh/`). A face scan (`POST /scanner/face/prepare`, then `POST /scanner/face/capture`) frames a face with MediaPipe and takes one stereo pair. The finished 3D objects in `results/` are served by `/library`.
 
 ---
 
@@ -33,7 +33,7 @@ The web page at `/` is the `3d-scanner-front-end` folder next to this project (o
 | `FRONTEND_DIR` | Folder of the web page served at `/` |
 | `PWM_CHIP` | Index of the PWM chip of the lights, when it cannot be found by itself |
 | `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Cloudflare R2 credentials |
-| `RUNPOD_API_KEY` | Only for scans with `cloud.launch_runpod = true` |
+| `RUNPOD_API_KEY`, `TURNTABLE_IMAGE`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_R2_API_TOKEN` | Only for scans with `cloud.launch_runpod = true` (see `.env.example`; check with `POST /test/cloud/runpod-dry-run`) |
 | `RESULTS_DIR` | Folder of the finished 3D objects served by `/library` (default `results/` in the project) |
 | `GROQ_API_KEY` | AI assistant (`/api/ai/*`). Without it the assistant is off and the rest of the server works |
 | `SCAN_PREFLIGHT=0` | Skips the preflight of `/scanner/prepare` (development only) |
@@ -56,6 +56,7 @@ The tests run without hardware (the Pi-only libraries are replaced by mocks).
 | Scanner state machine, scan loop, upload pipeline, safety | [`hardware/docs/SCANNER.md`](hardware/docs/SCANNER.md) |
 | Scanner API (`/scanner/*`) | [`router/docs/SCANNER_API.md`](router/docs/SCANNER_API.md) |
 | Hardware test API (`/test/*`) | [`router/docs/TEST_API.md`](router/docs/TEST_API.md) |
+| Every endpoint, for the front-end team | [`router/docs/FRONTEND_API_REFERENCE.md`](router/docs/FRONTEND_API_REFERENCE.md) |
 | API changes for the front-end team (2026-10-28 / 29) | [`router/docs/FRONTEND_CHANGES.md`](router/docs/FRONTEND_CHANGES.md) |
 | Library of finished 3D objects (`/library/*`) | [`router/docs/LIBRARY_API.md`](router/docs/LIBRARY_API.md) |
 | AI assistant API (`/api/ai/*`) | [`router/docs/AI_API.md`](router/docs/AI_API.md) |

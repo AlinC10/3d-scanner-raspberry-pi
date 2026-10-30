@@ -60,20 +60,36 @@ class FakeR2:
             self.calls.append((object_name, True))
             return True
 
-    def delete_all_files_from_bucket(self, bucket=None):
+    # Keys: the fake keeps the path relative to the job's input/ folder ("rig/0/f_1000.jpg"), so the tests read the
+    # same keys as before the per-job prefix; the real input_key() adds jobs/<job_id>/input/ in front of it.
+    JOB_ID = "20261030-101500-abcdef"
+
+    def new_job_id(self):
+        return self.JOB_ID
+
+    def input_key(self, job_id, relative_path):
+        return relative_path
+
+    def input_prefix(self, job_id):
+        return ""
+
+    def job_prefix(self, job_id):
+        return "rig/"
+
+    def delete_stale_jobs(self, older_than_s, bucket=None, client=None, keep=()):
         if self.delete_error:
             raise RuntimeError(self.delete_error)
         with self.lock:
             self.deleted = len(self.bucket)
             self.bucket.clear()
-        return self.deleted
+        return ["old-job"] if self.deleted else []
 
     def list_keys(self, prefix=""):
         with self.lock:
             return {k for k in self.bucket if k.startswith(prefix)}
 
-    def verify_keys(self, expected):
-        present = self.list_keys()
+    def verify_keys(self, expected, bucket=None, prefix="", client=None):
+        present = self.list_keys(prefix)
         return sorted(k for k in expected if k not in present)
 
     def preflight(self):
@@ -506,7 +522,7 @@ class TestScanVerification(ScannerTestCase):
     def test_bucket_listing_failure_is_not_reported_as_verified(self):
         self.verdicts = {1: False}
 
-        def boom(expected):
+        def boom(expected, **_):
             raise RuntimeError("listing denied")
 
         self.r2.verify_keys = boom
@@ -543,13 +559,13 @@ class TestScanVerification(ScannerTestCase):
         seen = {}
         original = self.r2.verify_keys
 
-        def spying_verify(expected):
+        def spying_verify(expected, **kwargs):
             seen["state"] = self.s.state
             seen["phase"] = self.s.phase
             seen["lights_off"] = self.s.lights.off.called
             seen["cameras_released"] = self.s.dual_cameras is None
             seen["motors_stopped"] = self.s.turntable_motor.stop.called
-            return original(expected)
+            return original(expected, **kwargs)
 
         self.r2.verify_keys = spying_verify
         self.r2.delay = 0.002
@@ -642,7 +658,7 @@ class TestManifest(ScannerTestCase):
         order = []
         original_verify = self.r2.verify_keys
         original_upload = self.r2.upload_file
-        self.r2.verify_keys = lambda expected: (order.append("verify"), original_verify(expected))[1]
+        self.r2.verify_keys = lambda expected, **kw: (order.append("verify"), original_verify(expected, **kw))[1]
 
         def upload(file_name, bucket=None, object_name=None):
             if object_name == "rig/_manifest.json":
@@ -1266,17 +1282,16 @@ class TestLifecycle(ScannerTestCase):
         self.assertEqual(self.r2.bucket, {"rig/0/old.jpg": 1})
         self.assertEqual(self.s.dual_cameras, None)
 
-    def test_bucket_wipe_failure_is_a_clear_error_before_the_recalibration(self):
+    def test_old_job_cleanup_failure_does_not_stop_the_prepare(self):
+        # Every scan uploads under its own jobs/<job_id>/ prefix: removing old job folders is housekeeping only
         cams = RecordingCameras()
         self.s.dual_cameras = cams
         self.s.state = ScannerState.PREPARING
         self.r2.delete_error = "Errors in delete_objects"
         self.finish()
-        self.assertEqual(self.s.state, ScannerState.ERROR)
-        self.assertEqual(self.s.phase, "error")
-        self.assertIn("Cloud sanitization failed", self.s.error)
-        self.assertIn("Errors in delete_objects", self.s.error)
-        self.assertEqual(cams.prepare_calls, [])
+        self.assertEqual(self.s.state, ScannerState.PREPARED)
+        self.assertIsNone(self.s.error)
+        self.assertEqual(len(cams.prepare_calls), 1)
 
     def test_bitrate_is_ignored_and_the_stream_starts_without_one(self):
         started = []

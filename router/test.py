@@ -497,3 +497,41 @@ def test_cleanup():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleanup error: {str(e)}")
+
+
+@router.post("/cloud/runpod-dry-run")
+def test_cloud_runpod_dry_run(
+    resolution_level: Annotated[int, Query(ge=0, le=3, description="Turntable Studio resolution level")] = 1,
+):
+    """
+    Checks the cloud chain WITHOUT creating a pod (nothing is billed): the configuration (`problem`), the R2 write test
+    (preflight), the RunPod API key (lists the account's pods, read only) and the pod request that a scan with
+    `cloud.launch_runpod: true` would send for the photos of the last scan (`input_images/rig/`), secrets redacted.
+    No temporary R2 credentials are minted. 400 when there are no photos on disk.
+    """
+    from pathlib import Path
+    import cloud.cloudflare_r2 as r2
+    from cloud import job as cloud_job, runpod as rp
+
+    problem = scanner_api._runpod_config_problem()
+    images_dir = Path(getattr(scanner, "images_dir", None) or "input_images/rig")
+    result = {"problem": problem, "images_dir": str(images_dir), "runpod_api": None, "turntable_pods": None}
+    try:
+        pods = rp.RunPodClient().list_pods()
+        result["runpod_api"] = "ok"
+        result["turntable_pods"] = [{"id": p.get("id"), "name": p.get("name"), "status": p.get("desiredStatus")}
+                                    for p in pods if str(p.get("name") or "").startswith("turntable-")]
+    except Exception as e:
+        result["runpod_api"] = f"error: {e}"
+    try:
+        report = cloud_job.run_cloud_job(
+            input_dir=str(images_dir.parent), image_prefix=images_dir.name + "/", job_id=r2.new_job_id(),
+            pipeline_options={"rig_mode": True, "resolution_level": resolution_level}, dry_run=True,
+        )
+    except (r2.R2Error, rp.RunPodError) as e:
+        raise HTTPException(status_code=400, detail=f"Dry run failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Dry run failed: {e}")
+    result.update({"plan": report.get("plan"), "pod_request": report.get("pod_request"),
+                   "r2_preflight_s": report.get("timings_s", {}).get("preflight")})
+    return result

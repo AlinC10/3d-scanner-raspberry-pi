@@ -176,6 +176,14 @@ class PrepareRequest(BaseModel):
             "endstop). Must be a whole number of motor steps (multiples of 0.01 mm at 1/4 microstepping)."
         )
     )] = Z_START_DEFAULT_MM
+    z_delay: Annotated[float, Field(
+        ge=STEP_DELAY_MIN,
+        le=STEP_DELAY_MAX,
+        description=(
+            "Step delay in seconds of the climb to the start position (constant speed; 0.0010 s = 10 mm/s at "
+            f"1/4 microstepping, larger is slower; {STEP_DELAY_MIN}-{STEP_DELAY_MAX} s)."
+        )
+    )] = 0.0010
 
     @field_validator("z_start_mm")
     @classmethod
@@ -382,39 +390,37 @@ class CloudConfig(BaseModel):
 
     launch_runpod: Annotated[bool, Field(
         description=(
-            "When false (default) the scan stops once the photos are verified in the R2 bucket and the state "
-            "becomes `completed`. When true the RunPod pipeline (Meshroom job, output download) runs afterwards."
+            "Default true: an object scan is reconstructed by Turntable Studio on RunPod. When false the scan stops once the photos are verified in the R2 bucket and the state "
+            "becomes `completed`. When true (default) a Turntable Studio pod is started on RunPod automatically (no confirmation), its result is "
+            "extracted into results/<job_id>/ (served by /library) and the job folder is deleted from R2."
         )
-    )] = False
+    )] = True
 
-    resolution_mp: Annotated[float, Field(
-        gt=0.0,
-        le=13.0,
+    resolution_level: Annotated[int, Field(
+        ge=0,
+        le=3,
         description=(
-            "Camera capture resolution in megapixels (12.0 nominal, 12.33 real sensor value). "
-            "Used to calculate required cloud GPU RAM."
+            "Turntable Studio dense reconstruction level: every level halves both sides of the photos the pod works "
+            "on (0 = full 12 MP, 1 = default, 3 = fastest). Also sizes the pod's RAM request."
         )
-    )] = 12.0
-
-    mode: Annotated[Literal["single", "rig", "two-sides"], Field(
-        description="Scanning mode layout. Options typically include 'single', 'rig', or 'two-sides'."
-    )] = "rig"
-    depthmap_downscale: Annotated[int, Field(
-        ge=1,
-        description="Meshroom DepthMap downscale factor. Higher values use less RAM but produce lower detail."
-    )] = 2
-    max_input_points: Annotated[int, Field(
-        ge=1000,
-        description="Meshroom Meshing maximum input points constraint."
-    )] = 10000000
+    )] = 1
+    title: Annotated[str | None, Field(
+        max_length=120,
+        description="Optional name of the 3D model, written by the pod to object.json (shown by /library)."
+    )] = None
 
 
 class StartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", json_schema_extra=_defaults_as_example)
 
-    job_id: Annotated[str, Field(
-        description="Unique identifier for this scanning and processing job, used to track RunPod execution."
-    )] = "meshroom-job"
+    job_id: Annotated[str | None, Field(
+        pattern=r"^\d{8}-\d{6}-[0-9a-f]{6}$",
+        description=(
+            "Optional id of this scan job: the R2 prefix jobs/<job_id>/ and the folder results/<job_id>/. "
+            "Format YYYYMMDD-HHMMSS-xxxxxx (the /library id). Null (default) = a new one, shown as `job_id` in "
+            "/scanner/status."
+        )
+    )] = None
     mechanical: MechanicalConfig = Field(default_factory=MechanicalConfig)
     cloud: CloudConfig = Field(default_factory=CloudConfig)
 
@@ -435,6 +441,11 @@ class FaceCaptureResult(BaseModel):
     warning: str | None = None
     photos: list[str] = []
     r2_uploaded: bool = False
+    # Local 3D reconstruction of the stereo pair (rpi_face_mesh, FACE-20): the /library id of the model in
+    # results/<result_id>/ (null when it did not run or failed), the face metrics, and why it failed
+    result_id: str | None = None
+    metrics: dict | None = None
+    reconstruction_error: str | None = None
 
 
 class StatusResponse(BaseModel):
@@ -454,6 +465,8 @@ class StatusResponse(BaseModel):
     error: str | None = None            # why the scan ended in `error`
     tof_warnings: list[str] = []
     face_result: FaceCaptureResult | None = None   # set when a face scan completed (POST /scanner/face/capture)
+    job_id: str | None = None           # id of the current photo set: R2 prefix jobs/<job_id>/
+    result_id: str | None = None        # /library id of the 3D model of the last run (cloud or face), when one was saved
     # Upload progress (E2): seconds since the last successful upload (or since the drain started), null when no upload
     # is running; the drain gives up after upload_drain_timeout_s without one
     seconds_since_last_upload: float | None = None
@@ -519,8 +532,20 @@ class FacePrepareRequest(BaseModel):
         description="Height in mm above the bottom endstop where the carriage waits and the face search starts."
     )] = 180.0
     upload_r2: Annotated[bool, Field(
-        description="Upload the photo pair to Cloudflare R2 and verify it (the bucket is cleaned by this prepare)."
-    )] = True
+        description=(
+            "Upload the photo pair to Cloudflare R2 (under jobs/<job_id>/). Default false: a face is reconstructed "
+            "on the Pi only and its photos never leave it."
+        )
+    )] = False
+    z_delay: Annotated[float, Field(
+        ge=STEP_DELAY_MIN,
+        le=STEP_DELAY_MAX,
+        description=(
+            "Step delay in seconds of every Z move of the face scan (climb, search, final approach), constant speed. "
+            "Default 0.005 s = 2 mm/s: slow enough that the camera lenses (VCM) are not shaken (FACE-19). "
+            "The capture keeps it unless it sends its own `z_delay`."
+        )
+    )] = 0.005
     camera_config: Annotated[DualCameraConfig, Field(
         description=(
             "Camera settings. focus \"auto\" (default): the lenses stay on the saved position during the search and "
@@ -572,6 +597,19 @@ class FaceCaptureRequest(BaseModel):
         le=2.0,
         description="Mechanical settling delay in seconds before taking the photo."
     )] = 0.150
+
+    z_delay: Annotated[float | None, Field(
+        ge=STEP_DELAY_MIN,
+        le=STEP_DELAY_MAX,
+        description="Step delay in seconds of the Z moves of this capture; null (default) keeps the prepare's value."
+    )] = None
+
+    reconstruct: Annotated[bool, Field(
+        description=(
+            "Build the 3D face model on the Pi from the stereo pair after the photo (rpi_face_mesh); the model is "
+            "saved in results/<result_id>/ and listed by /library. False = photos only."
+        )
+    )] = True
 
     @field_validator("step_mm", "search_range_mm", "manual_z")
     @classmethod

@@ -1,22 +1,62 @@
+"""
+cloudflare_r2.py — Cloudflare R2 (S3 API) storage for scan jobs.
+
+One bucket, one prefix per job:
+    jobs/<job_id>/input/rig/0/f_1000.jpg     photos (uploaded by the Pi / laptop)
+    jobs/<job_id>/output/output.zip          deliverables + logs + stats (uploaded by the pod)
+    jobs/<job_id>/output/status.json         written LAST by the pod: the completion signal
+    jobs/<job_id>/output/run_log.txt         also outside the zip, so a failed run still reports why
+
+The pod never gets the account keys: create_temp_credentials() mints short-lived S3 credentials
+limited to one prefix (read-only on input/, read-write on output/).
+"""
+
+from __future__ import annotations
+
+import json
 import logging
 import os
 import shutil
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
 
 import boto3
+import requests
 from boto3.exceptions import S3UploadFailedError
-from botocore.exceptions import BotoCoreError, ClientError
-from dotenv import load_dotenv
-
-load_dotenv()
-
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+
+try:  # Pi / laptop: keys in .env (the pod gets them as environment variables)
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+logger = logging.getLogger("TurntableStudio.R2")
+
+DEFAULT_BUCKET = "photogrammetry-pipeline"
+JOBS_ROOT = "jobs"
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 
 
 class R2Error(Exception):
     """Raised for R2 problems the caller must react to (failed deletes, failed listing, failed preflight)."""
+
+
+# Longest time one upload attempt may take in total (s). read_timeout only catches a connection that stalls completely;
+# a transfer that keeps trickling a few bytes at a time is cut here and retried by the scanner's upload worker.
+UPLOAD_ATTEMPT_TIMEOUT_S = float(os.environ.get("SCAN_UPLOAD_ATTEMPT_TIMEOUT_S", "300"))
+
+
+class UploadAttemptTimeout(Exception):
+    """An upload attempt ran longer than its time limit (raised from the transfer's progress callback)."""
 
 
 def _build_r2_config() -> Config:
@@ -48,221 +88,94 @@ def _build_r2_config() -> Config:
 
 R2_CONFIG = _build_r2_config()
 
-# Longest time one upload attempt may take in total (s). read_timeout only catches a connection that stalls completely;
-# a transfer that keeps trickling a few bytes at a time is cut here and retried by the scanner's upload worker.
-UPLOAD_ATTEMPT_TIMEOUT_S = float(os.environ.get("SCAN_UPLOAD_ATTEMPT_TIMEOUT_S", "300"))
+
+# ── Client ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def make_client(endpoint_url: str, access_key_id: str, secret_access_key: str, session_token: Optional[str] = None):
+    """S3 client for R2. session_token is required for the temporary credentials of create_temp_credentials()."""
+    return boto3.client(
+        service_name="s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        aws_session_token=session_token or None,
+        config=R2_CONFIG,
+    )
 
 
-class UploadAttemptTimeout(Exception):
-    """An upload attempt ran longer than its time limit (raised from the transfer's progress callback)."""
-
-s3 = boto3.client(
-    service_name="s3",
-    endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
-    aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
-    config=R2_CONFIG
-)
-
-# R2 bucket that will only be used for hosting images that will be used in the Meshroom pipeline
-# and after that will be deleted
-R2_PIPELINE_IMAGES_BUCKET = "photogrammetry-pipeline"
-
-from pathlib import Path
-
-# Base directory is the project root (parent of 'cloud')
-BASE_DIR = str(Path(__file__).resolve().parent.parent)
-
-INPUT_IMAGES = os.path.join(BASE_DIR, "input_images")
-# Rig mode: images split into input_images/rig/0/ (Camera 1) and input_images/rig/1/ (Camera 2)
-RIG_IMAGES = os.path.join(INPUT_IMAGES, "rig")
-# Two-sides mode: two rig directories for scanning both sides of an object
-TWO_SIDES_RIG1 = os.path.join(INPUT_IMAGES, "rig1")
-TWO_SIDES_RIG2 = os.path.join(INPUT_IMAGES, "rig2")
-
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-
-
-def file_exists_and_is_new(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET,
-                           after_timestamp: float = 0.0) -> bool:
+def client_from_env(prefix: str = "R2_"):
     """
-    Check if an object exists in R2 and was modified after a specific UNIX timestamp.
-    :param object_name: S3 object name
-    :type object_name: str
-    :param bucket: Bucket to check
-    :type bucket: str
-    :param after_timestamp: UNIX timestamp to check against
-    :type after_timestamp: float
-    :return: True if file exists and is newer than after_timestamp
-    :rtype: bool
+    Client from <prefix>ENDPOINT_URL / ACCESS_KEY_ID / SECRET_ACCESS_KEY [/ SESSION_TOKEN].
+    The endpoint is shared (R2_ENDPOINT_URL) when <prefix>ENDPOINT_URL is not set.
     """
-    try:
-        response = s3.head_object(Bucket=bucket, Key=object_name)
-        # LastModified is a datetime object, convert to UNIX timestamp
-        last_modified = response['LastModified'].timestamp()
-        return last_modified >= after_timestamp
-    except ClientError as e:
-        if e.response['Error']['Code'] == '404':
-            return False
-        logging.error("[R2] head_object error for %s: %s", object_name, e)
-        return False
-    except BotoCoreError as e:
-        logging.error("[R2] head_object error for %s: %s", object_name, e)
-        return False
-
-
-def delete_file(object_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-    """
-    Delete a file from an S3 bucket.
-    :param object_name: S3 object name
-    :type object_name: str
-    :param bucket: Bucket to delete from
-    :type bucket: str
-    :return: True if file was deleted, else False
-    :rtype: bool
-    """
-    # Delete the file
-    try:
-        s3.delete_object(Bucket=bucket, Key=object_name)
-    except (ClientError, BotoCoreError) as e:
-        logging.error(e)
-        return False
-    return True
-
-
-# delete_objects accepts at most 1000 keys per request
-_DELETE_CHUNK = 1000
-
-
-def list_keys(prefix: str = "", bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> set[str]:
-    """
-    List every object key in the bucket (paginated, so more than 1000 objects are handled).
-    :param prefix: Only keys starting with this prefix are returned ("" = all keys)
-    :type prefix: str
-    :param bucket: Bucket to list
-    :type bucket: str
-    :return: Set of object keys
-    :rtype: set[str]
-    :raises R2Error: if the listing fails
-    """
-    keys: set[str] = set()
-    try:
-        paginator = s3.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get('Contents', []):
-                keys.add(obj['Key'])
-    except (ClientError, BotoCoreError) as e:
-        raise R2Error(f"Could not list bucket '{bucket}': {e}") from e
-    return keys
-
-
-def verify_keys(expected, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> list[str]:
-    """
-    Compare the expected keys with what is really in the bucket (one paginated listing).
-    :param expected: Iterable of object keys that must be present
-    :param bucket: Bucket to check
-    :type bucket: str
-    :return: Sorted list of expected keys that are missing from the bucket (empty = everything is there)
-    :rtype: list[str]
-    :raises R2Error: if the listing fails
-    """
-    present = list_keys(bucket=bucket)
-    return sorted(set(expected) - present)
-
-
-def delete_all_files_from_bucket(bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> int:
-    """
-    Delete all files from R2 bucket (paginated listing, delete_objects in chunks of 1000).
-    :param bucket: Bucket to delete from
-    :type bucket: str
-    :return: Number of objects deleted
-    :rtype: int
-    :raises R2Error: if listing or deleting fails, or if R2 reports per-key errors (the message lists the keys)
-    """
-    keys = sorted(list_keys(bucket=bucket))
-    if not keys:
-        logging.info("[R2] No files found in bucket '%s'.", bucket)
-        return 0
-
-    deleted = 0
-    failed: list[str] = []
-    for start in range(0, len(keys), _DELETE_CHUNK):
-        chunk = keys[start:start + _DELETE_CHUNK]
-        try:
-            response = s3.delete_objects(
-                Bucket=bucket,
-                Delete={'Objects': [{'Key': key} for key in chunk], 'Quiet': True}
-            )
-        except (ClientError, BotoCoreError) as e:
-            raise R2Error(f"Could not delete objects from bucket '{bucket}': {e}") from e
-        errors = response.get('Errors') or []
-        failed.extend(err.get('Key', '?') for err in errors)
-        deleted += len(chunk) - len(errors)
-
-    if failed:
-        raise R2Error(
-            f"Failed to delete {len(failed)} object(s) from bucket '{bucket}': " + ", ".join(sorted(failed))
-        )
-    logging.info("[R2] Cleaned up %d old files in bucket '%s'.", deleted, bucket)
-    return deleted
-
-
-def preflight(bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> None:
-    """
-    Verify that uploads to R2 will work before a scan starts.
-
-    Checks the R2_* environment variables, then does a small write + head + delete round trip on a throw-away key.
-    This exercises the credentials, the bucket permissions and the checksum behaviour (CLOUD-16).
-    :param bucket: Bucket to probe
-    :type bucket: str
-    :return: None
-    :raises R2Error: with a human readable message when anything is wrong
-    """
-    missing = [
-        name for name in ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
-        if not os.environ.get(name, "").strip()
-    ]
+    endpoint = os.environ.get(prefix + "ENDPOINT_URL") or os.environ.get("R2_ENDPOINT_URL")
+    key_id = os.environ.get(prefix + "ACCESS_KEY_ID")
+    secret = os.environ.get(prefix + "SECRET_ACCESS_KEY")
+    missing = [n for n, v in (("R2_ENDPOINT_URL", endpoint), (prefix + "ACCESS_KEY_ID", key_id),
+                               (prefix + "SECRET_ACCESS_KEY", secret)) if not (v or "").strip()]
     if missing:
         raise R2Error("Cloudflare R2 is not configured, missing environment variable(s): " + ", ".join(missing))
-
-    key = f"_preflight/{uuid.uuid4().hex}.txt"
-    written = False
-    try:
-        s3.put_object(Bucket=bucket, Key=key, Body=b"preflight")
-        written = True
-        s3.head_object(Bucket=bucket, Key=key)
-    except (ClientError, BotoCoreError, OSError) as e:
-        raise R2Error(
-            f"R2 write test failed on bucket '{bucket}' (check credentials, bucket name and permissions): {e}"
-        ) from e
-    finally:
-        if written:
-            try:
-                s3.delete_object(Bucket=bucket, Key=key)
-            except (ClientError, BotoCoreError, OSError) as e:
-                raise R2Error(
-                    f"R2 delete test failed on bucket '{bucket}' (probe object '{key}' may be left behind): {e}"
-                ) from e
+    return make_client(endpoint, key_id, secret, os.environ.get(prefix + "SESSION_TOKEN"))
 
 
-def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_name: str | None = None,
-                timeout_s: float | None = None) -> bool:
+def bucket_from_env() -> str:
+    return os.environ.get("R2_BUCKET") or DEFAULT_BUCKET
+
+
+_default_client = None
+
+
+def _client(client=None):
+    """The given client, or a lazily created one from the R2_* environment (Pi / laptop)."""
+    global _default_client
+    if client is not None:
+        return client
+    if _default_client is None:
+        _default_client = client_from_env()
+    return _default_client
+
+
+# ── Keys ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def new_job_id() -> str:
+    """Sortable, unique job id: 20261027-153012-a1b2c3."""
+    return time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
+
+
+def job_prefix(job_id: str) -> str:
+    if not job_id or "/" in job_id or job_id in (".", ".."):
+        raise ValueError(f"Invalid job id: {job_id!r}")
+    return f"{JOBS_ROOT}/{job_id}/"
+
+
+def input_prefix(job_id: str) -> str:
+    return job_prefix(job_id) + "input/"
+
+
+def output_prefix(job_id: str) -> str:
+    return job_prefix(job_id) + "output/"
+
+
+def input_key(job_id: str, relative_path: str) -> str:
+    """input_key("j", "rig/0/f_1000.jpg") -> jobs/j/input/rig/0/f_1000.jpg"""
+    return input_prefix(job_id) + relative_path.replace("\\", "/").lstrip("/")
+
+
+def output_key(job_id: str, name: str) -> str:
+    return output_prefix(job_id) + name
+
+
+# ── Basic object operations ─────────────────────────────────────────────────────────────────────────────────────────
+
+def upload_file(file_name: str, bucket: Optional[str] = None, object_name: Optional[str] = None, client=None,
+                timeout_s: Optional[float] = None) -> bool:
     """
-    Upload a file to an S3 bucket. Never raises: every failure is logged and reported as False.
-    :param file_name: File to upload
-    :type file_name: str
-    :param bucket: Bucket to upload to
-    :type bucket: str
-    :param object_name: S3 object name. If not specified then file_name is used
-    :type object_name: str | None
-    :param timeout_s: Total time limit of this attempt in seconds (default UPLOAD_ATTEMPT_TIMEOUT_S; 0 or less
-        disables it). Checked whenever bytes are sent; a connection that sends nothing ends at the read timeout.
-    :type timeout_s: float | None
-    :return: True if file was uploaded, else False
-    :rtype: bool
+    Upload a file. Never raises: every failure is logged and reported as False (the caller, e.g. the scan upload
+    queue, decides whether to retry; the photo always stays on disk).
+    timeout_s: total time limit of this attempt (default UPLOAD_ATTEMPT_TIMEOUT_S; 0 or less disables it), checked
+    whenever bytes are sent; a connection that sends nothing ends at the read timeout.
     """
-
-    # If S3 object_name was not specified, use file_name
+    bucket = bucket or bucket_from_env()
     if object_name is None:
         object_name = os.path.basename(file_name)
 
@@ -270,13 +183,13 @@ def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_
     try:
         size = os.path.getsize(file_name) if os.path.isfile(file_name) else None
     except OSError as e:
-        logging.error("[R2] Cannot stat %s: %s", file_name, e)
+        logger.error("[R2] Cannot stat %s: %s", file_name, e)
         return False
     if size is None:
-        logging.error("[R2] Not uploading %s: file does not exist", file_name)
+        logger.error("[R2] Not uploading %s: file does not exist", file_name)
         return False
     if size == 0:
-        logging.error("[R2] Not uploading %s: file is empty (0 bytes)", file_name)
+        logger.error("[R2] Not uploading %s: file is empty (0 bytes)", file_name)
         return False
 
     limit = UPLOAD_ATTEMPT_TIMEOUT_S if timeout_s is None else timeout_s
@@ -286,420 +199,335 @@ def upload_file(file_name: str, bucket: str = R2_PIPELINE_IMAGES_BUCKET, object_
         if time.monotonic() > deadline:
             raise UploadAttemptTimeout(f"upload attempt longer than {limit:.0f} s")
 
-    # Upload the file
     try:
         if limit > 0:
-            s3.upload_file(file_name, bucket, object_name, Callback=_check_deadline)
+            _client(client).upload_file(file_name, bucket, object_name, Callback=_check_deadline)
         else:
-            s3.upload_file(file_name, bucket, object_name)
-    except (ClientError, BotoCoreError, S3UploadFailedError, OSError, UploadAttemptTimeout) as e:
-        logging.error("[R2] Upload of %s as %s failed: %s", file_name, object_name, e)
+            _client(client).upload_file(file_name, bucket, object_name)
+    except (ClientError, BotoCoreError, S3UploadFailedError, OSError, R2Error, UploadAttemptTimeout) as e:
+        logger.error("[R2] Upload of %s as %s failed: %s", file_name, object_name, e)
         return False
     if limit > 0 and time.monotonic() > deadline:
-        logging.warning("[R2] Upload of %s took longer than %.0f s but completed.", file_name, limit)
+        logger.warning("[R2] Upload of %s took longer than %.0f s but completed.", file_name, limit)
     return True
 
 
-def create_output_zip(folder_path: str, zip_path: str) -> str:
-    """
-    Builds a structured ZIP from the pipeline output directory.
-
-    ZIP layout:
-        obj/high/       <- all files from Texturing_1/
-        obj/low/        <- all files from Texturing_2/
-        glb/high_model.glb
-        glb/low_model.glb
-        stl/high_model.stl
-        stl/low_model.stl
-        3mf/high_model.3mf
-        3mf/low_model.3mf
-    :param folder_path: Absolute or relative path to the output directory.
-    :type folder_path: str
-    :param zip_path: Destination path for the .zip file.
-    :type zip_path: str
-    :return: zip_path on success, raises on error.
-    :rtype: str
-    """
-    texturing1_dir = os.path.join(folder_path, "Texturing_1")
-    texturing2_dir = os.path.join(folder_path, "Texturing_2")
-    glb_file = os.path.join(folder_path, "low_model.glb")
-    high_glb_file = os.path.join(folder_path, "high_model.glb")
-    high_stl_file = os.path.join(folder_path, "high_model.stl")
-    low_stl_file = os.path.join(folder_path, "low_model.stl")
-
-    os.makedirs(os.path.dirname(os.path.abspath(zip_path)), exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        # --- obj/high/ : everything inside Texturing_1/ ---
-        if os.path.isdir(texturing1_dir):
-            for fname in os.listdir(texturing1_dir):
-                fpath = os.path.join(texturing1_dir, fname)
-                if os.path.isfile(fpath):
-                    zipf.write(fpath, os.path.join("obj", "high", fname))
-        else:
-            logging.warning("[ZIP] Texturing_1 directory not found: %s", texturing1_dir)
-
-        # --- obj/low/ : everything inside Texturing_2/ ---
-        if os.path.isdir(texturing2_dir):
-            for fname in os.listdir(texturing2_dir):
-                fpath = os.path.join(texturing2_dir, fname)
-                if os.path.isfile(fpath):
-                    zipf.write(fpath, os.path.join("obj", "low", fname))
-        else:
-            logging.warning("[ZIP] Texturing_2 directory not found: %s", texturing2_dir)
-
-        # --- glb/low_model.glb ---
-        if os.path.isfile(glb_file):
-            zipf.write(glb_file, os.path.join("glb", "low_model.glb"))
-        else:
-            logging.warning("[ZIP] GLB file not found: %s", glb_file)
-
-        # --- glb/high_model.glb ---
-        if os.path.isfile(high_glb_file):
-            zipf.write(high_glb_file, os.path.join("glb", "high_model.glb"))
-
-        # --- stl/high_model.stl ---
-        if os.path.isfile(high_stl_file):
-            zipf.write(high_stl_file, os.path.join("stl", "high_model.stl"))
-        else:
-            logging.warning("[ZIP] High STL file not found: %s", high_stl_file)
-
-        # --- stl/low_model.stl ---
-        if os.path.isfile(low_stl_file):
-            zipf.write(low_stl_file, os.path.join("stl", "low_model.stl"))
-        else:
-            logging.warning("[ZIP] Low STL file not found: %s", low_stl_file)
-
-        # --- 3mf/high_model.3mf ---
-        high_3mf_file = os.path.join(folder_path, "high_model.3mf")
-        if os.path.isfile(high_3mf_file):
-            zipf.write(high_3mf_file, os.path.join("3mf", "high_model.3mf"))
-        else:
-            logging.warning("[ZIP] High 3MF file not found: %s", high_3mf_file)
-
-        # --- 3mf/low_model.3mf ---
-        low_3mf_file = os.path.join(folder_path, "low_model.3mf")
-        if os.path.isfile(low_3mf_file):
-            zipf.write(low_3mf_file, os.path.join("3mf", "low_model.3mf"))
-        else:
-            logging.warning("[ZIP] Low 3MF file not found: %s", low_3mf_file)
-
-        # --- stats.json ---
-        stats_file = os.path.join(folder_path, "stats.json")
-        if os.path.isfile(stats_file):
-            zipf.write(stats_file, "stats.json")
-
-    logging.info("[ZIP] Successfully created %s", zip_path)
-    return zip_path
-
-
-def upload_generated_obj(folder_path: str, object_name: str = "output.zip",
-                         bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-    """
-    Zips the pipeline output directory and uploads it to R2.
-
-    ZIP structure:
-        obj/high/       <- Texturing_1 contents (OBJ + PNG textures)
-        obj/low/        <- Texturing_2 contents (OBJ + JPG textures)
-        glb/high_model.glb
-        glb/low_model.glb
-        stl/high_model.stl
-        stl/low_model.stl
-        3mf/high_model.3mf
-        3mf/low_model.3mf
-    :param folder_path: Relative or absolute path to the output directory.
-    :type folder_path: str
-    :param object_name: Key used when storing the file in R2.
-    :type object_name: str
-    :param bucket: Bucket to download from
-    :type bucket: str
-    :return: True if upload succeeded, False otherwise.
-    :rtype: bool
-    """
-    zip_path = os.path.join(folder_path, "output.zip")
-
-    print(f"  [R2] Building zip archive -> {zip_path}")
+def put_json(data: dict, object_name: str, bucket: Optional[str] = None, client=None) -> bool:
+    """Small JSON object (status.json). Never raises."""
     try:
-        create_output_zip(folder_path, zip_path)
-    except Exception as e:
-        logging.error("[R2] Failed to create zip: %s", e)
+        _client(client).put_object(Bucket=bucket or bucket_from_env(), Key=object_name,
+                                   Body=json.dumps(data, indent=2).encode("utf-8"), ContentType="application/json")
+    except (ClientError, BotoCoreError, OSError, R2Error) as e:
+        logger.error("[R2] Writing %s failed: %s", object_name, e)
         return False
-
-    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    print(f"  [R2] Zip ready ({size_mb:.1f} MB). Uploading as '{object_name}'...")
-
-    success = upload_file(zip_path, bucket, object_name)
-    if success:
-        print(f"  [R2] Upload complete: {object_name}")
-    else:
-        print(f"  [R2] Upload FAILED for: {object_name}")
-
-    return success
+    return True
 
 
-def download_file(object_name: str, file_name: str | None = None, bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-    """
-    Download a file from an S3 bucket
-    :param object_name: S3 object name
-    :type object_name: str
-    :param file_name: File to download. If not specified then object_name is used
-    :type file_name: str | None
-    :param bucket: Bucket to download from
-    :type bucket: str
-    :return: True if file was downloaded, else False
-    :rtype: bool
-    """
-
-    # If file_name was not specified, use object_name
-    if file_name is None:
-        file_name = object_name
-
-    # Download the file
+def get_json(object_name: str, bucket: Optional[str] = None, client=None) -> Optional[dict]:
+    """Small JSON object, or None when it does not exist (other errors are raised as R2Error)."""
     try:
-        # s3.download_file('amzn-s3-demo-bucket', 'OBJECT_NAME', 'FILE_NAME')
-        s3.download_file(bucket, object_name, file_name)
+        body = _client(client).get_object(Bucket=bucket or bucket_from_env(), Key=object_name)["Body"].read()
     except ClientError as e:
-        logging.error(e)
-        return False
-    return True
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+            return None
+        raise R2Error(f"Could not read {object_name}: {e}") from e
+    except BotoCoreError as e:
+        raise R2Error(f"Could not read {object_name}: {e}") from e
+    return json.loads(body.decode("utf-8"))
 
 
-def download_every_img_from_bucket(local_dir: str = INPUT_IMAGES,
-                                   bucket: str = R2_PIPELINE_IMAGES_BUCKET,
-                                   rig_mode: bool = False,
-                                   two_sides_mode: bool = False):
-    """
-    Download all images from the R2 bucket to a local directory.
-
-    Single mode (rig_mode=False, two_sides_mode=False):
-        Downloads all objects flat into `local_dir/`.
-        R2 keys: IMG_0001.jpg  →  local_dir/IMG_0001.jpg
-
-    Rig mode (rig_mode=True):
-        Downloads all objects preserving subfolder structure into RIG_IMAGES.
-        R2 keys: rig/0/0001.jpg  →  input_images/rig/0/0001.jpg
-                 rig/1/0001.jpg  →  input_images/rig/1/0001.jpg
-
-    Two-sides mode (two_sides_mode=True):
-        Downloads objects preserving rig1/rig2 subfolder structure.
-        R2 keys: rig1/0/0001.jpg  →  input_images/rig1/0/0001.jpg
-                 rig1/1/0001.jpg  →  input_images/rig1/1/0001.jpg
-                 rig2/0/0001.jpg  →  input_images/rig2/0/0001.jpg
-                 rig2/1/0001.jpg  →  input_images/rig2/1/0001.jpg
-    :param local_dir: Local directory to download images into (used in single mode).
-    :type local_dir: str
-    :param bucket: R2 bucket name.
-    :type bucket: str
-    :param rig_mode: If True, download rig-structured images.
-    :type rig_mode: bool
-    :param two_sides_mode: If True, download two-sides structured images into rig1/rig2.
-    :type two_sides_mode: bool
-    :return: None
-    :rtype: None
-    """
-    if two_sides_mode:
-        os.makedirs(TWO_SIDES_RIG1, exist_ok=True)
-        os.makedirs(TWO_SIDES_RIG2, exist_ok=True)
-
-        print("Downloading images from R2 (two-sides mode)...")
-        response = s3.list_objects_v2(Bucket=bucket)
-        if 'Contents' in response:
-            for obj in response['Contents']:
-                file_key = obj['Key']
-                # Keys are: rig1/0/0001.jpg, rig2/1/0001.jpg, etc.
-                if file_key.startswith("rig1/"):
-                    sub_path = file_key[len("rig1/"):]  # e.g. "0/0001.jpg"
-                    local_path = os.path.join(TWO_SIDES_RIG1, *sub_path.split("/"))
-                elif file_key.startswith("rig2/"):
-                    sub_path = file_key[len("rig2/"):]
-                    local_path = os.path.join(TWO_SIDES_RIG2, *sub_path.split("/"))
-                else:
-                    continue
-
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                print(f"Downloading {file_key} -> {local_path}...")
-                download_file(file_key, local_path, bucket)
-
-        print("Downloaded every image (two-sides)")
-        return
-
-    if rig_mode:
-        target_dir = RIG_IMAGES
-        os.makedirs(target_dir, exist_ok=True)
-
-        print("Downloading images from R2 (rig mode)...")
-        response = s3.list_objects_v2(Bucket=bucket)
-        if 'Contents' in response:
-            for obj in response['Contents']:
-                file_key = obj['Key']
-                if not file_key.startswith("rig/"):
-                    continue
-                # file_key = "rig/0/0001.jpg". Strip "rig/" to get "0/0001.jpg"
-                sub_path = file_key[len("rig/"):]
-                local_path = os.path.join(target_dir, *sub_path.split("/"))
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                print(f"Downloading {file_key} -> {local_path}...")
-                download_file(file_key, local_path, bucket)
-
-        print("Downloaded every image (rig)")
-        return
-
-    # Single mode
-    os.makedirs(local_dir, exist_ok=True)
-    print("Downloading images from R2...")
-    response = s3.list_objects_v2(Bucket=bucket)
-    if 'Contents' in response:
-        for obj in response['Contents']:
-            file_key = obj['Key']
-            local_path = os.path.join(local_dir, os.path.basename(file_key))
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            print(f"Downloading {file_key} -> {local_path}...")
-            download_file(file_key, local_path, bucket)
-
-    print("Downloaded every image")
-
-
-def download_generated_obj(object_name: str = "output.zip", dest_dir: str | None = None,
-                           bucket: str = R2_PIPELINE_IMAGES_BUCKET) -> bool:
-    """
-    Downloads the output ZIP from R2 and extracts it into dest_dir.
-
-    Resulting layout after extraction:
-        dest_dir/obj/high/       <- OBJ + PNG textures
-        dest_dir/obj/low/        <- OBJ + JPG textures
-        dest_dir/glb/high_model.glb
-        dest_dir/glb/low_model.glb
-        dest_dir/stl/high_model.stl
-        dest_dir/stl/low_model.stl
-        dest_dir/3mf/high_model.3mf
-        dest_dir/3mf/low_model.3mf
-    :param object_name: R2 key of the zip file (e.g. "output.zip").
-    :type object_name: str
-    :param dest_dir: Local directory where the zip is extracted. Created automatically if it does not exist.
-    :type dest_dir: str | None
-    :param bucket: Bucket to download from
-    :type bucket: str
-    :return: True if download + extraction succeeded, False otherwise.
-    :rtype: bool
-    """
-    if not dest_dir:
-        dest_dir = OUTPUT_DIR
-
-    # Safely clean out old artifacts before extracting new ones
-    if os.path.exists(dest_dir):
-        # Safety guard: ensure we don't accidentally wipe root/current working dir
-        if os.path.abspath(dest_dir) != os.path.abspath(os.getcwd()):
-            shutil.rmtree(dest_dir, ignore_errors=True)
-
-    os.makedirs(dest_dir, exist_ok=True)
-
-    zip_path = os.path.join(dest_dir, "output.zip")
-
-    print(f"  [R2] Downloading '{object_name}' -> {zip_path}")
-    if not download_file(object_name, zip_path, bucket):
-        print(f"  [R2] Download FAILED for: {object_name}")
-        return False
-
-    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    print(f"  [R2] Downloaded ({size_mb:.1f} MB). Extracting to {dest_dir}...")
-
+def download_file(object_name: str, file_name: str, bucket: Optional[str] = None, client=None) -> bool:
+    """Download one object. Never raises."""
     try:
-        with zipfile.ZipFile(zip_path, "r") as zipf:
-            zipf.extractall(dest_dir)
-    except zipfile.BadZipFile as e:
-        logging.error("[R2] Extraction failed — bad zip: %s", e)
+        Path(file_name).parent.mkdir(parents=True, exist_ok=True)
+        _client(client).download_file(bucket or bucket_from_env(), object_name, file_name)
+    except (ClientError, BotoCoreError, OSError, R2Error) as e:
+        logger.error("[R2] Download of %s failed: %s", object_name, e)
         return False
-    finally:
-        os.remove(zip_path)
-
-    print(f"  [R2] Extraction complete: {dest_dir}")
     return True
 
 
-def send_images(input_images_path: str = INPUT_IMAGES):
-    """Upload flat single-camera images to R2.
-
-    R2 keys will be the bare filenames: IMG_0001.jpg
-    Use for mode='single'.
+def list_keys(prefix: str = "", bucket: Optional[str] = None, client=None) -> set[str]:
     """
-    print(f"Uploading images to R2 (single mode)...")
-    for img in os.listdir(input_images_path):
-        img_path = os.path.join(input_images_path, img)
-        if not os.path.isfile(img_path):
-            continue
-        print(f"  Uploading {img} to R2...")
-        upload_file(img_path)
-
-    print("All images uploaded to R2")
-
-
-def send_rig_images(rig_images_path: str = RIG_IMAGES):
-    """Upload rig-structured images to R2 preserving the subfolder layout.
-
-    Walks 0/ and 1/ (or any numeric subfolders) and uploads each
-    image with an R2 key that mirrors the local structure:
-        rig_images_path/0/0001.jpg  →  R2 key: rig/0/0001.jpg
-        rig_images_path/1/0001.jpg  →  R2 key: rig/1/0001.jpg
-
-    Use for mode='rig'.
+    Every object key under `prefix` (paginated, so more than 1000 objects are handled).
+    :raises R2Error: if the listing fails
     """
-    print(f"Uploading rig images to R2 (rig mode)...")
-    for cam_folder in sorted(os.listdir(rig_images_path)):
-        cam_path = os.path.join(rig_images_path, cam_folder)
-        if not os.path.isdir(cam_path):
-            continue
-        for img in sorted(os.listdir(cam_path)):
-            img_path = os.path.join(cam_path, img)
-            if not os.path.isfile(img_path):
-                continue
-            # R2 key mirrors the subfolder structure: rig/<cam_folder>/<filename>
-            r2_key = f"rig/{cam_folder}/{img}"
-            print(f"  Uploading {r2_key}...")
-            upload_file(img_path, object_name=r2_key)
-
-    print("All rig images uploaded to R2")
+    bucket = bucket or bucket_from_env()
+    keys: set[str] = set()
+    try:
+        paginator = _client(client).get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                keys.add(obj['Key'])
+    except (ClientError, BotoCoreError) as e:
+        raise R2Error(f"Could not list bucket '{bucket}': {e}") from e
+    return keys
 
 
-def send_two_sides_images(rig1_path: str = TWO_SIDES_RIG1,
-                          rig2_path: str = TWO_SIDES_RIG2):
-    """Upload two-sides rig-structured images to R2.
+def verify_keys(expected: Iterable[str], bucket: Optional[str] = None, prefix: str = "", client=None) -> list[str]:
+    """Sorted list of expected keys missing from the bucket (empty = everything is there). One listing."""
+    present = list_keys(prefix=prefix, bucket=bucket, client=client)
+    return sorted(set(expected) - present)
 
-    Walks rig1/ and rig2/ (each containing 0/ and 1/ camera subfolders)
-    and uploads each image with an R2 key that mirrors the local structure:
-        rig1_path/0/0001.jpg  →  R2 key: rig1/0/0001.jpg
-        rig1_path/1/0001.jpg  →  R2 key: rig1/1/0001.jpg
-        rig2_path/0/0001.jpg  →  R2 key: rig2/0/0001.jpg
-        rig2_path/1/0001.jpg  →  R2 key: rig2/1/0001.jpg
 
-    Use for mode='two-sides'.
+# delete_objects accepts at most 1000 keys per request
+_DELETE_CHUNK = 1000
+
+
+def delete_prefix(prefix: str, bucket: Optional[str] = None, client=None) -> int:
     """
-    print("Uploading images to R2 (two-sides mode)...")
-    for rig_name, rig_path in [("rig1", rig1_path), ("rig2", rig2_path)]:
-        if not os.path.isdir(rig_path):
-            print(f"  WARNING: {rig_path} not found, skipping.")
-            continue
-        for cam_folder in sorted(os.listdir(rig_path)):
-            cam_path = os.path.join(rig_path, cam_folder)
-            if not os.path.isdir(cam_path):
-                continue
-            for img in sorted(os.listdir(cam_path)):
-                img_path = os.path.join(cam_path, img)
-                if not os.path.isfile(img_path):
+    Delete every object under `prefix` (a job: jobs/<id>/). Refuses an empty prefix.
+    :return: Number of objects deleted
+    :raises R2Error: if listing or deleting fails, or if R2 reports per-key errors (the message lists the keys)
+    """
+    if not prefix or not prefix.startswith(JOBS_ROOT + "/"):
+        raise R2Error(f"Refusing to delete outside '{JOBS_ROOT}/': {prefix!r}")
+    bucket = bucket or bucket_from_env()
+    cl = _client(client)
+    keys = sorted(list_keys(prefix=prefix, bucket=bucket, client=cl))
+    deleted = 0
+    failed: list[str] = []
+    for start in range(0, len(keys), _DELETE_CHUNK):
+        chunk = keys[start:start + _DELETE_CHUNK]
+        try:
+            response = cl.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': k} for k in chunk], 'Quiet': True})
+        except (ClientError, BotoCoreError) as e:
+            raise R2Error(f"Could not delete objects from bucket '{bucket}': {e}") from e
+        errors = response.get('Errors') or []
+        failed.extend(err.get('Key', '?') for err in errors)
+        deleted += len(chunk) - len(errors)
+    if failed:
+        raise R2Error(f"Failed to delete {len(failed)} object(s) from bucket '{bucket}': " + ", ".join(sorted(failed)))
+    logger.info("[R2] Deleted %d object(s) under %s", deleted, prefix)
+    return deleted
+
+
+def preflight(bucket: Optional[str] = None, client=None, prefix: str = "_preflight/") -> None:
+    """
+    Verify that uploads to R2 will work before a scan starts: a small write + head + delete round trip on a
+    throw-away key (credentials, bucket permissions, checksum behaviour CLOUD-16).
+    :raises R2Error: with a human readable message when anything is wrong
+    """
+    bucket = bucket or bucket_from_env()
+    cl = _client(client)
+    key = f"{prefix}{uuid.uuid4().hex}.txt"
+    written = False
+    try:
+        cl.put_object(Bucket=bucket, Key=key, Body=b"preflight")
+        written = True
+        cl.head_object(Bucket=bucket, Key=key)
+    except (ClientError, BotoCoreError, OSError) as e:
+        raise R2Error(
+            f"R2 write test failed on bucket '{bucket}' (check credentials, bucket name and permissions): {e}"
+        ) from e
+    finally:
+        if written:
+            try:
+                cl.delete_object(Bucket=bucket, Key=key)
+            except (ClientError, BotoCoreError, OSError) as e:
+                raise R2Error(
+                    f"R2 delete test failed on bucket '{bucket}' (probe object '{key}' may be left behind): {e}"
+                ) from e
+
+
+# ── Job transfers ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+def local_image_files(input_dir: str) -> Dict[str, str]:
+    """{relative path with '/': absolute path} of every image under input_dir (rig/0/..., rig/1/... or flat)."""
+    root = Path(input_dir).resolve()
+    files = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES and "masks" not in p.relative_to(root).parts:
+            files[p.relative_to(root).as_posix()] = str(p)
+    return files
+
+
+def upload_job_images(job_id: str, input_dir: str, bucket: Optional[str] = None, client=None,
+                      workers: int = 8) -> Dict[str, List[str]]:
+    """Uploads every image of input_dir to jobs/<id>/input/<relative path>. Returns {"uploaded": [...], "failed": [...]}."""
+    files = local_image_files(input_dir)
+    cl = _client(client)
+
+    def one(item):
+        rel, path = item
+        key = input_key(job_id, rel)
+        return key, upload_file(path, bucket, key, client=cl)
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        results = list(ex.map(one, files.items()))
+    return {"uploaded": [k for k, ok in results if ok], "failed": [k for k, ok in results if not ok]}
+
+
+def download_job_images(job_id: str, dest_dir: str, bucket: Optional[str] = None, client=None,
+                        workers: int = 8) -> List[str]:
+    """
+    Downloads jobs/<id>/input/** into dest_dir keeping the relative layout (rig/0/f_1000.jpg).
+    :raises R2Error: when nothing is there or any download fails
+    """
+    prefix = input_prefix(job_id)
+    cl = _client(client)
+    keys = sorted(list_keys(prefix=prefix, bucket=bucket, client=cl))
+    if not keys:
+        raise R2Error(f"No input images under {prefix}")
+    dest = Path(dest_dir).resolve()
+
+    def one(key):
+        rel = key[len(prefix):]
+        target = (dest / rel).resolve()
+        if dest not in target.parents:
+            return key, False  # a key like ../../x must not escape dest_dir
+        return key, download_file(key, str(target), bucket, client=cl)
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        results = list(ex.map(one, keys))
+    failed = [k for k, ok in results if not ok]
+    if failed:
+        raise R2Error(f"{len(failed)} input image(s) could not be downloaded: " + ", ".join(failed[:5]))
+    return [k for k, _ in results]
+
+
+def download_job_output(job_id: str, dest_dir: str, bucket: Optional[str] = None, client=None) -> Path:
+    """
+    Downloads jobs/<id>/output/output.zip into dest_dir (a folder for this job only) and extracts it.
+    Also fetches status.json and run_log.txt when present.
+    :raises R2Error: when output.zip is missing or not a valid zip
+    """
+    dest = Path(dest_dir).resolve()
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    cl = _client(client)
+    for name in ("status.json", "run_log.txt"):
+        download_file(output_key(job_id, name), str(dest / name), bucket, client=cl)
+    zip_path = dest / "output.zip"
+    if not download_file(output_key(job_id, "output.zip"), str(zip_path), bucket, client=cl):
+        raise R2Error(f"output.zip of job {job_id} could not be downloaded")
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for member in zf.namelist():  # no absolute paths or .. escaping dest
+                target = (dest / member).resolve()
+                if dest != target and dest not in target.parents:
+                    raise R2Error(f"Unsafe path in output.zip: {member}")
+            # A full disk mid-extraction leaves a half model (CLOUD-20): check the space first, with 10 % margin
+            needed = sum(info.file_size for info in zf.infolist())
+            free = shutil.disk_usage(dest).free
+            if needed * 1.1 > free:
+                raise R2Error(f"Not enough disk space to extract output.zip of job {job_id}: "
+                              f"{needed / 1e9:.2f} GB needed, {free / 1e9:.2f} GB free")
+            zf.extractall(dest)
+    except zipfile.BadZipFile as e:
+        raise R2Error(f"output.zip of job {job_id} is not a valid zip: {e}") from e
+    return dest
+
+
+def delete_stale_jobs(older_than_s: float, bucket: Optional[str] = None, client=None,
+                      keep: Iterable[str] = (), now: Optional[float] = None) -> list[str]:
+    """
+    Deletes the folders jobs/<id>/ whose NEWEST object is older than `older_than_s` (photos of failed jobs that
+    were kept for a retry, jobs interrupted on this machine). A running job writes started.json / status.json, and
+    a pod never runs longer than its runtime cap, so a job untouched for longer than that cannot be running.
+    Nothing outside jobs/ is touched. Returns the deleted job ids.
+    """
+    import time as _time
+    bucket = bucket or bucket_from_env()
+    cl = _client(client)
+    newest: Dict[str, float] = {}
+    try:
+        for page in cl.get_paginator('list_objects_v2').paginate(Bucket=bucket, Prefix=JOBS_ROOT + "/"):
+            for obj in page.get('Contents', []):
+                parts = obj['Key'].split("/")
+                if len(parts) < 3 or not parts[1]:
                     continue
-                # R2 key: rig1/0/0001.jpg
-                r2_key = f"{rig_name}/{cam_folder}/{img}"
-                print(f"  Uploading {r2_key}...")
-                upload_file(img_path, object_name=r2_key)
-
-    print("All two-sides images uploaded to R2")
-
-
-def download_result():
-    print("Download resulted model")
-    download_generated_obj("output.zip", "./output")
-    print("Model downloaded!")
+                stamp = obj['LastModified'].timestamp()
+                newest[parts[1]] = max(newest.get(parts[1], 0.0), stamp)
+    except (ClientError, BotoCoreError) as e:
+        raise R2Error(f"Could not list bucket '{bucket}': {e}") from e
+    limit = (now if now is not None else _time.time()) - older_than_s
+    stale = sorted(j for j, t in newest.items() if t < limit and j not in set(keep))
+    for job_id in stale:
+        delete_prefix(job_prefix(job_id), bucket, client=cl)
+    return stale
 
 
-def delete_all_files():
-    print("Cleaning up R2 bucket...")
-    delete_all_files_from_bucket()
-    print("R2 bucket cleaned up!")
+# ── Temporary, prefix-scoped credentials for the pod ───────────────────────────────────────────────────────────────
+
+@dataclass
+class TempCredentials:
+    access_key_id: str
+    secret_access_key: str
+    session_token: str
+
+    def as_env(self, prefix: str) -> Dict[str, str]:
+        return {
+            prefix + "ACCESS_KEY_ID": self.access_key_id,
+            prefix + "SECRET_ACCESS_KEY": self.secret_access_key,
+            prefix + "SESSION_TOKEN": self.session_token,
+        }
+
+
+def temp_credentials_request(bucket: str, parent_access_key_id: str, permission: str,
+                             prefixes: List[str], ttl_seconds: int) -> dict:
+    """Body of POST /accounts/{account_id}/r2/temp-access-credentials."""
+    if permission not in ("object-read-only", "object-read-write"):
+        raise ValueError(f"Pod credentials must be object-level, got {permission!r}")
+    if not prefixes or any(not p.startswith(JOBS_ROOT + "/") for p in prefixes):
+        raise ValueError("Pod credentials must be limited to job prefixes")
+    return {
+        "bucket": bucket,
+        "parentAccessKeyId": parent_access_key_id,
+        "permission": permission,
+        "prefixes": prefixes,
+        "ttlSeconds": int(ttl_seconds),
+    }
+
+
+def create_temp_credentials(account_id: str, api_token: str, bucket: str, parent_access_key_id: str,
+                            permission: str, prefixes: List[str], ttl_seconds: int,
+                            session: Optional[requests.Session] = None) -> TempCredentials:
+    """
+    Short-lived S3 credentials limited to `prefixes` (Cloudflare R2 temp-access-credentials API).
+    The API token needs only R2 permissions; it never leaves the Pi / laptop.
+    """
+    body = temp_credentials_request(bucket, parent_access_key_id, permission, prefixes, ttl_seconds)
+    http = session or requests
+    r = http.post(
+        f"{CLOUDFLARE_API}/accounts/{account_id}/r2/temp-access-credentials",
+        headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    try:
+        payload = r.json()
+    except ValueError:
+        payload = {}
+    if r.status_code >= 400 or not payload.get("success", False):
+        raise R2Error(f"Cloudflare temp-access-credentials failed ({r.status_code}): {payload.get('errors') or r.text[:300]}")
+    res = payload["result"]
+    return TempCredentials(res["accessKeyId"], res["secretAccessKey"], res["sessionToken"])
+
+
+def pod_credentials_env(job_id: str, ttl_seconds: int, account_id: Optional[str] = None,
+                        api_token: Optional[str] = None, bucket: Optional[str] = None,
+                        parent_access_key_id: Optional[str] = None) -> Dict[str, str]:
+    """
+    Environment for the pod: read-only credentials on input/, read-write on output/, both expiring after
+    ttl_seconds, plus the endpoint and the bucket. Values default to CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_R2_API_TOKEN, R2_BUCKET and R2_ACCESS_KEY_ID.
+    """
+    account_id = account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    api_token = api_token or os.environ.get("CLOUDFLARE_R2_API_TOKEN")
+    parent = parent_access_key_id or os.environ.get("R2_ACCESS_KEY_ID")
+    bucket = bucket or bucket_from_env()
+    missing = [n for n, v in (("CLOUDFLARE_ACCOUNT_ID", account_id), ("CLOUDFLARE_R2_API_TOKEN", api_token),
+                              ("R2_ACCESS_KEY_ID", parent), ("R2_ENDPOINT_URL", os.environ.get("R2_ENDPOINT_URL")))
+               if not v]
+    if missing:
+        raise R2Error("Cannot create pod credentials, missing: " + ", ".join(missing))
+    read = create_temp_credentials(account_id, api_token, bucket, parent, "object-read-only",
+                                   [input_prefix(job_id)], ttl_seconds)
+    write = create_temp_credentials(account_id, api_token, bucket, parent, "object-read-write",
+                                    [output_prefix(job_id)], ttl_seconds)
+    env = {"R2_ENDPOINT_URL": os.environ["R2_ENDPOINT_URL"], "R2_BUCKET": bucket}
+    env.update(read.as_env("R2_IN_"))
+    env.update(write.as_env("R2_OUT_"))
+    return env

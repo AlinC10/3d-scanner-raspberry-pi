@@ -4,7 +4,7 @@ Instructions for AI coding agents working in this repository. Read this first; i
 
 ## What this is
 
-A photogrammetry scanner with a turntable. A **Raspberry Pi 5 (Trixie OS)** runs a FastAPI server, two Arducam IMX477 cameras (libcamera `rpi.sync`, motorized focus), a VL53L1X ToF sensor, relay + PWM lights and two endstops. An **Arduino Uno** generates the step pulses of two NEMA 17 motors (turntable, vertical Z axis) through TB6600 drivers, over serial. Photos are uploaded to Cloudflare R2 and verified there. The 3D reconstruction is done by **Turntable Studio** (`../template_meshroom/turntable_studio`, a separate project with its own `AGENTS.md`); the scanner's own RunPod launch (`cloud.launch_runpod`, the old Meshroom image) is **off by default** and kept only until the hand-over to Turntable Studio is decided. A face scan (`POST /scanner/face/prepare`, then `POST /scanner/face/capture`) uses MediaPipe auto-framing. An optional AI assistant answers from `ai/ai-docs/` (`/api/ai/*`).
+A photogrammetry scanner with a turntable. A **Raspberry Pi 5 (Trixie OS)** runs a FastAPI server, two Arducam IMX477 cameras (libcamera `rpi.sync`, motorized focus), a VL53L1X ToF sensor, relay + PWM lights and two endstops. An **Arduino Uno** generates the step pulses of two NEMA 17 motors (turntable, vertical Z axis) through TB6600 drivers, over serial. Photos are uploaded to Cloudflare R2 and verified there. The 3D reconstruction is done by **Turntable Studio** (`../template_meshroom/turntable_studio`, a separate project with its own `AGENTS.md`); with `cloud.launch_runpod: true` the scanner starts Turntable Studio on RunPod itself (`cloud/job.py`; off by default); a face scan is reconstructed on the Pi (`rpi_face_mesh/`, `hardware/face_reconstruction.py`). A face scan (`POST /scanner/face/prepare`, then `POST /scanner/face/capture`) uses MediaPipe auto-framing. An optional AI assistant answers from `ai/ai-docs/` (`/api/ai/*`).
 
 The owner works in Romanian. `PROBLEME_RAMASE.md` is written in Romanian without diacritics; the documentation under `*/docs/` and the code are in English.
 
@@ -43,7 +43,7 @@ Python 3.13. All tests must pass before you finish; the suite takes about 30 sec
 | Motors, Arduino bridge and serial protocol, firmware | `hardware/docs/MOTOR.md`, `hardware/docs/ARDUINO_BRIDGE.md`, `hardware/docs/ARDUINO_PROTOCOL.md`, `hardware/arduino_control/README.md` |
 | ToF sensor and the object / backdrop threshold, lights | `hardware/docs/TOF.md`, `hardware/docs/LIGHTS.md` |
 | Wi-Fi / Bluetooth / Ethernet (status, saved networks, guard during a scan, restore at startup) | `system/README.md`, `router/docs/SYSTEM_API.md` |
-| What changed for the front-end (keep it updated when an endpoint changes) | `router/docs/FRONTEND_CHANGES.md` |
+| Every endpoint for the front-end, and what changed (keep both updated when an endpoint changes) | `router/docs/FRONTEND_API_REFERENCE.md`, `router/docs/FRONTEND_CHANGES.md` |
 | Mechanical limits of the rig | `hardware/rig_limits.py` |
 | Open problems by priority, decisions already taken, what was fixed and what is unconfirmed | `PROBLEME_RAMASE.md` |
 | Procedure before testing the motors on the rig | `PRE_TEST_CHECKLIST.md` |

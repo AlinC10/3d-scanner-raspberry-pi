@@ -285,6 +285,8 @@ class ScannerMock:
         self.mode: Optional[str] = None
         self.z_position_mm: Optional[float] = None
         self._face_upload_r2 = True
+        self.job_id: Optional[str] = None
+        self.result_id: Optional[str] = None
         self._reset_status()
 
     # ── status ────────────────────────────────────────────────────────────────
@@ -404,7 +406,8 @@ class ScannerMock:
     def generate_livestream(self):
         return ["/scanner/stream/mjpeg?camera=1", "/scanner/stream/mjpeg?camera=2"]
 
-    def finish_preparation(self, z_start_mm: float = Z_START_DEFAULT_MM, upload_r2: bool = True, **camera_kwargs):
+    def finish_preparation(self, z_start_mm: float = Z_START_DEFAULT_MM, upload_r2: bool = True,
+                           z_delay: Optional[float] = None, **camera_kwargs):
         """Simulated homing, climb to `z_start_mm` and camera calibration (about 2 s); a cancel ends it."""
         self._face_upload_r2 = bool(upload_r2)
         try:
@@ -522,8 +525,13 @@ class ScannerMock:
         finish_state: str = ScannerState.COMPLETED,
         analyzer: Optional[Any] = None,
         begun: bool = False,
+        z_delay: Optional[float] = None,
+        reconstruct: bool = True,
     ) -> dict:
-        """Simulated face capture from the prepared height: sweeps or moves directly, and captures mock photos."""
+        """
+        Simulated face capture from the prepared height: sweeps or moves directly, and captures mock photos. The mock
+        photos are not faces: `reconstruct` is accepted and ignored (no 3D model, `result_id` stays null).
+        """
         if not begun:
             self.begin_face_scan(strategy=strategy, search_range_mm=search_range_mm, step_mm=step_mm,
                                  manual_z=manual_z)

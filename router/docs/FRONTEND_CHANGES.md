@@ -8,6 +8,14 @@ The server listens on `127.0.0.1:8000` only (the page runs on the Pi); there is 
 
 ---
 
+## 0. Changes of 2026-10-30
+
+* **`POST /scanner/start`**: `cloud` is now `{launch_runpod, resolution_level (0..3, default 1), title}`. The Meshroom fields `resolution_mp`, `mode`, `depthmap_downscale`, `max_input_points` were **removed** (sending them = `422`). `job_id` is optional (`null` default; if sent it must be `YYYYMMDD-HHMMSS-xxxxxx`). `launch_runpod: true` now starts Turntable Studio on RunPod with no confirmation; the model lands in `/library`.
+* **`GET /scanner/status`**: new `job_id`, `result_id` (library id of the model just saved), new phase `reconstructing_face`; `face_result` has `result_id`, `metrics`, `reconstruction_error`.
+* **`POST /scanner/prepare`**: optional `z_delay` (default `0.0010`). **`POST /scanner/face/prepare`**: optional `z_delay` (default `0.005`, slower than before). **`POST /scanner/face/capture`**: optional `z_delay` (`null` = the prepare's) and `reconstruct` (default `true`: 3D face model on the Pi, ~10-20 s in `processing` / phase `reconstructing_face`; a failure ends in `error`).
+* **Defaults changed:** `cloud.launch_runpod` is now `true` (an object scan always goes to RunPod), `face/prepare.upload_r2` is now `false` (a face never leaves the Pi). The pod also gets the turntable `angle` (`step_deg`).
+* New `POST /test/cloud/runpod-dry-run`: checks the cloud configuration and shows the pod request, without creating a pod.
+
 ## 1. Breaking changes (must be adapted)
 
 | Where | Before | Now |

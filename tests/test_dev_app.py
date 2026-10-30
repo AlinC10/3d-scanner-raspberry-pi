@@ -97,7 +97,7 @@ with TestClient(app) as client:
     out["endstops"] = client.get("/test/endstops").json()
 
     # scan -> completed
-    start = client.post("/scanner/start", json={"job_id": "dev-run"})
+    start = client.post("/scanner/start", json={"job_id": None, "cloud": {"launch_runpod": False}})
     out["start"] = start.status_code
     final = wait_for(client, ("completed", "error", "cancelled"), timeout=60)
     out["final"] = [final["state"], final["photos_captured"] > 0, final["photos_uploaded"] == final["photos_captured"], final["phase"]]

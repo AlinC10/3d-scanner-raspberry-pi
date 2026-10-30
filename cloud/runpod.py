@@ -1,504 +1,366 @@
+"""
+runpod.py — One pod per scan job through the RunPod REST API (https://rest.runpod.io/v1).
+
+* The pod is created from a list of acceptable GPU types (gpuTypeIds + gpuTypePriority "custom": RunPod takes
+  the first one with capacity, in our order) with a minimum host RAM and vCPU count per GPU.
+* Completion is read from R2 (jobs/<id>/output/status.json, written last by the pod), not guessed from uptime.
+* A pod whose container never starts (e.g. the host's Docker fails to pull the image: "failed to register layer")
+  still reports RUNNING. The pod writes jobs/<id>/output/started.json first thing; without it after
+  BOOT_TIMEOUT_S the pod is terminated and the job retried on a new pod (usually another host).
+* Every pod created is terminated (DELETE /pods/{id}) in a `finally`, after success, failure, cancel or timeout.
+  When a termination fails no other pod is started, so a lost termination never doubles the bill.
+* The pod never receives the RunPod API key: stopping it is the client's job.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
 import os
-import json
 import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+
 import requests
-from cloud.ram_heuristic import calculate_required_ram
-import csv
-import cloud.cloudflare_r2 as r2
 
-try:
-    from dotenv import load_dotenv
+logger = logging.getLogger("TurntableStudio.RunPod")
 
-    load_dotenv()
-except ImportError:
+REST_URL = "https://rest.runpod.io/v1"
+
+# Cheap CUDA GPUs first: GPU speed barely matters (2.3 of 30 min are GPU compute), host RAM and vCPUs do.
+# Exact ids are RunPod's gpuTypeIds enum (some contain double spaces there): check with --dry_run.
+DEFAULT_GPU_TYPES = (
+    "NVIDIA RTX A4000",
+    "NVIDIA RTX A4500",
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA RTX A5000",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA L4",
+    "NVIDIA A40",
+)
+
+# ── Limits (each one can be overridden by an environment variable) ─────────────────────────────────────────────────
+# A pod that runs longer than this is terminated. The pod's R2 credentials expire after the same time.
+POD_MAX_RUNTIME_S = float(os.environ.get("RUNPOD_POD_MAX_RUNTIME_S", str(60 * 60)))
+# Pods started for one job (a retry happens only for "ram_insufficient" or a pod that died without a status)
+MAX_POD_ATTEMPTS = int(os.environ.get("RUNPOD_MAX_POD_ATTEMPTS", "2"))
+# Create requests rejected for lack of capacity cost nothing: retried this many times
+MAX_CREATE_ATTEMPTS = int(os.environ.get("RUNPOD_MAX_CREATE_ATTEMPTS", "5"))
+CREATE_RETRY_S = 30.0
+# A pod whose pipeline has not written started.json after this long is replaced (stuck image pull on its host)
+BOOT_TIMEOUT_S = float(os.environ.get("RUNPOD_BOOT_TIMEOUT_S", str(10 * 60)))
+POLL_S = 5.0                      # pause between two status checks (the pod bills until the one after status.json)
+STATUS_MAX_ERRORS = 5             # consecutive failed status queries after which the pod is given up (and terminated)
+TERMINATE_ATTEMPTS = 5
+TERMINATE_RETRY_S = 5.0
+RAM_RETRY_FACTOR = 1.5            # pod died without status (likely OOM): next one asks for this much more RAM
+
+
+class RunPodError(RuntimeError):
     pass
 
-RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
-GRAPHQL_URL = "https://api.runpod.io/graphql"
 
-# Update this to your actual Docker image name on Docker Hub
-IMAGE_NAME = "yourdockerhubuser/meshroom-runner:latest"
+class RunPodClient:
+    """Thin REST client: create / get / delete pod."""
 
-# ── Limits of launch_job (each one can be overridden by an environment variable) ─────────────────────────────────
-# A pod that was created and did not deliver output.zip costs money: at most this many are tried with the RAM the job
-# needs. Then ONE last pod is tried on the host with the most RAM seen so far (see launch_job).
-MAX_POD_ATTEMPTS = int(os.environ.get("RUNPOD_MAX_POD_ATTEMPTS", "3"))
-# create_pod() failures cost nothing (no capacity for that GPU): the whole GPU list is walked at most this many times.
-MAX_CREATE_PASSES = int(os.environ.get("RUNPOD_MAX_CREATE_PASSES", "3"))
-# A pod that runs longer than this is terminated and the job is given up (a retry would most likely run as long).
-POD_MAX_RUNTIME_S = float(os.environ.get("RUNPOD_POD_MAX_RUNTIME_S", str(60 * 60)))
-# Variables copied into the pod (see pod_env in launch_job)
-POD_FORWARDED_VARIABLES = ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "MESHROOM_URL",
-                           "MESHROOM_FALLBACK_URL", "HF_TOKEN")
-POLL_S = 15.0                     # pause between two status queries
-STATUS_MAX_ERRORS = 5             # consecutive failed status queries after which the pod is given up (and terminated)
-TERMINATE_ATTEMPTS = 5            # terminate_pod() is retried this many times
-TERMINATE_RETRY_S = 5.0
-MIN_SUCCESS_UPTIME_S = 120        # a pod that exits sooner than this failed its host check (RAM) at start
-CREATE_RETRY_S = 2.0
-PASS_COOLDOWN_S = 60.0            # between two walks over the GPU list
-FAILED_POD_COOLDOWN_S = 10.0
+    def __init__(self, api_key: Optional[str] = None, session: Optional[requests.Session] = None,
+                 base_url: str = REST_URL):
+        self.api_key = api_key or os.environ.get("RUNPOD_API_KEY")
+        if not self.api_key:
+            raise RunPodError("RUNPOD_API_KEY is not set.")
+        self.http = session or requests.Session()
+        self.base_url = base_url.rstrip("/")
+
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        return self.http.request(
+            method, f"{self.base_url}{path}",
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            timeout=60, **kwargs,
+        )
+
+    def create_pod(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        r = self._request("POST", "/pods", json=body)
+        if r.status_code not in (200, 201):
+            raise RunPodError(f"Create pod failed ({r.status_code}): {r.text[:500]}")
+        return r.json()
+
+    def get_pod(self, pod_id: str) -> Dict[str, Any]:
+        r = self._request("GET", f"/pods/{pod_id}")
+        if r.status_code != 200:
+            raise RunPodError(f"Get pod {pod_id} failed ({r.status_code}): {r.text[:300]}")
+        return r.json()
+
+    def list_pods(self) -> List[Dict[str, Any]]:
+        r = self._request("GET", "/pods")
+        if r.status_code != 200:
+            raise RunPodError(f"List pods failed ({r.status_code}): {r.text[:300]}")
+        data = r.json()
+        return data if isinstance(data, list) else list(data.get("pods") or data.get("data") or [])
+
+    def delete_pod(self, pod_id: str) -> None:
+        r = self._request("DELETE", f"/pods/{pod_id}")
+        if r.status_code not in (200, 204, 404):  # 404: already gone
+            raise RunPodError(f"Delete pod {pod_id} failed ({r.status_code}): {r.text[:300]}")
 
 
-# determine GPU dynamically
-# GPU_TYPE_ID = "NVIDIA GeForce RTX 5090"
+def gpu_types_from_env() -> List[str]:
+    raw = os.environ.get("RUNPOD_GPU_TYPES", "")
+    return [g.strip() for g in raw.split(",") if g.strip()] or list(DEFAULT_GPU_TYPES)
 
-def gql(query: str, variables: dict | None = None) -> dict:
+
+def disk_gb_for(n_images: int, input_gb: float, resolution_level: int) -> int:
     """
-    Execute a GraphQL query against the RunPod API.
-
-    :param query: The GraphQL query string.
-    :type query: str
-    :param variables: The variables for the GraphQL query.
-    :type variables: dict | None
-    :return: The data payload from the GraphQL response.
-    :rtype: dict
+    Container disk: photos + undistorted/texturing copies (~4x the JPEGs) + depth maps at their peak
+    (~74 MB per image at level 1, 4x at level 0; deleted after fusion) + 10 GB of headroom.
     """
-    if not RUNPOD_API_KEY:
-        raise ValueError("RUNPOD_API_KEY is not set.")
-
-    r = requests.post(
-        GRAPHQL_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {RUNPOD_API_KEY}",
-        },
-        json={"query": query, "variables": variables or {}},
-        timeout=60,
-    )
-    r.raise_for_status()
-    payload = r.json()
-    if "errors" in payload:
-        raise RuntimeError(payload["errors"])
-    return payload["data"]
+    dmaps_gb = n_images * 0.074 * (4 if int(resolution_level) == 0 else 1)
+    return int(math.ceil(10 + 4 * input_gb + dmaps_gb))
 
 
-def create_pod(env_dict: dict, gpu_type_id: str) -> str:
-    """
-    Create a new pod on RunPod using the specified environment and GPU.
-
-    :param env_dict: The environment variables to set in the pod.
-    :type env_dict: dict
-    :param gpu_type_id: The ID of the GPU type to request.
-    :type gpu_type_id: str
-    :return: The ID of the created pod.
-    :rtype: str
-    """
-    mutation = """
-    mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
-      podFindAndDeployOnDemand(input: $input) {
-        id
-        desiredStatus
-      }
-    }
-    """
-    env_list = [{"key": k, "value": str(v)} for k, v in env_dict.items()]
-
-    pod_input = {
-        "cloudType": "SECURE",
+def build_pod_request(
+    image: str,
+    env: Dict[str, str],
+    min_ram_gb: int,
+    min_vcpu: int,
+    disk_gb: int,
+    gpu_types: Optional[List[str]] = None,
+    name: str = "turntable-studio-job",
+    cloud_type: str = "SECURE",
+    registry_auth_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """POST /pods body: 1 GPU from `gpu_types` in our order, minimum host RAM / vCPUs per GPU, no ports."""
+    body: Dict[str, Any] = {
+        "name": name,
+        "imageName": image,
+        "computeType": "GPU",
+        "cloudType": cloud_type,
         "gpuCount": 1,
-        "gpuTypeId": gpu_type_id,
-        "name": f"meshroom-dynamic-job",
-        "imageName": IMAGE_NAME,
-        # Give enough disk space to extract the 22.5 GB Meshroom + cache + output (tarball itself is 13.3 GB!)
-        "containerDiskInGb": 80,
+        "gpuTypeIds": list(gpu_types or DEFAULT_GPU_TYPES),
+        "gpuTypePriority": "custom",
+        "minRAMPerGPU": int(min_ram_gb),
+        "minVCPUPerGPU": int(min_vcpu),
+        "containerDiskInGb": int(disk_gb),
         "volumeInGb": 0,
-        "env": env_list,
-        "ports": "",
-        "dockerArgs": "",
+        "ports": [],
+        "env": dict(env),
     }
-
-    data = gql(mutation, {"input": pod_input})
-    return data["podFindAndDeployOnDemand"]["id"]
-
-
-def get_pod_status(pod_id: str) -> dict:
-    """
-    Retrieve the status of a specific pod.
-
-    :param pod_id: The ID of the pod to check.
-    :type pod_id: str
-    :return: The pod status data.
-    :rtype: dict
-    """
-    query = """
-    query GetPod($podId: String!) {
-      pod(input: {podId: $podId}) {
-        id
-        desiredStatus
-        runtime {
-          uptimeInSeconds
-        }
-      }
-    }
-    """
-    data = gql(query, {"podId": pod_id})
-    return data["pod"]
+    if registry_auth_id:
+        body["containerRegistryAuthId"] = registry_auth_id
+    return body
 
 
-def get_pod_memory_gb(pod_id: str) -> float | None:
-    """
-    RAM of the host a pod runs on, in GB (None when it cannot be read). Best effort on purpose: it feeds only the choice
-    of the last-resort host in launch_job(), so a failing query must never fail the job.
-    """
-    query = """
-    query PodMemory($podId: String!) {
-      pod(input: {podId: $podId}) {
-        memoryInGb
-      }
-    }
-    """
-    try:
-        value = gql(query, {"podId": pod_id})["pod"]["memoryInGb"]
-        return float(value) if value is not None else None
-    except Exception as e:
-        print(f"Could not read the RAM of pod {pod_id}: {e}")
-        return None
+def redact(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy of a request for printing: secrets in env replaced."""
+    out = dict(body)
+    out["env"] = {k: ("***" if any(s in k for s in ("SECRET", "TOKEN", "KEY")) else v)
+                  for k, v in body.get("env", {}).items()}
+    return out
 
 
-def get_pod_logs(pod_id: str) -> str:
+def terminate_pod_reliably(client: RunPodClient, pod_id: str) -> bool:
     """
-    Fetches the logs of a specific pod.
-    :param pod_id: The ID of the pod
-    :type pod_id: str
-    :return: The log string
-    :rtype: str
-    """
-    query = """
-    query PodLog($podId: String!) {
-      podLog(input: {podId: $podId}) {
-        stepLog
-      }
-    }
-    """
-    response = gql(query, {"podId": pod_id})
-    return response.get("podLog", {}).get("stepLog", "")
-
-
-def terminate_pod(pod_id: str) -> str:
-    """
-    Terminate a running pod on RunPod. This completely deletes the pod and disk to stop all billing.
-    :param pod_id: The ID of the pod to terminate.
-    :type pod_id: str
-    :return: The status of the pod after termination.
-    :rtype: str
-    """
-    mutation = """
-    mutation TerminatePod($podId: String!) {
-      podTerminate(input: {podId: $podId})
-    }
-    """
-    data = gql(mutation, {"podId": pod_id})
-    # podTerminate returns a boolean or null usually, we can just return success string
-    return "TERMINATED"
-
-
-def terminate_pod_reliably(pod_id: str) -> bool:
-    """
-    Terminates a pod and makes sure it is gone: terminate_pod() is retried a few times (a network blip must not leave a
-    billed pod running). Returns False, after saying loudly which pod is still alive, when every attempt failed.
+    Terminates a pod and makes sure it is gone: retried a few times (a network blip must not leave a billed pod
+    running). Returns False, after saying loudly which pod is still alive, when every attempt failed.
     """
     for attempt in range(1, TERMINATE_ATTEMPTS + 1):
         try:
-            terminate_pod(pod_id)
+            client.delete_pod(pod_id)
             return True
         except Exception as e:
-            print(f"Terminating pod {pod_id} failed (attempt {attempt} of {TERMINATE_ATTEMPTS}): {e}")
+            logger.warning(f"Terminating pod {pod_id} failed (attempt {attempt} of {TERMINATE_ATTEMPTS}): {e}")
             if attempt < TERMINATE_ATTEMPTS:
                 time.sleep(TERMINATE_RETRY_S)
-    print(f"!!! POD {pod_id} COULD NOT BE TERMINATED AND MAY STILL BE BILLED. Terminate it in the RunPod console. !!!")
+    logger.error(f"!!! POD {pod_id} COULD NOT BE TERMINATED AND MAY STILL BE BILLED. Terminate it in the RunPod console. !!!")
     return False
 
 
+def terminate_stale_pods(client: RunPodClient, name_prefix: str = "turntable-", keep: tuple = ()) -> List[str]:
+    """
+    Terminates every pod of the account whose name starts with `name_prefix` (pods of earlier jobs left alive by a
+    crash, a power cut or a lost termination). Called before a new job starts a pod, so at most one job's pod bills.
+    Returns the ids it terminated; raises RunPodError when the pods cannot be listed or one cannot be terminated.
+    """
+    stale = [p.get("id") for p in client.list_pods()
+             if str(p.get("name") or "").startswith(name_prefix) and p.get("id") and p.get("id") not in keep]
+    failed = [pod_id for pod_id in stale if not terminate_pod_reliably(client, pod_id)]
+    if failed:
+        raise RunPodError(f"Old pod(s) could not be terminated: {', '.join(failed)}")
+    return stale
+
+
+@dataclass
 class PodRun:
-    """What happened to one pod: how it ended, how long it ran, the RAM of its host and whether it is gone."""
+    """What happened to one pod."""
+    pod_id: str
+    started_at: float
+    outcome: str = "failed"          # finished | exited | cancelled | timeout | boot_timeout | status_error
+    status: Optional[Dict[str, Any]] = None   # jobs/<id>/output/status.json
+    terminated: bool = False
+    pod_info: Dict[str, Any] = field(default_factory=dict)   # gpu, memoryInGb, vcpuCount, costPerHr
+    ended_at: float = 0.0
 
-    def __init__(self, pod_id: str, started_at: float):
-        self.pod_id = pod_id
-        self.started_at = started_at
-        self.outcome = "failed"      # exited | cancelled | timeout | status_error | failed
-        self.uptime = 0
-        self.memory_gb: float | None = None
-        self.terminated = False
+    @property
+    def elapsed_s(self) -> float:
+        return (self.ended_at or time.time()) - self.started_at
+
+    @property
+    def cost_estimate(self) -> Optional[float]:
+        rate = self.pod_info.get("costPerHr")
+        return round(float(rate) * self.elapsed_s / 3600.0, 4) if rate else None
 
 
-def run_pod(env: dict, gpu_type_id: str, cancel_event=None) -> PodRun:
+def _pod_summary(pod: Dict[str, Any]) -> Dict[str, Any]:
+    gpu = pod.get("gpu") or {}
+    machine = pod.get("machine") or {}
+    return {
+        "gpu": gpu.get("displayName") or gpu.get("id") or machine.get("gpuTypeId"),
+        "memoryInGb": pod.get("memoryInGb"),
+        "vcpuCount": pod.get("vcpuCount"),
+        "costPerHr": pod.get("adjustedCostPerHr") or pod.get("costPerHr"),
+        "dataCenterId": machine.get("dataCenterId"),
+    }
+
+
+def create_pod_with_retries(client: RunPodClient, body: Dict[str, Any],
+                            wait: Callable[[float], bool]) -> Optional[Dict[str, Any]]:
+    """Create requests rejected (no capacity with these filters) cost nothing: retry a few times, then give up."""
+    for attempt in range(1, MAX_CREATE_ATTEMPTS + 1):
+        try:
+            return client.create_pod(body)
+        except Exception as e:
+            logger.warning(f"Pod creation failed (attempt {attempt} of {MAX_CREATE_ATTEMPTS}): {e}")
+            if attempt < MAX_CREATE_ATTEMPTS and wait(CREATE_RETRY_S):
+                return None
+    return None
+
+
+def run_pod(
+    client: RunPodClient,
+    body: Dict[str, Any],
+    read_status: Callable[[], Optional[Dict[str, Any]]],
+    cancel_event=None,
+    max_runtime_s: float = POD_MAX_RUNTIME_S,
+    poll_s: float = POLL_S,
+    on_progress: Optional[Callable[[str], None]] = None,
+    read_started: Optional[Callable[[], bool]] = None,
+    boot_timeout_s: Optional[float] = None,
+) -> Optional[PodRun]:
     """
-    Creates one pod, waits until it exits (or is cancelled, runs too long, or cannot be queried) and ALWAYS terminates it
-    afterwards, whatever happens in between (the `finally`). Raises only when the pod could not be created: nothing is
-    left running in that case.
+    Creates one pod, waits until its status.json appears in R2 (or the pod exits, is cancelled, runs too long,
+    never starts its pipeline within boot_timeout_s or cannot be queried) and ALWAYS terminates it afterwards.
+    read_started() says whether the pod's pipeline has started (started.json in R2); None disables the check.
+    Returns None when no pod could be created.
     """
-    started_at = time.time()
-    pod_id = create_pod(env, gpu_type_id)
-    print(f"Created pod: {pod_id}")
-    run = PodRun(pod_id, started_at)
-    try:
-        run.memory_gb = get_pod_memory_gb(pod_id)
-        print(f"Waiting for pod {pod_id} to start and complete (host RAM: {run.memory_gb} GB)...")
-        errors = 0
-        while True:
-            if cancel_event is not None:
-                if cancel_event.wait(timeout=POLL_S):
-                    print("Job cancelled by user. Terminating pod immediately.")
-                    run.outcome = "cancelled"
-                    break
-            else:
-                time.sleep(POLL_S)
-
-            if time.time() - started_at > POD_MAX_RUNTIME_S:
-                print(f"Pod exceeded the maximum runtime of {POD_MAX_RUNTIME_S / 60:g} minutes. Terminating it to prevent runaway billing.")
-                run.outcome = "timeout"
-                break
-
-            try:
-                pod_data = get_pod_status(pod_id)
-            except Exception as e:
-                errors += 1
-                print(f"Could not read the status of pod {pod_id} ({errors} of {STATUS_MAX_ERRORS}): {e}")
-                if errors >= STATUS_MAX_ERRORS:
-                    run.outcome = "status_error"
-                    break
-                continue
-            errors = 0
-
-            runtime = pod_data.get("runtime")
-            if runtime:
-                run.uptime = runtime.get("uptimeInSeconds", 0)
-            status = pod_data["desiredStatus"]
-            print(f"Pod status: {status} (Uptime: {run.uptime}s)")
-            if status in ("EXITED", "TERMINATED"):
-                print("Pod has exited.")
-                run.outcome = "exited"
-                break
-    finally:
-        print(f"Stopping/cleaning up pod {pod_id}...")
-        run.terminated = terminate_pod_reliably(pod_id)
-    return run
-
-
-def output_is_ready(started_at: float) -> bool:
-    """True when output.zip is in the bucket and was written after `started_at` (False when it cannot be checked)."""
-    try:
-        return bool(r2.file_exists_and_is_new("output.zip", after_timestamp=started_at))
-    except Exception as e:
-        print(f"Could not check output.zip in the bucket: {e}")
-        return False
-
-
-def launch_job(job: dict, cancel_event=None):
-    """
-    Launch a processing job on a dynamically provisioned pod based on RAM requirements.
-
-    The number of attempts is bounded (a pod is billed from the moment it is created):
-
-    * pods that could not be created (no capacity) cost nothing: the GPU list is walked at most MAX_CREATE_PASSES times;
-    * pods that were created and did not deliver output.zip (the host failed the RAM check at start, or the job was
-      killed) count as failed attempts: after MAX_POD_ATTEMPTS of them ONE last pod is started on the GPU whose host had
-      the most RAM, with the RAM requirement lowered to what that host has (best effort: the job may still run out of
-      memory). If no host RAM could be read, the job is given up instead;
-    * a pod that exceeds POD_MAX_RUNTIME_S is terminated and the job is given up at once.
-
-    Every pod is terminated in a `finally` (run_pod), also on cancel, timeout, API errors and unexpected exceptions; when
-    a pod cannot be terminated no other pod is started.
-
-    :param job: The job configuration and details.
-    :type job: dict
-    :param cancel_event: Optional threading.Event to instantly cancel execution.
-    :return: True if the job completed successfully.
-    :rtype: bool
-    """
-    photo_count = job.get("photo_count", 50)
-    resolution_mp = job.get("resolution_mp", 12.0)
-    mode = job.get("mode", "single")
-    two_sides = (mode == "two-sides")
-
-    # Store these key parameters in the job dict so they flow into the final stats
-    job["depthmap_downscale"] = job.get("depthmap_downscale", 2)
-    job["max_input_points"] = job.get("max_input_points", 10000000)
-
-    # Calculate required RAM
-    ram_min_gb = calculate_required_ram(
-        num_images=photo_count,
-        resolution_mp=resolution_mp,
-        depthmap_downscale=job["depthmap_downscale"],
-        max_input_points=job["max_input_points"],
-        two_sides_mode=two_sides
-    )
-    print(f"Calculated required RAM: {ram_min_gb} GB for {photo_count} photos ({mode} mode)")
-
-    # Define GPU fallback strategy based on required RAM and Secure Cloud availability
-    if ram_min_gb > 64:
-        # High RAM needs:
-        gpu_fallback_list = [
-            "NVIDIA GeForce RTX 5090",
-            "NVIDIA L40",
-            "NVIDIA RTX 6000 Ada Generation",
-            "NVIDIA GeForce RTX 3090",
-            "NVIDIA RTX A6000"
-        ]
-        complementary_gpus_list = [
-            "NVIDIA GeForce RTX 4090",
-            "NVIDIA A40"
-        ]
-    else:
-        # Low/Medium RAM needs: Stick to fast/cheap consumer GPUs.
-        gpu_fallback_list = [
-            "NVIDIA GeForce RTX 5090",
-            "NVIDIA GeForce RTX 4090",
-            "NVIDIA GeForce RTX 3090",
-            "NVIDIA A40"
-        ]
-        complementary_gpus_list = [
-            "NVIDIA L40",
-            "NVIDIA RTX 6000 Ada Generation",
-            "NVIDIA RTX A6000"
-        ]
-    candidates = gpu_fallback_list + complementary_gpus_list
-
-    def pod_env(gpu: str, ram_gb: int) -> dict:
-        # Inject the target GPU into the job JSON so main.py can save it in stats
-        job["target_gpu"] = gpu
-        env = {"JOB_JSON": json.dumps(job), "RAM_MIN_GB": str(ram_gb)}
-        # Forward the Cloudflare R2 access, the Meshroom URLs and the Hugging Face token. The pod runs on a third party's
-        # host, so POD_<NAME> (for example POD_R2_ACCESS_KEY_ID, a token limited to the scanner bucket) is preferred over
-        # <NAME> (the Pi's own key) when it is set.
-        for key in POD_FORWARDED_VARIABLES:
-            value = os.getenv("POD_" + key) or os.getenv(key)
-            if value:
-                env[key] = value
-        return env
-
     def wait(seconds: float) -> bool:
-        """Pause; True when the job was cancelled meanwhile."""
         if cancel_event is not None:
             return cancel_event.wait(timeout=seconds)
         time.sleep(seconds)
         return False
 
-    failed: list[tuple[float | None, str]] = []   # (host RAM in GB, GPU) of the pods that failed
-    create_failures = 0
-    max_create_failures = max(1, MAX_CREATE_PASSES) * len(candidates)
-    index = 0
-    attempt = 0
+    say = on_progress or logger.info
+    boot_timeout_s = BOOT_TIMEOUT_S if boot_timeout_s is None else boot_timeout_s
+    created = create_pod_with_retries(client, body, wait)
+    if not created:
+        return None
+    run = PodRun(pod_id=created["id"], started_at=time.time(), pod_info=_pod_summary(created))
+    say(f"Created pod {run.pod_id}: {run.pod_info}")
+    try:
+        errors = 0
+        started = read_started is None
+        while True:
+            if wait(poll_s):
+                say("Job cancelled: terminating the pod.")
+                run.outcome = "cancelled"
+                break
+            if time.time() - run.started_at > max_runtime_s:
+                say(f"Pod exceeded {max_runtime_s / 60:g} minutes: terminating it.")
+                run.outcome = "timeout"
+                break
+            try:
+                status = read_status()
+            except Exception as e:
+                status = None
+                say(f"Could not read status.json: {e}")
+            if status:
+                run.status = status
+                run.outcome = "finished"
+                break
+            if not started:
+                try:
+                    started = bool(read_started())
+                except Exception as e:
+                    say(f"Could not read started.json: {e}")
+                if started:
+                    say(f"Pipeline started in the pod after {run.elapsed_s:.0f} s (image pull + boot).")
+                elif run.elapsed_s > boot_timeout_s:
+                    say(f"Pipeline not started after {boot_timeout_s / 60:g} minutes (image pull stuck on this host?): "
+                        "terminating the pod. Its log is on console.runpod.io until then.")
+                    run.outcome = "boot_timeout"
+                    break
+            try:
+                pod = client.get_pod(run.pod_id)
+                errors = 0
+            except Exception as e:
+                errors += 1
+                say(f"Could not read pod {run.pod_id} ({errors} of {STATUS_MAX_ERRORS}): {e}")
+                if errors >= STATUS_MAX_ERRORS:
+                    run.outcome = "status_error"
+                    break
+                continue
+            info = _pod_summary(pod)
+            run.pod_info.update({k: v for k, v in info.items() if v is not None})
+            say(f"Pod {pod.get('desiredStatus')} | {run.elapsed_s / 60:.1f} min | {pod.get('lastStatusChange', '')}")
+            if pod.get("desiredStatus") in ("EXITED", "TERMINATED"):
+                run.status = read_status()   # the pod may have written it just before exiting
+                run.outcome = "finished" if run.status else "exited"
+                break
+    finally:
+        run.ended_at = time.time()
+        say(f"Terminating pod {run.pod_id}...")
+        run.terminated = terminate_pod_reliably(client, run.pod_id)
+    return run
 
-    while len(failed) < MAX_POD_ATTEMPTS:
-        if cancel_event is not None and cancel_event.is_set():
-            print("Job cancelled by user before pod creation.")
-            return False
-        if create_failures >= max_create_failures:
-            print(f"[!] No pod could be created in {MAX_CREATE_PASSES} walks over the GPU list. Giving up.")
-            return False
 
-        target_gpu = candidates[index % len(candidates)]
-        index += 1
-        attempt += 1
-        print(f"\n--- Attempt {attempt} (Targeting: {target_gpu}) ---")
-
-        try:
-            run = run_pod(pod_env(target_gpu, ram_min_gb), target_gpu, cancel_event)
-        except Exception as e:
-            print(f"Failed to create pod for {target_gpu}: {e}")
-            create_failures += 1
-            # after a whole walk over the list without a pod, wait before the next one (spares the API)
-            if index % len(candidates) == 0:
-                print(f"Walked the whole GPU list; waiting {PASS_COOLDOWN_S:g} s before the next walk...")
-                if wait(PASS_COOLDOWN_S):
-                    return False
-            elif wait(CREATE_RETRY_S):
-                return False
+def run_job_pods(
+    client: RunPodClient,
+    make_body: Callable[[int], Dict[str, Any]],
+    min_ram_gb: int,
+    read_status: Callable[[], Optional[Dict[str, Any]]],
+    cancel_event=None,
+    max_runtime_s: float = POD_MAX_RUNTIME_S,
+    on_progress: Optional[Callable[[str], None]] = None,
+    before_retry: Optional[Callable[[], None]] = None,
+    read_started: Optional[Callable[[], bool]] = None,
+) -> List[PodRun]:
+    """
+    Runs the job on at most MAX_POD_ATTEMPTS pods. A new pod is started only when the previous one
+    reported "ram_insufficient" (asks for the RAM the pod measured it needs), died without a status
+    (likely OOM: asks for RAM_RETRY_FACTOR more) or never started its pipeline (same request, new pod). make_body(min_ram_gb) builds the create request (fresh
+    credentials for every pod); before_retry() removes the previous pod's status.json.
+    """
+    say = on_progress or logger.info
+    runs: List[PodRun] = []
+    ram = int(min_ram_gb)
+    for attempt in range(1, MAX_POD_ATTEMPTS + 1):
+        if attempt > 1 and before_retry is not None:
+            before_retry()
+        say(f"--- Pod attempt {attempt} of {MAX_POD_ATTEMPTS} (min RAM {ram} GB per GPU) ---")
+        run = run_pod(client, make_body(ram), read_status, cancel_event, max_runtime_s, on_progress=say,
+                      read_started=read_started)
+        if run is None:
+            say("No pod could be created with these filters.")
+            break
+        runs.append(run)
+        if not run.terminated or run.outcome in ("cancelled", "timeout", "status_error"):
+            break
+        state = (run.status or {}).get("state")
+        if run.outcome == "finished" and state == "ram_insufficient":
+            ram = max(ram + 8, int(math.ceil(float(run.status.get("required_gb", ram)) * 1.2)))
             continue
-
-        if not run.terminated:
-            return False          # a pod may still be running: do not start another one
-        if run.outcome == "cancelled":
-            return False
-        if run.outcome == "timeout":
-            return False
-        if run.outcome == "exited" and run.uptime > MIN_SUCCESS_UPTIME_S:
-            print("Pod ran for a significant amount of time. Verifying R2 for output.zip...")
-            if output_is_ready(run.started_at):
-                print("Success! output.zip is present and fresh.")
-                return True
-            print("Failure! output.zip is missing or stale. The job likely failed via OOM kill.")
-        else:
-            print("Pod exited very quickly or could not be followed. RAM check likely failed on this host.")
-
-        failed.append((run.memory_gb, target_gpu))
-        if len(failed) < MAX_POD_ATTEMPTS and wait(FAILED_POD_COOLDOWN_S):
-            return False
-
-    # Last resort: the host with the most RAM seen, with the requirement lowered to what it has
-    known = [item for item in failed if item[0] is not None]
-    if not known:
-        print(f"[!] {len(failed)} pods failed and none reported its RAM, so there is no better host to pick. Giving up.")
-        return False
-    best_ram, best_gpu = max(known, key=lambda item: item[0])
-    lowered = min(ram_min_gb, int(best_ram))
-    print(f"[!] {len(failed)} pods failed. Last attempt on {best_gpu} (host RAM {best_ram:g} GB, "
-          f"requirement lowered from {ram_min_gb} GB to {lowered} GB); the job may run out of memory.")
-    if cancel_event is not None and cancel_event.is_set():
-        return False
-    try:
-        run = run_pod(pod_env(best_gpu, lowered), best_gpu, cancel_event)
-    except Exception as e:
-        print(f"Failed to create the last-resort pod for {best_gpu}: {e}")
-        return False
-    if run.outcome == "exited" and run.terminated and run.uptime > MIN_SUCCESS_UPTIME_S and output_is_ready(run.started_at):
-        print("Success! output.zip is present and fresh.")
-        return True
-    print("The last-resort pod did not deliver output.zip. Giving up.")
-    return False
-
-
-def update_statistics(output_dir="./output", csv_file="stats.csv"):
-    stats_path = os.path.join(output_dir, "stats.json")
-    if not os.path.exists(stats_path):
-        print(f"No stats.json found in {output_dir}. Skipping statistics update.")
-        return
-
-    try:
-        with open(stats_path, "r", encoding="utf-8") as f:
-            stats = json.load(f)
-
-        file_exists = os.path.exists(csv_file)
-
-        with open(csv_file, "a", newline="", encoding="utf-8") as csvfile:
-            fieldnames = [
-                "timestamp", "job_id", "status",
-                "run_time_seconds", "max_ram_mb", "min_ram_calculated", "cpu_cores",
-                "photo_count", "resolution_mp", "mode", "depthmap_downscale", "max_input_points",
-                "output_size_mb", "target_gpu"
-            ]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-            if not file_exists:
-                writer.writeheader()
-
-            writer.writerow(stats)
-
-        print(f"Successfully appended run statistics to {csv_file}!")
-    except Exception as e:
-        print(f"Error updating statistics: {e}")
-
-
-if __name__ == "__main__":
-    print("Starting the simulation...")
-
-    # send_images()
-    # send_rig_images()
-
-    # Run a Runpod command
-    print("Run Runpod...")
-
-    test_job = {
-        "job_id": "job-12345",
-        "photo_count": 80,
-        "mode": "single"
-    }
-    launch_job(test_job)
-
-    print("Runpod Finishes its job!")
-
-    r2.download_result()
-    update_statistics()
-    r2.delete_all_files()
+        if run.outcome == "exited":
+            ram = int(math.ceil(ram * RAM_RETRY_FACTOR))
+            continue
+        if run.outcome == "boot_timeout":
+            continue          # same request: RunPod places the new pod, usually on another host
+        break  # ok or pipeline_error: retrying would not help
+    return runs

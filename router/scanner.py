@@ -34,8 +34,9 @@ if MOCK_HARDWARE:
     from hardware.scanner_mock import ScannerState
 else:
     from hardware.scanner import Scanner, ScannerState
-import cloud.cloudflare_r2 as r2
-# cloud.runpod is imported lazily (see _load_runpod): a missing RunPod package or configuration must not affect scans
+from pathlib import Path
+from app_paths import results_directory
+# cloud.job / cloud.runpod are imported lazily (see _load_cloud_job): a missing RunPod configuration must not affect scans
 # that do not launch RunPod.
 
 log = logging.getLogger(__name__)
@@ -110,6 +111,11 @@ def _load_runpod():
     return importlib.import_module("cloud.runpod")
 
 
+def _load_cloud_job():
+    """Imports cloud.job (Turntable Studio's whole cloud flow for one scan) on first use."""
+    return importlib.import_module("cloud.job")
+
+
 def __getattr__(name):
     # Backward compatibility: `router.scanner.runpod` used to be a module-level import
     if name == "runpod":
@@ -129,17 +135,18 @@ def _runpod_config_problem() -> str | None:
     asks for RunPod is refused before the physical scan instead of failing after it (API-10, CLOUD-11).
     """
     try:
-        runpod_module = _load_runpod()
+        job_module = _load_cloud_job()
     except Exception as e:
-        return f"The RunPod module could not be loaded: {e}"
+        return f"The cloud module could not be loaded: {e}"
 
-    api_key = getattr(runpod_module, "RUNPOD_API_KEY", None)
-    if not isinstance(api_key, str) or not api_key.strip():
-        return "RUNPOD_API_KEY is not set; configure it or send cloud.launch_runpod=false."
-
-    image = getattr(runpod_module, "IMAGE_NAME", None)
-    if not isinstance(image, str) or not image.strip() or image.strip().lower().startswith("yourdockerhubuser/"):
-        return "The RunPod image name is not configured (placeholder value); set it or send cloud.launch_runpod=false."
+    missing = [name for name in ("RUNPOD_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_R2_API_TOKEN",
+                                 "R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+               if not os.environ.get(name, "").strip()]
+    if missing:
+        return f"missing environment variable(s) {', '.join(missing)}; configure them or send cloud.launch_runpod=false."
+    image_env = getattr(job_module, "DEFAULT_IMAGE_ENV", "TURNTABLE_IMAGE")
+    if not os.environ.get(image_env, "").strip():
+        return f"{image_env} (the Turntable Studio Docker image) is not set; set it or send cloud.launch_runpod=false."
     return None
 
 
@@ -256,7 +263,7 @@ def prepare_scan(req: PrepareRequest, background_tasks: BackgroundTasks):
     """
     return _start_preparation(
         background_tasks, req.illumination_brightness, req.enable_stream, req.camera_config.model_dump(),
-        {"z_start_mm": req.z_start_mm}, scan_mode=MODE_OBJECT,
+        {"z_start_mm": req.z_start_mm, "z_delay": req.z_delay}, scan_mode=MODE_OBJECT,
     )
 
 
@@ -273,7 +280,7 @@ def prepare_face_scan(req: FacePrepareRequest, background_tasks: BackgroundTasks
         raise HTTPException(status_code=400, detail=problem)
     return _start_preparation(
         background_tasks, req.illumination_brightness, req.enable_stream, req.camera_config.model_dump(),
-        {"z_start_mm": req.start_z_mm, "upload_r2": req.upload_r2}, scan_mode=MODE_FACE, check_cloud=req.upload_r2,
+        {"z_start_mm": req.start_z_mm, "upload_r2": req.upload_r2, "z_delay": req.z_delay}, scan_mode=MODE_FACE, check_cloud=req.upload_r2,
     )
 
 
@@ -301,7 +308,8 @@ def _orchestrate_pipeline(req: StartRequest):
                 z_decel_percent=req.mechanical.z_axis.decel_percent,
                 turntable_end_delay=req.mechanical.turntable.end_delay,
                 z_end_delay=req.mechanical.z_axis.end_delay,
-                finish_state=ScannerState.PROCESSING  # no IDLE gap between the scan and the cloud pipeline
+                finish_state=ScannerState.PROCESSING,  # no IDLE gap between the scan and the cloud pipeline
+                job_id=req.job_id,
             )
         except RuntimeError as e:
             # scan() refused to start (the scanner is no longer PREPARED, e.g. cancelled in between).
@@ -339,49 +347,63 @@ def _orchestrate_pipeline(req: StartRequest):
                 log.info("Scan completed: photos verified in the bucket (RunPod not requested).")
             return
 
-        # 3. Cloud Processing
-        runpod = _load_runpod()
+        # 3. Cloud processing: Turntable Studio on one RunPod pod (cloud.job.run_cloud_job). The photos are already in
+        # jobs/<job_id>/input/ (uploaded and verified during the scan), so the upload step is skipped. Every pod is
+        # terminated in run_pod's `finally` (also on a cancel: the cancel event is passed through), pods of older jobs
+        # are terminated before a new one starts, and the R2 job folder is deleted once the result is extracted.
+        cloud_job = _load_cloud_job()
         if not _set_state_unless_cancelled(ScannerState.PROCESSING):
             log.info("Scan was cancelled, aborting cloud pipeline.")
             return
 
-        job = {
-            "job_id": req.job_id,
-            "photo_count": scanner.total_photos,
-            "resolution_mp": req.cloud.resolution_mp,
-            "mode": req.cloud.mode,
-            "depthmap_downscale": req.cloud.depthmap_downscale,
-            "max_input_points": req.cloud.max_input_points
+        job_id = scanner.job_id
+        options = {
+            "rig_mode": True,
+            "resolution_level": req.cloud.resolution_level,
+            "lift_mm": req.mechanical.z_axis.distance_mm,
+            "step_deg": req.mechanical.turntable.angle,   # turntable step: the pod derives the camera poses from it
+            "texturing_engine": "texrecon",
         }
+        if req.cloud.title:
+            options["title"] = req.cloud.title
 
-        success = runpod.launch_job(job, cancel_event=scanner._cancel_event)
+        def _progress(message: str) -> None:
+            log.info("[Cloud %s] %s", job_id, message)
+            if scanner.state == ScannerState.PROCESSING:
+                scanner.phase_message = message
+
+        report = cloud_job.run_cloud_job(
+            input_dir=str(Path(scanner.images_dir).parent),
+            image_prefix=str(Path(scanner.images_dir).name) + "/",
+            results_dir=str(results_directory()),
+            job_id=job_id,
+            pipeline_options=options,
+            dry_run=False,
+            skip_upload=True,
+            cancel_event=scanner._cancel_event,
+            on_progress=_progress,
+        )
 
         if _cancel_requested() or scanner.state == ScannerState.CANCELLED:
             scanner.state = ScannerState.CANCELLED
             log.info("Job cancelled during cloud processing.")
             return
 
-        if not success:
-            raise RuntimeError("RunPod processing failed.")
+        if report.get("result") != "ok":
+            status = report.get("status") or {}
+            raise RuntimeError(f"Turntable Studio job {job_id} failed: {status.get('state') or 'no pod result'} "
+                               f"{status.get('error', '')}".strip())
 
-        # 4. Downloading Assets
-        if not _set_state_unless_cancelled(ScannerState.DOWNLOADING):
-            log.info("Job cancelled before the download.")
-            return
-        # R2 download_generated_obj defaults to dest_dir=os.getcwd() if not provided, but let's be explicit
-        success = r2.download_generated_obj(object_name="output.zip", dest_dir=r2.OUTPUT_DIR)
-
-        if not success:
-            raise RuntimeError("Failed to download or extract output.zip from R2.")
-
-        # 5. Completed! (not if a cancel arrived during the download)
+        # 4. The result is already extracted in results/<job_id>/ (served by /library)
+        scanner.result_id = job_id
         if _set_state_unless_cancelled(ScannerState.COMPLETED):
-            log.info("Full pipeline completed successfully.")
-        else:
-            log.info("Job cancelled during the download; state stays CANCELLED.")
+            log.info("Full pipeline completed: model in %s (cost estimate %s).",
+                     report.get("results_dir"), report.get("cost_estimate"))
 
     except Exception as e:
         log.error("Pipeline failed: %s", e)
+        if scanner.state in (ScannerState.PROCESSING, ScannerState.DOWNLOADING):
+            scanner.error = str(e)
         _set_state_unless_cancelled(ScannerState.ERROR)
     finally:
         with _start_lock:
@@ -546,6 +568,8 @@ def get_status():
         error=_text("error"),
         tof_warnings=_texts("tof_warnings"),
         face_result=_face_result(),
+        job_id=_text("job_id"),
+        result_id=_text("result_id"),
         **_upload_progress(),
     )
 

@@ -1,77 +1,100 @@
-# Cloud Module Documentation
+# Cloud: RunPod + Cloudflare R2
 
-The `cloud` module is responsible for orchestrating remote processing and storage for the 3D scanning pipeline. It contains the integration logic for **Cloudflare R2 (S3-compatible object storage)** and **RunPod (dynamic GPU provisioning)**.
+One scan = one pod, started on demand and terminated as soon as its result is in R2.
+The pipeline (`pipeline/`, `main.py`) does not depend on this folder; `runpod_job.py` (in the Docker image)
+and `cloud/job.py` (on the Pi / laptop) connect the two.
 
----
-
-## 🏗️ Cloudflare R2 (`cloudflare_r2.py`)
-
-This file manages all upload, download, and cleanup operations for images and generated 3D assets.
-
-### 1. Robust File Paths
-To ensure the module can be executed safely from anywhere (like a FastAPI router at the project root), all paths are defined dynamically using absolute positioning:
-```python
-BASE_DIR = str(Path(__file__).resolve().parent.parent)
-INPUT_IMAGES = os.path.join(BASE_DIR, "input_images")
 ```
-This guarantees it will reliably find `input_images` and `output` folders regardless of the current working directory.
-
-### 2. Strict Socket Timeouts and Bounded Retries
-Because the background upload queue (`scanner.py`) relies on network stability, `boto3` is explicitly configured (`R2_CONFIG`) to prevent Python threads from hanging infinitely in kernel I/O wait during Wi-Fi drops:
-- `connect_timeout=10`: Fails fast if the TCP socket cannot open.
-- `read_timeout=60`: Fails if an ongoing data transfer stalls.
-- `retries={'max_attempts': 1}`: Internal blind retries are disabled. Retrying is the job of the upload worker in `hardware/scanner.py`, which uses a **bounded** number of attempts with backoff and a global drain deadline, so a scan can never wait on R2 forever.
-- `region_name="auto"`: the region R2 expects.
-
-`upload_file()` never raises: `ClientError`, `BotoCoreError`, `S3UploadFailedError` and `OSError` are logged and reported as `False`. A local file that is missing or has 0 bytes returns `False` immediately, without any network call. The worker decides whether to retry; the photo always stays on disk.
-
-### 2b. Checksum Note (audit CLOUD-16)
-boto3 >= 1.36 adds CRC checksums to requests and validates them on responses by default, which R2 can reject. The config therefore sets `request_checksum_calculation="when_required"` and `response_checksum_validation="when_required"`. Older botocore versions do not know these keywords, so the config builder falls back to the options it accepts (a `TypeError` is caught). `preflight()` exercises this behaviour with a real write.
-
-### 2c. Verification and Preflight
-- `list_keys(prefix="", bucket=...)`: paginated listing (`list_objects_v2` paginator, so more than 1000 objects work) returning a set of keys. Raises `R2Error` if the listing fails.
-- `verify_keys(expected, bucket=...)`: does **one** paginated listing and returns the sorted list of expected keys that are missing from the bucket. An empty list means every photo of the manifest is in R2.
-- `preflight(bucket=...)`: raises `R2Error` with a human readable message if `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID` or `R2_SECRET_ACCESS_KEY` is missing/empty (read from `os.environ` at call time), or if a small write + head + delete round trip on `_preflight/<uuid>.txt` fails (credentials, bucket permissions, checksum behaviour). The probe object is always removed. Called at `/prepare`, before homing, so a misconfigured R2 fails before the scan and not after it.
-
-### 2d. What `/prepare` Wipes
-At the start of every new scan the bucket and the local photo directory are wiped. `delete_all_files_from_bucket()` lists the bucket with the paginator, calls `delete_objects` in chunks of 1000 keys, inspects the `Errors` list of every response and raises `R2Error` naming the keys that could not be deleted. It returns the number of deleted objects. Listing/delete request failures are also raised as `R2Error`. Because the previous scan's photos are gone after `/prepare`, download them from the bucket (or copy the local folder) before starting a new scan.
-
-### 3. Pipeline Validation (`file_exists_and_is_new`)
-To determine if Meshroom succeeded or failed on RunPod, the system uses `file_exists_and_is_new()`. This relies on `boto3.head_object()` to check the `LastModified` UNIX timestamp against the time the job was started. This guarantees we don't accidentally download a stale `output.zip` from a previous scan.
-
----
-
-## 🚀 RunPod Orchestration (`runpod.py`)
-
-This file dynamically provisions secure GPU containers on-demand to process photogrammetry.
-
-### 1. Dynamic GPU Fallbacks and Bounded Attempts
-The orchestrator checks the required RAM (via `ram_heuristic.py`) and walks a list of suitable NVIDIA GPUs (e.g., RTX 5090 -> L40 -> RTX 6000 Ada -> RTX 3090). The attempts are **bounded**, because a pod is billed from the moment it is created:
-* A pod that cannot be created (no capacity) costs nothing: the whole list is walked at most `MAX_CREATE_PASSES` times (default 3, `RUNPOD_MAX_CREATE_PASSES`), then the job is given up.
-* A pod that is created and does not deliver `output.zip` (it exits in under 120 s because its host failed the RAM check, or `output.zip` is missing after a long run) counts as a failed attempt. After `MAX_POD_ATTEMPTS` of them (default 3, `RUNPOD_MAX_POD_ATTEMPTS`) **one last pod** is started on the GPU whose host had the most RAM (read with `get_pod_memory_gb`), with `RAM_MIN_GB` lowered to what that host has: it may still run out of memory, but it is the best host seen. If no pod reported its RAM there is no better host to pick and the job is given up.
-* A pod that runs longer than `POD_MAX_RUNTIME_S` (60 minutes, `RUNPOD_POD_MAX_RUNTIME_S`) is terminated and the job is given up at once (a retry would most likely run as long).
-
-### 2. Cost-Effective Termination (`terminate_pod`)
-Because RunPod bills for **both compute and disk volume storage**, simply stopping a pod (`podStop`) halts compute billing but continues bleeding credits for the allocated container disk. 
-
-The orchestrator explicitly uses the GraphQL `podTerminate` mutation. `run_pod()` terminates every pod it creates in a `finally`: after a normal exit, a cancel, the runtime cap, repeated failures to read the pod status, and any unexpected exception. `terminate_pod_reliably()` retries the termination (`TERMINATE_ATTEMPTS`, 5 by default); if it still fails it prints which pod is alive and **no other pod is started**, so a lost termination never doubles the bill. (A pod whose creation request timed out after RunPod had already created it cannot be known by id and is not covered: see CLOUD-12 in `PROBLEME_RAMASE.md`.)
-
-### 3. Proper Python Import Routing
-Since `runpod.py` is invoked from the parent FastAPI application, internal module dependencies strictly use absolute imports:
-```python
-import cloud.cloudflare_r2 as r2
-from cloud.ram_heuristic import calculate_required_ram
+Pi / laptop                              R2 (one bucket)                          RunPod pod
+───────────                              ───────────────                          ──────────
+1. job id, preflight
+2. upload photos  ─────────────────────▶ jobs/<id>/input/rig/0|1/*.jpg
+3. verify every photo is there
+4. temporary credentials (TTL = pod runtime cap, 60 min):
+   input/ read-only, output/ read-write
+5. create the pod ──────────────────────────────────────────────────────────────▶ 6. download the photos
+                                                                                   7. pipeline (main.run_pipeline)
+                                         jobs/<id>/output/ ◀──────────────────────  8. output.zip, stats.json,
+                                                                                      run_log.txt, status.json (last)
+9. wait for status.json, terminate the pod (always)
+10. download + extract output.zip -> results/<id>/
+11. delete jobs/<id>/ from R2
 ```
 
-### 4. Cancellation & Max Timeout Protection
-The orchestrator natively supports a `cancel_event` threading event in its `launch_job` polling loop. If a user triggers an emergency stop via the FastAPI endpoint, the RunPod orchestrator instantly wakes up (bypassing the 15-second polling sleep) and terminates the active pod.
-Additionally, an automated 60-minute runtime cap (`POD_MAX_RUNTIME_S`, counted from the moment the pod is created) acts as a failsafe to protect against infinite billing in the event Meshroom freezes silently without exiting. The cap includes scheduling and the pull of the image; 60 minutes is enough for the job.
+## Files
 
-### 5. Upgraded RAM Heuristic (OOM Detection)
-RunPod does not cleanly broadcast Out-Of-Memory (OOM) kills through its GraphQL API; the pod simply transitions to `EXITED`. 
-The system relies on a two-part heuristic:
-1. **Uptime Check**: If the pod exits in under 120 seconds, it almost certainly hit an OOM during the initial mesh depthmap calculation. The script catches this and automatically provisions a larger GPU.
-2. **Payload Validation**: Even if the pod runs for >120 seconds, the orchestrator queries R2 (`r2.file_exists_and_is_new`) to verify `output.zip` is present and was generated *after* the job started. If the payload is missing (or the bucket cannot be queried), it counts as a failed attempt and the next one follows the bounded rules of section 1.
+| File | Role |
+|---|---|
+| `cloudflare_r2.py` | S3 client for R2, job key layout (`jobs/<id>/input|output/`), uploads (never raise), downloads, prefix deletion, preflight, **temporary prefix-scoped credentials** |
+| `runpod.py` | RunPod REST client (`POST/GET/DELETE /v1/pods`), pod request, pod lifecycle with guaranteed termination and bounded retries |
+| `job.py` | The whole flow above for one scan (`run_cloud_job`), used by the Pi and by `tools/cloud_scan.py` |
+| `resources.py` | RAM estimate of the pipeline (copy of Turntable Studio's `pipeline/resources.py`: the Pi has no `pipeline/`) |
 
-### 6. Credentials given to the pod
-The pod runs on a host of RunPod and receives, as environment variables, `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `MESHROOM_URL`, `MESHROOM_FALLBACK_URL` and `HF_TOKEN` (when they are set). For each name, `POD_<NAME>` is used instead when it is set, so the pod can get **its own R2 token** (limited to the scanner bucket, Object Read & Write) while the Pi keeps a different one: put `POD_R2_ACCESS_KEY_ID` and `POD_R2_SECRET_ACCESS_KEY` in `.env`. The other options (temporary credentials, presigned URLs, a read-only Hugging Face token) are in `PROBLEME_RAMASE.md`, CLOUD-10.
+**In the scanner** (`router/scanner.py`, `_orchestrate_pipeline`): the photos are uploaded during the scan by the
+`UploadWorker` under `jobs/<job_id>/input/rig/0|1/` and verified, so `run_cloud_job(skip_upload=True,
+image_prefix="rig/")` starts at step 4, only when `/scanner/start` has `cloud.launch_runpod: true`. Before creating
+a pod it terminates every `turntable-*` pod of the account (`runpod.terminate_stale_pods`). The upload keeps the
+scanner's per-attempt time limit (`UPLOAD_ATTEMPT_TIMEOUT_S`). Dry run without a pod: `POST /test/cloud/runpod-dry-run`.
+| `../runpod_job.py` | Inside the pod: download, run, upload, `status.json` |
+| `../tools/cloud_scan.py` | Runs the flow from the laptop with `input_images/` (not in the Docker image) |
+
+## Keys: who holds what
+
+| Where | Key | Can do |
+|---|---|---|
+| Pi / laptop (`.env`) | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`: R2 key limited to the scanner bucket | upload photos, read results, delete jobs |
+| | `CLOUDFLARE_R2_API_TOKEN`: Cloudflare API token with **R2 permissions only** | mint temporary credentials |
+| | `RUNPOD_API_KEY` | create / delete pods |
+| Pod | `R2_IN_*`: temporary, `object-read-only`, prefix `jobs/<id>/input/` | read the photos of this job |
+| | `R2_OUT_*`: temporary, `object-read-write`, prefix `jobs/<id>/output/` | write the result of this job |
+
+The temporary credentials come from Cloudflare's `POST /accounts/{account_id}/r2/temp-access-credentials`
+(`parentAccessKeyId` = the bucket key above, so they can never do more than it). They expire after
+`RUNPOD_POD_MAX_RUNTIME_S` (default 3600 s), the same cap after which the client terminates the pod: one setting,
+so the credentials cannot expire before the pod finishes uploading. The pod never gets the RunPod key and never
+stops itself; the client terminates it.
+
+## Choosing the pod
+
+`POST https://rest.runpod.io/v1/pods` with:
+- `gpuTypeIds`: acceptable GPUs, cheapest first (`RUNPOD_GPU_TYPES`, default list in `runpod.py`), and
+  `gpuTypePriority: "custom"`, so RunPod takes the first one with capacity in our order. GPU speed barely matters
+  (2.3 of 30 minutes are GPU compute); host RAM, vCPUs and disk do.
+- `minRAMPerGPU` = `ceil(estimate_ram_gb × 1.3)` from `pipeline/resources.py` (photos × resolution),
+  `minVCPUPerGPU` (default 8), `containerDiskInGb` from the photo count.
+- No data center filter (more capacity), no ports, no volume.
+
+Retries are bounded: a create request rejected for lack of capacity is retried `RUNPOD_MAX_CREATE_ATTEMPTS` times
+(free); a second pod is started only if the first reported `ram_insufficient` (asks for the RAM it measured × 1.2)
+or died without writing a status (likely OOM, asks for 1.5× RAM). `pipeline_error`, timeout and cancel are not retried.
+
+## status.json (written last by the pod)
+
+```json
+{"job_id": "...", "state": "ok | ram_insufficient | pipeline_error | input_error | timeout",
+ "error": "...", "required_gb": 0, "available_gb": 0, "resources": {...}, "timings_s": {...}}
+```
+
+## Test from the laptop
+
+```bash
+cp .env.example .env       # fill in the keys and TURNTABLE_IMAGE
+python tools/cloud_scan.py --dry_run    # preflight + estimate + the pod request (secrets redacted); no pod
+python tools/cloud_scan.py              # full flow; prints timings, the pod used and the cost estimate
+python tools/cloud_scan.py --keep_remote                 # leave jobs/<id>/ in R2
+python tools/cloud_scan.py --keep_old_jobs               # keep earlier jobs in R2 (default: all jobs/ folders deleted first)
+python tools/cloud_scan.py --job_id <id> --skip_upload   # retry with the photos already in R2
+```
+
+Before the first real run:
+1. Build and push the image (`docker build -t <user>/turntable-studio:v1 . && docker push ...`). Then `python tools/cloud_scan.py --mock` tests image, keys, R2 and pod termination with simulated OpenMVS.
+   For a private registry, add its credentials in RunPod (Settings → Container Registry Auth) and put the id in
+   `RUNPOD_REGISTRY_AUTH_ID`.
+2. Check the GPU ids in `--dry_run` against RunPod's list (some ids contain double spaces there).
+3. Optional safety net: an R2 lifecycle rule that expires `jobs/` after a few days (abandoned jobs).
+
+## Upload queue on the Pi
+
+`upload_file(path, bucket, key)` never raises (the queue retries; the photo stays on disk). Keys:
+`r2.input_key(job_id, "rig/0/f_1000.jpg")`. At the end of the scan: `verify_keys(...)` and only then
+`run_cloud_job(..., skip_upload=True, job_id=job_id)`. `/prepare` no longer empties the bucket: a new job id is enough.

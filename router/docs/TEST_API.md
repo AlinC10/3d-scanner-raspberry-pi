@@ -460,6 +460,12 @@ Powers down all hardware cleanly:
 
 ---
 
+## 7. Cloud check (no pod is created)
+
+### `POST /test/cloud/runpod-dry-run?resolution_level=1`
+
+Checks the Turntable Studio / RunPod chain without billing anything: `problem` (the reason a `/scanner/start` with `cloud.launch_runpod: true` would be refused, or `null`), the R2 write test (`r2_preflight_s`), the RunPod key (`runpod_api: "ok"` after a read-only listing; `turntable_pods` lists any `turntable-*` pod still alive), and, for the photos on disk (`input_images/rig/`, the last scan), the `plan` (photo count, size, RAM estimate, vCPU, disk) and the `pod_request` that would be sent (secrets replaced by `<redacted>`). No temporary R2 credentials are minted and no pod is created. `400` when there are no photos on disk, R2 fails, or `TURNTABLE_IMAGE` is missing.
+
 ## Recommended Hardware Verification Checklist
 
 When first bringing up or troubleshooting the physical rig:
