@@ -13,6 +13,7 @@ A missing results folder is an empty list.
 | `GET` | `/library/objects?offset=0&limit=20&category=all&search=` | One page of objects, newest first, without model files (filtered by category / text) |
 | `GET` | `/library/objects/{id}` | One object (404 when it does not exist or is not finished) |
 | `GET` | `/library/objects/{id}/model?format=.glb&lod=low` | One model file |
+| `DELETE` | `/library/objects/{id}` | Deletes the object (`204`; `404`, `409` during its export) |
 
 ## `GET /library/objects`
 
@@ -79,6 +80,17 @@ Edits the object's `object.json`; only the fields sent (and not `null`) change. 
 Answer: the updated object (like `GET /library/objects/{id}`). `404` unknown object, `422` invalid value or a field that
 cannot be edited (`created_at`, `job_id`, `faces_*`, ...). The file is written atomically (temporary file + rename).
 
+## `DELETE /library/objects/{id}` → `204`
+
+Deletes the object for good: its models, `object.json` and the scan photos kept with it (`photos/`). No body. `204` done (empty body), `404` unknown object, `409` while a USB or Bluetooth export of this object is running (wait for it or cancel it), `500` the folder could not be removed. It cannot be undone: ask the user to confirm. The object disappears from the list at once (the folder is renamed to a hidden name, then removed).
+
+## Category of the existing objects
+
+Objects made before 2026-10-30 have no `category` in `object.json`; the API infers it at every read (`"face"` when the
+face reconstruction made it, else `"object"`), so nothing has to be done. To write it into the files once (for example
+before copying `results/` elsewhere): `python -m storage.results --backfill-categories` (or with a folder:
+`python -m storage.results --backfill-categories /path/to/results`); only the objects without a category change.
+
 ## Object names
 
 An object scan without `cloud.title` and a face capture without `title` are named after their folder (the job id, e.g.
@@ -94,6 +106,7 @@ is saved. They are not served by the API and not part of the USB export.
 | Method | Path | Answer |
 |---|---|---|
 | `GET` | `/library/usb` | The USB sticks plugged in: `[{device, label, size_bytes, fstype, mountpoint, free_bytes}]` (empty list = none) |
+| `POST` | `/library/usb/eject` | `200` stick unmounted and powered off; body optional `{"device": "/dev/sda1"}`; `503` no stick, `409` export running |
 | `POST` | `/library/objects/{id}/export/usb` | `202` + export status; body optional `{"device": "/dev/sda1"}` (default: the first stick) |
 | `GET` | `/library/export/usb/status` | Progress of the export |
 
@@ -121,3 +134,7 @@ OBEX push (`bt-obex`, package `bluez-tools`); the phone asks the user to accept 
 OBEX). No device connected = `503` ("No Bluetooth device is connected"), a transfer running = `409`, unknown object = `404`.
 `POST /system/bluetooth/disconnect` with the receiving device cancels the transfer first (`state: "cancelled"`). There is
 no byte progress (OBEX push does not report it): show a spinner while `sending`. A transfer longer than 10 min is stopped.
+
+### `POST /library/usb/eject`
+
+Safe removal: unmounts every partition of the stick and powers it off (`udisksctl power-off`). Body optional `{"device": "/dev/sda1"}` (default: the first stick). `200` `{"device": "/dev/sda1", "disk": "/dev/sda", "powered_off": true, "safe_to_remove": true}` (`powered_off: false`: unmounted only, still safe to pull out); `503` no stick, `409` an export is running, `500` it could not be unmounted. The export already unmounts the stick when it ends; use this as the "Eject" button (or after the stick was mounted some other way).

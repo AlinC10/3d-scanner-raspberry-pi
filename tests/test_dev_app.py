@@ -190,7 +190,7 @@ class DevAppTest(unittest.TestCase):
 
     def test_buzzer_endpoints(self):
         self.assertEqual(self.r["buzzer_status"],
-                         {"available": True, "pin": None, "patterns": ["ready", "start", "hold_still", "success", "error"]})
+                         {"available": True, "pin": None, "patterns": ["ready", "start", "hold_still", "photo_countdown", "success", "error"]})
         self.assertEqual(self.r["buzzer_play"], 200)
         self.assertEqual(self.r["buzzer_bad_pattern"], 422)
         self.assertEqual(self.r["buzzer_tone"], {"status": "success", "frequency_hz": 880.0, "duration_s": 0.5})

@@ -387,16 +387,16 @@ class TestScannerAdditions(unittest.TestCase):
     def test_stale_turntable_pods_are_terminated_and_others_kept(self):
         class Client(FakeRunPod):
             def list_pods(self):
-                return [{"id": "a", "name": "turntable-old"}, {"id": "b", "name": "my-notebook"},
-                        {"id": "c", "name": "turntable-older"}]
+                return [{"id": "a", "name": "turntable-pi-old"}, {"id": "b", "name": "my-notebook"},
+                        {"id": "c", "name": "turntable-pi-older"}, {"id": "d", "name": "turntable-laptop-job"}]
         client = Client()
-        self.assertEqual(rp.terminate_stale_pods(client), ["a", "c"])
+        self.assertEqual(rp.terminate_stale_pods(client), ["a", "c"])   # the laptop's "turntable-*" pod is kept
         self.assertEqual(client.deleted, ["a", "c"])
 
     def test_a_pod_that_cannot_be_terminated_is_an_error(self):
         class Client(FakeRunPod):
             def list_pods(self):
-                return [{"id": "a", "name": "turntable-old"}]
+                return [{"id": "a", "name": "turntable-pi-old"}]
         with mock.patch.object(rp, "TERMINATE_RETRY_S", 0):
             with self.assertRaises(rp.RunPodError):
                 rp.terminate_stale_pods(Client(delete_fails=True))

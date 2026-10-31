@@ -173,6 +173,46 @@ def set_category(root: Path, result_id: str, category: str) -> bool:
         return False
 
 
+def delete_result(root: Path, result_id: str) -> None:
+    """
+    Deletes an object: its whole folder (models, object.json, the scan photos). The folder is first renamed to
+    ``.<id>.deleting`` (not a valid id, so the library stops listing it at once), then removed; a removal that fails
+    half way leaves only that hidden folder, which a later delete of the same id or `purge_deleting` cleans.
+
+    :raises ResultNotFoundError: the id is invalid or the folder does not exist.
+    :raises OSError: the folder could not be renamed (nothing was deleted).
+    """
+    import shutil
+    folder = _result_folder(root, result_id)
+    trash = folder.parent / f".{result_id}.deleting"
+    with _object_write_lock:
+        if trash.exists():
+            shutil.rmtree(trash, ignore_errors=True)
+        os.replace(folder, trash)
+    shutil.rmtree(trash, ignore_errors=True)
+    if trash.exists():
+        log.warning("Object %s is hidden but %s could not be removed completely.", result_id, trash)
+
+
+def backfill_categories(root: Path) -> dict:
+    """
+    Writes ``category`` into the object.json of every finished object that has none (the value `infer_category`
+    gives). Returns ``{id: category}`` of the objects written; the others are left untouched.
+    """
+    written = {}
+    if not root.is_dir():
+        return written
+    for folder in sorted(root.iterdir()):
+        if not folder.is_dir() or not is_valid_id(folder.name):
+            continue
+        entry = _read_entry(folder)
+        if entry is None or entry.object.get("category") in CATEGORIES:
+            continue
+        if set_category(root, entry.id, entry.category):
+            written[entry.id] = entry.category
+    return written
+
+
 def _write_object_json(folder: Path, obj: dict) -> None:
     """Saves object.json atomically (temporary file + rename); the caller holds _object_write_lock."""
     tmp = folder / "object.json.tmp"
@@ -272,3 +312,20 @@ def _read_entry(folder: Path) -> Optional[ResultEntry]:
         if lods:
             models[fmt] = lods
     return ResultEntry(id=folder.name, object=obj, models=models, category=infer_category(obj, status))
+
+
+if __name__ == "__main__":
+    # python -m storage.results --backfill-categories [results folder]: writes "category" into older objects
+    import sys
+    if len(sys.argv) >= 2 and sys.argv[1] == "--backfill-categories":
+        if len(sys.argv) > 2:
+            target = Path(sys.argv[2])
+        else:
+            from app_paths import results_directory
+            target = results_directory()
+        done = backfill_categories(target)
+        for oid, cat in done.items():
+            print(f"{oid}: {cat}")
+        print(f"{len(done)} object(s) updated in {target}.")
+    else:
+        print("Usage: python -m storage.results --backfill-categories [results folder]")

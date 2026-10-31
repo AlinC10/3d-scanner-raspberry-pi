@@ -174,7 +174,12 @@ def terminate_pod_reliably(client: RunPodClient, pod_id: str) -> bool:
     return False
 
 
-def terminate_stale_pods(client: RunPodClient, name_prefix: str = "turntable-", keep: tuple = ()) -> List[str]:
+# Name prefix of the pods the scanner starts ("turntable-pi-<job_id>"): only these are ever terminated as stale, so a
+# "turntable-*" pod started from the laptop is never touched (CLOUD-22)
+SCANNER_POD_PREFIX = "turntable-pi-"
+
+
+def terminate_stale_pods(client: RunPodClient, name_prefix: str = SCANNER_POD_PREFIX, keep: tuple = ()) -> List[str]:
     """
     Terminates every pod of the account whose name starts with `name_prefix` (pods of earlier jobs left alive by a
     crash, a power cut or a lost termination). Called before a new job starts a pod, so at most one job's pod bills.

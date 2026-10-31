@@ -116,6 +116,16 @@ from hardware.rig_limits import Z_TRAVEL_MAX_MM, Z_HOMING_MARGIN_MM  # noqa: E40
 Z_PREPARE_DELAY_S = 0.0010
 # Face scan Z moves (FacePrepareRequest.z_delay default): 2 mm/s, so the camera lenses (VCM) are not shaken (FACE-19)
 FACE_Z_DELAY_DEFAULT_S = 0.005
+# Face scan: the buzzer counts down ("photo_countdown") and the photo is taken this long after the countdown starts, so
+# the subject can open the eyes and hold still. Without a buzzer only the settle pause is kept. 0 turns it off.
+FACE_PHOTO_WARNING_S = _env_float("SCAN_FACE_PHOTO_WARNING_S", 1.5)
+# Face scan burst (UX-6): this many photo pairs back to back after the countdown; MediaPipe scores the eyes on each and
+# only the pair with the eyes most open is kept (the others are deleted). 1 = a single pair, no eye check.
+FACE_BURST_SHOTS = max(1, int(_env_float("SCAN_FACE_BURST_SHOTS", 4)))
+# Below this eye openness (1 - the larger MediaPipe eyeBlink blendshape, 0..1) the kept pair gets a warning
+FACE_EYES_OPEN_MIN = _env_float("SCAN_FACE_EYES_OPEN_MIN", 0.5)
+# Width the burst photos are scaled to before MediaPipe (speed; the eyes stay large enough at the rig's distance)
+FACE_EYES_CHECK_WIDTH = 1280
 # Pause after the carriage has reached the bottom endstop in finish_preparation(), before it climbs to the start position
 # (lets the carriage and the endstop settle; a cancel ends it at once).
 Z_HOME_SETTLE_S = _env_float("SCAN_Z_HOME_SETTLE_S", 1.0)
@@ -1434,7 +1444,13 @@ class Scanner:
         self._check_tof()
 
     def _check_tof(self) -> None:
-        """:raises ScannerPreflightError: the ToF sensor is missing or gives no valid test reading."""
+        """
+        :raises ScannerPreflightError: the ToF sensor is missing (not initialised) or its test reading raised.
+
+        A test reading without a valid distance is only logged: it is what a dark object in front of the sensor gives
+        (the 940 nm light is absorbed), and the carriage may not even be at the height it will scan from. During the
+        scan such a reading counts as "unknown", which never ends the scan.
+        """
         if not getattr(self.tof, "available", True):
             raise ScannerPreflightError(
                 "The ToF distance sensor is not available (not detected or not initialised); "
@@ -1445,10 +1461,8 @@ class Scanner:
         except Exception as e:
             raise ScannerPreflightError(f"The ToF distance sensor failed a test reading: {e}")
         if first_reading is None:
-            raise ScannerPreflightError(
-                "The ToF distance sensor returned no valid test reading (check wiring and that the backdrop is in "
-                "view)."
-            )
+            log.warning("[Scanner] The ToF test reading has no valid distance (a dark or absorbing object in view, "
+                        "nothing in range or a wiring problem); the scan treats such readings as unknown.")
 
     def _check_free_disk(self) -> None:
         """:raises ScannerPreflightError: less than MIN_FREE_DISK_MB free for the photos."""
@@ -2196,6 +2210,76 @@ class Scanner:
             self._reset_status()
             self._set_phase(ScanPhase.SCANNING, "Face scan: positioning the carriage")
 
+    def _capture_face_burst(self, images_dir: str, stem: str) -> Tuple[list, Optional[float]]:
+        """
+        Takes FACE_BURST_SHOTS photo pairs back to back, keeps the pair with the eyes most open (renamed to
+        ``<stem>.jpg`` in each camera folder) and deletes the others. Returns the kept paths and their eye openness
+        (None when the eyes could not be checked: one shot, MediaPipe failed, or no face in any pair).
+
+        :raises ScannerError: cancelled during the burst.
+        """
+        if FACE_BURST_SHOTS <= 1:
+            return list(self.dual_cameras.capture_photo(output_prefix=stem, output_dir=images_dir,
+                                                        meshroom_rig=True)), None
+        shots = []
+        for i in range(FACE_BURST_SHOTS):
+            if self._cancel_applies():
+                raise ScannerError("Face scan cancelled during the photo burst.")
+            shots.append(list(self.dual_cameras.capture_photo(output_prefix=f"{stem}_b{i}", output_dir=images_dir,
+                                                              meshroom_rig=True)))
+        scores = self._score_eyes(shots)
+        best = max(range(len(shots)), key=lambda i: (scores[i] if scores[i] is not None else -1.0, -i))
+        log.info("[Scanner Face] Eye openness of the burst: %s -> pair %d kept",
+                 ["-" if s is None else f"{s:.2f}" for s in scores], best)
+        kept = []
+        for i, pair in enumerate(shots):
+            for path in pair:
+                if i == best:
+                    target = str(Path(path).with_name(f"{stem}{Path(path).suffix}"))
+                    os.replace(path, target)
+                    kept.append(target)
+                else:
+                    try:
+                        os.remove(path)
+                    except OSError as e:
+                        log.warning("[Scanner Face] Could not delete burst photo %s: %s", path, e)
+        return kept, scores[best]
+
+    def _score_eyes(self, shots: list) -> list:
+        """
+        Eye openness of each pair (0 closed .. 1 open): 1 - the larger ``eyeBlinkLeft`` / ``eyeBlinkRight`` blendshape
+        of MediaPipe, the lower of the two cameras (a blink in either one spoils the pair); None when no camera of the
+        pair shows a face. All None when MediaPipe cannot run.
+        """
+        try:
+            import cv2
+            from face_scan.face_scanner import FaceScanner
+        except Exception as e:
+            log.warning("[Scanner Face] Eye check unavailable: %s", e)
+            return [None] * len(shots)
+        scores = []
+        try:
+            with FaceScanner(num_faces=1, output_facial_transformation_matrixes=False) as detector:
+                for pair in shots:
+                    per_cam = []
+                    for path in pair:
+                        image = cv2.imread(str(path))
+                        if image is None:
+                            continue
+                        h, w = image.shape[:2]
+                        if w > FACE_EYES_CHECK_WIDTH:
+                            image = cv2.resize(image, (FACE_EYES_CHECK_WIDTH, int(h * FACE_EYES_CHECK_WIDTH / w)))
+                        faces = detector.scan_image(image).get("faces") or []
+                        if faces:
+                            blend = faces[0].get("blendshapes") or {}
+                            blink = max(blend.get("eyeBlinkLeft", 0.0), blend.get("eyeBlinkRight", 0.0))
+                            per_cam.append(1.0 - float(blink))
+                    scores.append(min(per_cam) if per_cam else None)
+        except Exception as e:
+            log.warning("[Scanner Face] Eye check failed: %s", e)
+            return [None] * len(shots)
+        return scores
+
     @staticmethod
     def _face_detection_problem() -> Optional[str]:
         """Why MediaPipe face detection cannot run (None when it can)."""
@@ -2411,6 +2495,7 @@ class Scanner:
         best_score = None
         face_detected: Optional[bool] = None
         warning: Optional[str] = None
+        eyes_open: Optional[float] = None
 
         self._tls.automated = True
         try:
@@ -2467,21 +2552,31 @@ class Scanner:
                 self._sound("hold_still")
                 self._lock_cameras(lock_kwargs, copy_colour_gains, f"face at Z={target_z:g} mm")
 
-                # Stabilization pause (a cancel ends it at once)
-                if settle_s > 0:
-                    self._cancel_event.wait(settle_s)
+                # Stabilization pause (a cancel ends it at once). With a buzzer it is also the "eyes open" warning:
+                # the countdown plays and the photo follows FACE_PHOTO_WARNING_S after it starts.
+                pause_s = settle_s
+                buzzer = getattr(self, "buzzer", None)
+                if FACE_PHOTO_WARNING_S > 0 and getattr(buzzer, "available", False):
+                    self._set_phase(ScanPhase.SCANNING,
+                                    f"Face scan: photo in {FACE_PHOTO_WARNING_S:g} s, keep your eyes open")
+                    self._sound("photo_countdown")
+                    pause_s = max(settle_s, FACE_PHOTO_WARNING_S)
+                if pause_s > 0:
+                    self._cancel_event.wait(pause_s)
                 if self._cancel_applies():
                     raise ScannerError("Face scan cancelled before photo capture.")
 
-                # Synchronized Still Capture
+                # Synchronized Still Capture: a burst, the pair with the eyes most open is kept (UX-6)
                 self._set_phase(ScanPhase.SCANNING, f"Face scan: capturing at Z={target_z:.1f} mm",)
                 stem = f"f_{int(round(target_z))}"
-                log.info("[Scanner Face] Capturing stereo pair at Z=%.1f mm with prefix %s...", target_z, stem)
-                paths = self.dual_cameras.capture_photo(
-                    output_prefix=stem,
-                    output_dir=images_dir,
-                    meshroom_rig=True
-                )
+                log.info("[Scanner Face] Capturing %d stereo pair(s) at Z=%.1f mm with prefix %s...",
+                         FACE_BURST_SHOTS, target_z, stem)
+                paths, eyes_open = self._capture_face_burst(images_dir, stem)
+                if eyes_open is not None and eyes_open < FACE_EYES_OPEN_MIN:
+                    eyes_warning = (f"The eyes may be closed in the photo (openness {eyes_open:.2f}); "
+                                    "take it again if the model looks wrong.")
+                    warning = f"{warning} {eyes_warning}" if warning else eyes_warning
+                    log.warning("[Scanner Face] %s", eyes_warning)
                 self._register_photos(
                     images_dir=images_dir,
                     photo_paths=paths,
@@ -2526,6 +2621,7 @@ class Scanner:
                 "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
                 "face_detected": face_detected, "warning": warning,
                 "photos": list(paths), "r2_uploaded": uploaded,
+                "eyes_open": eyes_open,
             }
 
         if self._cancel_event.is_set() or not scan_ok:
@@ -2545,7 +2641,7 @@ class Scanner:
         def publish() -> None:
             self.face_result = {k: result.get(k) for k in
                                 ("optimal_z_mm", "best_score", "face_detected", "warning", "photos", "r2_uploaded",
-                                 "result_id", "metrics", "reconstruction_error")}
+                                 "eyes_open", "result_id", "metrics", "reconstruction_error")}
 
         if reconstruct:
             # The rig is free (motors, lights and cameras are off): the run is now PROCESSING until the model is saved

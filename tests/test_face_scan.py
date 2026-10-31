@@ -114,7 +114,7 @@ class TestFaceScanSchemas(unittest.TestCase):
         self.assertEqual(self.r["response_state"], "running")
         self.assertEqual(self.r["result_default"], {
             "optimal_z_mm": None, "best_score": None, "face_detected": None, "warning": None, "photos": [],
-            "r2_uploaded": False, "result_id": None, "metrics": None, "reconstruction_error": None,
+            "r2_uploaded": False, "eyes_open": None, "result_id": None, "metrics": None, "reconstruction_error": None,
         })
         self.assertEqual(self.r["status_face_result"]["mode"], "face")
         self.assertFalse(self.r["status_face_result"]["face_result"]["face_detected"])
@@ -275,6 +275,86 @@ class TestFaceScanScanner(unittest.TestCase):
             self._run(scanner, strategy="none", manual_z=200.0, z_delay=0.01)
         self.assertTrue(delays)
         self.assertEqual(set(delays), {0.01})
+
+    def _record_sounds_and_pause(self, scanner, available):
+        """Records the buzzer sounds, the pause before the photo and the order of both against the capture."""
+        events = []
+        scanner.buzzer = MagicMock(available=available)
+        scanner.buzzer.play.side_effect = lambda pattern: events.append(("sound", pattern))
+        scanner._cancel_event = MagicMock()
+        scanner._cancel_event.wait.side_effect = lambda s: (events.append(("wait", s)), False)[1]
+        scanner._cancel_event.is_set.return_value = False
+        scanner.dual_cameras.capture_photo.side_effect = lambda **kw: (events.append(("photo",)),
+                                                                        ["/tmp/rig/0/f_180.jpg", "/tmp/rig/1/f_180.jpg"])[1]
+        return events
+
+    def test_countdown_sound_then_photo_after_the_warning_time(self):
+        import hardware.scanner as scanner_module
+        scanner = self._scanner()
+        events = self._record_sounds_and_pause(scanner, available=True)
+        with patch.object(scanner_module, "FACE_PHOTO_WARNING_S", 1.5):
+            self._run(scanner, strategy="none", settle_s=0.15)
+        i = events.index(("sound", "photo_countdown"))
+        self.assertEqual(events[i + 1:i + 3], [("wait", 1.5), ("photo",)])
+        self.assertLess(events.index(("sound", "hold_still")), i)
+
+    def test_without_a_buzzer_only_the_settle_pause_is_kept(self):
+        import hardware.scanner as scanner_module
+        scanner = self._scanner()
+        events = self._record_sounds_and_pause(scanner, available=False)
+        with patch.object(scanner_module, "FACE_PHOTO_WARNING_S", 1.5):
+            self._run(scanner, strategy="none", settle_s=0.15)
+        self.assertNotIn(("sound", "photo_countdown"), events)
+        i = events.index(("photo",))
+        self.assertEqual(events[i - 1], ("wait", 0.15))
+
+    def _burst(self, scores):
+        """A scanner whose capture writes real files in a temp dir, with scripted eye scores per pair."""
+        import tempfile
+        import hardware.scanner as scanner_module
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        scanner = self._scanner()
+
+        def capture(output_prefix, output_dir, meshroom_rig=True):
+            paths = []
+            for cam in ("0", "1"):
+                os.makedirs(os.path.join(output_dir, cam), exist_ok=True)
+                path = os.path.join(output_dir, cam, f"{output_prefix}.jpg")
+                open(path, "w").write(output_prefix)
+                paths.append(path)
+            return paths
+
+        scanner.dual_cameras.capture_photo.side_effect = capture
+        patches = [patch.object(scanner_module, "FACE_BURST_SHOTS", len(scores)),
+                   patch.object(scanner, "_score_eyes", return_value=list(scores))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return scanner, tmp
+
+    def test_burst_keeps_only_the_pair_with_the_eyes_most_open(self):
+        scanner, tmp = self._burst([0.1, 0.9, 0.95, 0.3])
+        with patch.object(scanner, "images_dir", tmp):
+            result, _ = self._run(scanner, strategy="none")
+        for cam in ("0", "1"):
+            self.assertEqual(sorted(os.listdir(os.path.join(tmp, cam))), ["f_180.jpg"])
+            self.assertEqual(open(os.path.join(tmp, cam, "f_180.jpg")).read(), "f_180_b2")
+        self.assertEqual(result["photos"], [os.path.join(tmp, "0", "f_180.jpg"), os.path.join(tmp, "1", "f_180.jpg")])
+        self.assertEqual(result["eyes_open"], 0.95)
+        self.assertIsNone(result["warning"])
+        self.assertEqual(scanner.cams.capture_photo.call_count, 4)
+
+    def test_closed_eyes_in_every_pair_is_a_warning_and_unknown_keeps_the_first(self):
+        scanner, tmp = self._burst([0.2, 0.1])
+        with patch.object(scanner, "images_dir", tmp):
+            result, _ = self._run(scanner, strategy="none")
+        self.assertIn("eyes may be closed", result["warning"])
+        scanner, tmp = self._burst([None, None, None])
+        with patch.object(scanner, "images_dir", tmp):
+            result, _ = self._run(scanner, strategy="none")
+        self.assertEqual(open(os.path.join(tmp, "0", "f_180.jpg")).read(), "f_180_b0")
+        self.assertIsNone(result["eyes_open"])
 
     def test_reconstruction_runs_on_the_pair_in_processing_and_its_result_is_published(self):
         scanner = self._scanner()

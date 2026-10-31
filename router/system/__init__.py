@@ -12,7 +12,7 @@ router = APIRouter(
 def get_network_status():
     """
     Every connection in one call: Ethernet (cable, state, profile, IP), Wi-Fi (radio, state, SSID, signal, IP),
-    Bluetooth (power, connected devices) and the outcome of the restore at startup. Reads only what the system already
+    Bluetooth (power, connected devices), the USB sticks plugged in (`usb`) and the outcome of the restore at startup. Reads only what the system already
     knows (no radio scan, nothing changed): safe to poll every few seconds, also during a scan.
     """
     return system_status.get_network_status()

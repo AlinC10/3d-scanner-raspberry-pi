@@ -29,6 +29,8 @@ PATTERNS: Dict[str, List[Note]] = {
     "start": [(880.0, 0.12)],
     # Face scan: the cameras start locking on the face, the subject must hold still
     "hold_still": [(1320.0, 0.08), (None, 0.06), (1320.0, 0.08)],
+    # Face scan: the photo is taken FACE_PHOTO_WARNING_S after the first beep ("eyes open"): two beeps, then a higher one
+    "photo_countdown": [(1047.0, 0.1), (None, 0.4), (1047.0, 0.1), (None, 0.4), (1568.0, 0.2)],
     # Scan (and processing) finished: rising arpeggio
     "success": [(523.0, 0.12), (659.0, 0.12), (784.0, 0.12), (1047.0, 0.25)],
     # Error, cancel or emergency stop: low long tone, then fast alert beeps

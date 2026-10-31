@@ -136,6 +136,10 @@ with patch.object(subprocess, "run", rig):
     out["bt_duration_capped"] = [c["cmd"][2] for c in calls if "scan" in c["cmd"]][-1]
 
     out["status"] = status.get_network_status()
+    with patch.object(status.usb, "list_drives", return_value=[{"device": "/dev/sda1", "label": "STICK"}]):
+        out["status_usb"] = status.get_network_status()["usb"]
+    with patch.object(status.usb, "list_drives", return_value=[]):
+        out["status_no_usb"] = status.get_network_status()["usb"]["connected"]
 
     # one tool failing gives an "error" part, not a failed status
     def broken_bt(cmd, **kw):
@@ -234,6 +238,9 @@ class SystemNetworkTest(unittest.TestCase):
         self.assertEqual(s["wifi"]["ip"], "192.168.1.20/24")
         self.assertEqual(s["bluetooth"]["devices"], [{"mac_address": "AA:AA:AA:AA:AA:05", "name": "Speaker"}])
         self.assertIn("error", self.r["status_bt_missing"])
+        self.assertEqual(self.r["status_usb"], {"connected": True, "drives": [{"device": "/dev/sda1", "label": "STICK"}],
+                                                "export_state": "idle", "safe_to_remove": True})
+        self.assertIs(self.r["status_no_usb"], False)
 
     def test_network_state_and_restore(self):
         saved = self.r["state_saved"]

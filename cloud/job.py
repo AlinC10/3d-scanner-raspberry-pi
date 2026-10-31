@@ -154,7 +154,7 @@ def run_cloud_job(
     on_progress gets every message (technical detail: pod polling, uploads...); on_phase only the milestones (photos
     checked, cloud server created, reconstruction started, each finished pipeline step the pod reports in
     progress.json, model downloaded), each one once.
-    image_prefix: see plan_job. terminate_old_pods: first terminate every "turntable-*" pod of the account (an
+    image_prefix: see plan_job. terminate_old_pods: first terminate every "turntable-pi-*" pod of the account (only the scanner's own pods (an
     earlier job's pod left alive by a crash), so a new scan never runs next to a forgotten, billed pod.
     """
     say = on_progress or logger.info
@@ -230,7 +230,7 @@ def run_cloud_job(
             raise rp.RunPodError(f"No Docker image: set {DEFAULT_IMAGE_ENV} (e.g. ghcr.io/<user>/turntable-studio:v1).")
         return rp.build_pod_request(
             image=image, env=make_env(), min_ram_gb=min_ram_gb, min_vcpu=plan["min_vcpu"],
-            disk_gb=plan["disk_gb"], gpu_types=rp.gpu_types_from_env(), name=f"turntable-{job_id}",
+            disk_gb=plan["disk_gb"], gpu_types=rp.gpu_types_from_env(), name=f"{rp.SCANNER_POD_PREFIX}{job_id}",
             cloud_type=os.environ.get("RUNPOD_CLOUD_TYPE", "SECURE"),
             registry_auth_id=os.environ.get("RUNPOD_REGISTRY_AUTH_ID") or None,
         )

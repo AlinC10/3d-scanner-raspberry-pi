@@ -444,6 +444,8 @@ class FaceCaptureResult(BaseModel):
     warning: str | None = None
     photos: list[str] = []
     r2_uploaded: bool = False
+    # Eye openness of the kept photo pair (0 closed .. 1 open, the lower camera), null when it was not checked (UX-6)
+    eyes_open: float | None = None
     # Local 3D reconstruction of the stereo pair (rpi_face_mesh, FACE-20): the /library id of the model in
     # results/<result_id>/ (null when it did not run or failed), the face metrics, and why it failed
     result_id: str | None = None

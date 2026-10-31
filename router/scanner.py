@@ -285,6 +285,73 @@ def prepare_face_scan(req: FacePrepareRequest, background_tasks: BackgroundTasks
     )
 
 
+# What a failed cloud stage needs to run again without a new scan (UX-3): set when run_cloud_job fails (the photos
+# stay in R2 under jobs/<job_id>/input/ and on disk), cleared when a cloud stage succeeds
+_cloud_retry: dict = {}
+
+
+def _run_cloud_stage(cloud_job, options: dict) -> None:
+    """
+    Runs Turntable Studio on RunPod for the photos of scanner.job_id (already uploaded and verified) and saves the
+    model in results/<job_id>/. The state must already be PROCESSING. Raises on a failed job (the caller ends in ERROR);
+    the job is then remembered in `_cloud_retry` for POST /scanner/cloud/retry.
+    """
+    job_id = scanner.job_id
+    _cloud_retry.clear()
+    _cloud_retry.update(job_id=job_id, options=dict(options), images_dir=str(scanner.images_dir))
+    _cloud_stage_body(cloud_job, options, job_id)
+    if scanner.state == ScannerState.COMPLETED:
+        _cloud_retry.clear()
+
+
+def _cloud_stage_body(cloud_job, options: dict, job_id: str) -> None:
+    # Technical detail (pod polling every few seconds, uploads, retries) goes to `cloud_message`; `phase_message`
+    # changes only when a phase of the reconstruction is finished, so the screen shows a steady progress (CLOUD-24)
+    def _progress(message: str) -> None:
+        log.info("[Cloud %s] %s", job_id, message)
+        if scanner.state == ScannerState.PROCESSING:
+            scanner.cloud_message = message
+
+    def _phase(message: str) -> None:
+        log.info("[Cloud %s] Phase: %s", job_id, message)
+        if scanner.state == ScannerState.PROCESSING:
+            scanner.phase_message = message
+
+    scanner.cloud_message = None
+    _phase("Preparing the 3D reconstruction in the cloud")
+
+    report = cloud_job.run_cloud_job(
+        input_dir=str(Path(scanner.images_dir).parent),
+        image_prefix=str(Path(scanner.images_dir).name) + "/",
+        results_dir=str(results_directory()),
+        job_id=job_id,
+        pipeline_options=options,
+        dry_run=False,
+        skip_upload=True,
+        cancel_event=scanner._cancel_event,
+        on_progress=_progress,
+        on_phase=_phase,
+    )
+
+    if _cancel_requested() or scanner.state == ScannerState.CANCELLED:
+        scanner.state = ScannerState.CANCELLED
+        log.info("Job cancelled during cloud processing.")
+        return
+
+    if report.get("result") != "ok":
+        status = report.get("status") or {}
+        raise RuntimeError(f"Turntable Studio job {job_id} failed: {status.get('state') or 'no pod result'} "
+                           f"{status.get('error', '')}".strip())
+
+    # 4. The result is already extracted in results/<job_id>/ (served by /library); the photos are kept beside it
+    copy_photos(Path(scanner.images_dir), results_directory() / job_id)
+    set_category(results_directory(), job_id, "object")
+    scanner.result_id = job_id
+    if _set_state_unless_cancelled(ScannerState.COMPLETED):
+        log.info("Full pipeline completed: model in %s (cost estimate %s).",
+                 report.get("results_dir"), report.get("cost_estimate"))
+
+
 def _orchestrate_pipeline(req: StartRequest):
     """
     Background worker that runs the mechanical scan and, only when the request asks for it (cloud.launch_runpod), the
@@ -357,7 +424,6 @@ def _orchestrate_pipeline(req: StartRequest):
             log.info("Scan was cancelled, aborting cloud pipeline.")
             return
 
-        job_id = scanner.job_id
         options = {
             "rig_mode": True,
             "resolution_level": req.cloud.resolution_level,
@@ -366,53 +432,8 @@ def _orchestrate_pipeline(req: StartRequest):
             "texturing_engine": "texrecon",
         }
         # Untitled: the object is named after its folder (the job id), the same name as in results/ and on a USB export
-        options["title"] = req.cloud.title or job_id
-
-        # Technical detail (pod polling every few seconds, uploads, retries) goes to `cloud_message`; `phase_message`
-        # changes only when a phase of the reconstruction is finished, so the screen shows a steady progress (CLOUD-24)
-        def _progress(message: str) -> None:
-            log.info("[Cloud %s] %s", job_id, message)
-            if scanner.state == ScannerState.PROCESSING:
-                scanner.cloud_message = message
-
-        def _phase(message: str) -> None:
-            log.info("[Cloud %s] Phase: %s", job_id, message)
-            if scanner.state == ScannerState.PROCESSING:
-                scanner.phase_message = message
-
-        scanner.cloud_message = None
-        _phase("Preparing the 3D reconstruction in the cloud")
-
-        report = cloud_job.run_cloud_job(
-            input_dir=str(Path(scanner.images_dir).parent),
-            image_prefix=str(Path(scanner.images_dir).name) + "/",
-            results_dir=str(results_directory()),
-            job_id=job_id,
-            pipeline_options=options,
-            dry_run=False,
-            skip_upload=True,
-            cancel_event=scanner._cancel_event,
-            on_progress=_progress,
-            on_phase=_phase,
-        )
-
-        if _cancel_requested() or scanner.state == ScannerState.CANCELLED:
-            scanner.state = ScannerState.CANCELLED
-            log.info("Job cancelled during cloud processing.")
-            return
-
-        if report.get("result") != "ok":
-            status = report.get("status") or {}
-            raise RuntimeError(f"Turntable Studio job {job_id} failed: {status.get('state') or 'no pod result'} "
-                               f"{status.get('error', '')}".strip())
-
-        # 4. The result is already extracted in results/<job_id>/ (served by /library); the photos are kept beside it
-        copy_photos(Path(scanner.images_dir), results_directory() / job_id)
-        set_category(results_directory(), job_id, "object")
-        scanner.result_id = job_id
-        if _set_state_unless_cancelled(ScannerState.COMPLETED):
-            log.info("Full pipeline completed: model in %s (cost estimate %s).",
-                     report.get("results_dir"), report.get("cost_estimate"))
+        options["title"] = req.cloud.title or scanner.job_id
+        _run_cloud_stage(cloud_job, options)
 
     except Exception as e:
         log.error("Pipeline failed: %s", e)
@@ -422,6 +443,58 @@ def _orchestrate_pipeline(req: StartRequest):
     finally:
         with _start_lock:
             _start_state["pending"] = False
+
+def _cloud_retry_problem() -> str | None:
+    """Why POST /scanner/cloud/retry is refused now (None when it can run)."""
+    if not _cloud_retry:
+        return "There is no failed cloud reconstruction to retry."
+    if scanner.state not in (ScannerState.ERROR, ScannerState.CANCELLED):
+        return f"Cannot retry from state {scanner.state}; a retry follows a failed or cancelled reconstruction."
+    if _cloud_retry.get("job_id") != getattr(scanner, "job_id", None):
+        return "A newer scan replaced the photos of the failed reconstruction."
+    images_dir = Path(_cloud_retry.get("images_dir") or "")
+    if not images_dir.is_dir() or not any(images_dir.rglob("*.jpg")):
+        return "The photos of the failed reconstruction are no longer on the Pi."
+    return _runpod_config_problem()
+
+
+def _retry_cloud_pipeline() -> None:
+    """Background worker of POST /scanner/cloud/retry: the cloud stage again, same job and options."""
+    try:
+        if _cancel_requested() or not _set_state_unless_cancelled(ScannerState.PROCESSING):
+            return
+        _run_cloud_stage(_load_cloud_job(), dict(_cloud_retry["options"]))
+    except Exception as e:
+        log.error("Cloud retry failed: %s", e)
+        if scanner.state == ScannerState.PROCESSING:
+            scanner.error = str(e)
+        _set_state_unless_cancelled(ScannerState.ERROR)
+    finally:
+        with _start_lock:
+            _start_state["pending"] = False
+
+
+@router.post("/cloud/retry", response_model=StartResponse, status_code=202)
+def retry_cloud_reconstruction(background_tasks: BackgroundTasks):
+    """
+    Runs the 3D reconstruction of the last object scan again on RunPod (UX-3), after it failed or was cancelled in
+    `processing`: same job id, same options, the photos already in the cloud (no new scan, no new upload). `400` when
+    there is nothing to retry, a newer scan replaced the photos or RunPod is not configured; `409` while a run is busy.
+    Billed like a scan.
+    """
+    with _start_lock:
+        if _start_state["pending"] or getattr(scanner, "_stopping", False) is True:
+            raise HTTPException(status_code=409, detail="A scan, a retry or an emergency stop is still running.")
+        problem = _cloud_retry_problem()
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+        _start_state["pending"] = True
+        scanner.error = None
+        if hasattr(scanner, "_cancel_event"):
+            scanner._cancel_event.clear()
+    background_tasks.add_task(_retry_cloud_pipeline)
+    return StartResponse(status="accepted", message=f"Retrying the reconstruction of {scanner.job_id}.")
+
 
 @router.post("/start", response_model=StartResponse, status_code=202)
 def start_scan(req: StartRequest, background_tasks: BackgroundTasks):

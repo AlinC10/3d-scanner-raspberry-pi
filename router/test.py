@@ -67,11 +67,11 @@ class MotorTarget(str, Enum):
 from schemas.scanner import ZMoveRequest, TurntableRotateRequest
 
 # The sounds the scanner plays (hardware/buzzer.py PATTERNS; tests check that both lists are the same)
-BuzzerPattern = Literal["ready", "start", "hold_still", "success", "error"]
+BuzzerPattern = Literal["ready", "start", "hold_still", "photo_countdown", "success", "error"]
 
 
 class BuzzerPlayRequest(BaseModel):
-    pattern: Annotated[BuzzerPattern, Field(description="Sound to play: ready, start, hold_still, success, error.")]
+    pattern: Annotated[BuzzerPattern, Field(description="Sound to play: ready, start, hold_still, photo_countdown, success, error.")]
 
 
 class BuzzerToneRequest(BaseModel):
@@ -579,7 +579,7 @@ def test_cloud_runpod_dry_run(
         pods = rp.RunPodClient().list_pods()
         result["runpod_api"] = "ok"
         result["turntable_pods"] = [{"id": p.get("id"), "name": p.get("name"), "status": p.get("desiredStatus")}
-                                    for p in pods if str(p.get("name") or "").startswith("turntable-")]
+                                    for p in pods if str(p.get("name") or "").startswith("turntable-")]  # the scanner's ("turntable-pi-*") and the laptop's
     except Exception as e:
         result["runpod_api"] = f"error: {e}"
     try:

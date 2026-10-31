@@ -556,6 +556,7 @@ Finished models are stored on the Pi and served by the library endpoints.
 - Newest first; `limit` 1 to 100; next page with `offset = next_offset` until it is `null`.
 - `object` is the reconstruction's `object.json`.
 - `models` lists only files that exist; disable buttons for the missing ones.
+- `DELETE /library/objects/{id}` deletes an object for good (models and photos): `204`, `404` unknown, `409` while it is being exported.
 - `category` is `"object"` (turntable scan) or `"face"` (face scan). `category=all|object|face` and `search=<text>` (title, description or id, any case) filter before the paging, so `total` counts only matching objects.
 
 ### 10.2 `GET /library/objects/{id}`
@@ -679,7 +680,7 @@ For a service / calibration page. Every motion endpoint answers `409` while a sc
 | GET | `/test/tof` | | `{"status": "success", "distance_mm": 412, "valid": true, "available": true}` (`status: "invalid"`, `distance_mm: null` without a reading) |
 | POST | `/test/lights/enable` | `{"brightness": 0.5}` (optional, 0 to 1) | `{"status": "success", "state": "enabled", "brightness": 0.5, "message": "..."}` |
 | POST | `/test/lights/disable` | | `{"status": "success", "state": "disabled", "message": "..."}` |
-| GET | `/test/buzzer` | | `{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "success", "error"]}` |
+| GET | `/test/buzzer` | | `{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "photo_countdown", "success", "error"]}` |
 | POST | `/test/buzzer/play` | `{"pattern": "success"}` | `{"status": "success", "pattern": "success"}`; `503` without buzzer |
 | POST | `/test/buzzer/tone` | `{"frequency_hz": 880, "duration_s": 0.5}` (110-1760 Hz, up to 5 s) | `{"status": "success", "frequency_hz": 880.0, "duration_s": 0.5}` |
 | GET | `/test/motor/status` | | `{"turntable": "enabled", "z_axis": "disabled"}` |

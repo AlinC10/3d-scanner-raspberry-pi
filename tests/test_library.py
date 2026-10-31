@@ -135,6 +135,26 @@ class CategoryAndFilterTest(unittest.TestCase):
         self.assertEqual([e.id[-1] for e in page.items], ["3"])
         self.assertEqual(page.next_offset, 2)
 
+    def test_backfill_writes_only_the_missing_categories(self):
+        written = results.backfill_categories(self.root)
+        self.assertEqual(written, {"20261020-000000-000001": "object", "20261021-000000-000002": "face",
+                                   "20261023-000000-000004": "object", "20261024-000000-000005": "face"})
+        obj = json.loads((self.root / "20261021-000000-000002" / "object.json").read_text())
+        self.assertEqual(obj, {"title": "Ana", "mode": "mediapipe_face_mesh", "category": "face"})
+        self.assertEqual(results.backfill_categories(self.root), {})          # a second run changes nothing
+        self.assertEqual(results.backfill_categories(self.root / "missing"), {})
+
+    def test_delete_removes_the_folder_and_refuses_unknown_ids(self):
+        oid = "20261020-000000-000001"
+        (self.root / oid / "photos" / "rig" / "0").mkdir(parents=True)
+        results.delete_result(self.root, oid)
+        self.assertFalse((self.root / oid).exists())
+        self.assertFalse(any(p.name.endswith(".deleting") for p in self.root.iterdir()))
+        self.assertNotIn("1", self.ids())
+        for bad in (oid, "../etc", "20261020-000000-zzzzzz"):
+            with self.assertRaises(results.ResultNotFoundError):
+                results.delete_result(self.root, bad)
+
     def test_set_category_writes_object_json_and_keeps_the_rest(self):
         oid = "20261020-000000-000001"
         self.assertTrue(results.set_category(self.root, oid, "object"))
@@ -184,6 +204,12 @@ print(json.dumps({
     "model_bad_format": call(f"/library/objects/{oid}/model?format=obj")["status"],
     "model_bad_lod": call(f"/library/objects/{oid}/model?lod=mid")["status"],
     "model_traversal": call("/library/objects/..%%2F..%%2Fetc/model")["status"],
+    "delete_busy": (library.usb._status.update(state="archiving", object_id="20261026-000000-000001"),
+                    client.delete("/library/objects/20261026-000000-000001").status_code,
+                    library.usb._status.update(state="idle", object_id=None))[1],
+    "delete": client.delete("/library/objects/20261026-000000-000001").status_code,
+    "after_delete": call("/library/objects/20261026-000000-000001")["status"],
+    "delete_again": client.delete("/library/objects/20261026-000000-000001").status_code,
 }))
 """
 
@@ -233,6 +259,10 @@ class LibraryApiTest(unittest.TestCase):
         found = self.r["list_search"]["body"]
         self.assertEqual((found["total"], [i["id"] for i in found["items"]]), (1, ["20261027-202750-21d2de"]))
         self.assertEqual(self.r["list_bad_category"], 422)
+
+    def test_delete(self):
+        self.assertEqual((self.r["delete_busy"], self.r["delete"], self.r["after_delete"], self.r["delete_again"]),
+                         (409, 204, 404, 404))
 
     def test_one_object(self):
         self.assertEqual(self.r["one"]["status"], 200)

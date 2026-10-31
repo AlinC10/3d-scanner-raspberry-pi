@@ -1076,13 +1076,16 @@ class TestPreflight(ScannerTestCase):
     def test_require_tof_is_the_check_of_scanner_start(self):
         self.s.tof.read_distance_mm.return_value = 300.0
         self.s.require_tof()
-        self.s.tof.read_distance_mm.return_value = None
+        self.s.tof.available = False
         with self.assertRaises(ScannerPreflightError):
             self.s.require_tof()
 
-    def test_tof_without_a_valid_test_reading_leaves_the_state_idle(self):
+    def test_tof_without_a_valid_test_reading_is_only_a_warning(self):
+        # A dark object in front of the sensor gives no valid distance: not a reason to refuse the scan
         self.s.tof.read_distance_mm.return_value = None
-        self.assert_refused("no valid test reading")
+        with self.assertLogs(scanner_module.log, "WARNING") as logs:
+            self.s.require_tof()
+        self.assertIn("no valid distance", "\n".join(logs.output))
 
     def test_tof_test_reading_exception_leaves_the_state_idle(self):
         self.s.tof.read_distance_mm.side_effect = OSError("i2c")

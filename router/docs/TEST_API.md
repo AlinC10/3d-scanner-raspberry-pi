@@ -75,8 +75,15 @@ Reads the live electrical status of both physical limit switches.
 ### `GET /test/tof`
 Reads the VL53L1X time-of-flight sensor (distance to the subject).
 
-* **Response (`200 OK`)**: `{"status": "success", "distance_mm": 412}`
-* **Error (`500`)**: `ToF Sensor Error: ...` when the sensor cannot be read.
+Always answers `200`:
+
+| Answer | Meaning |
+|---|---|
+| `{"status": "success", "distance_mm": 412.0, "valid": true, "available": true}` | A valid distance |
+| `{"status": "invalid", "distance_mm": null, "valid": false, "available": true}` | The sensor works (it was found and initialised at start-up) but this reading has no valid distance: a dark / absorbing object in front of it (940 nm light absorbed, e.g. black plastic), nothing within range, a too weak signal, or a timeout. Point it at the white backdrop: it must read a valid distance |
+| `{"status": "invalid", "distance_mm": null, "valid": false, "available": false}` | The sensor was not found or not initialised at start-up (wiring, I2C, library); a restart of the server tries again |
+
+`available` is not re-checked at each reading: an I2C fault after start-up shows as `invalid` with `available: true`.
 
 ---
 
@@ -114,12 +121,12 @@ Allowed in any state (no motor and no light is involved); a test sound interrupt
 ### `GET /test/buzzer`
 
 ```json
-{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "success", "error"]}
+{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "photo_countdown", "success", "error"]}
 ```
 
 ### `POST /test/buzzer/play`
 
-Body `{"pattern": "success"}`: one of `ready`, `start`, `hold_still`, `success`, `error` (another value: `422`). Answer `{"status": "success", "pattern": "success"}`.
+Body `{"pattern": "success"}`: one of `ready`, `start`, `hold_still`, `photo_countdown`, `success`, `error` (another value: `422`). Answer `{"status": "success", "pattern": "success"}`.
 
 ### `POST /test/buzzer/tone`
 
@@ -487,7 +494,7 @@ Powers down all hardware cleanly:
 
 ### `POST /test/cloud/runpod-dry-run?resolution_level=1`
 
-Checks the Turntable Studio / RunPod chain without billing anything: `problem` (the reason a `/scanner/start` with `cloud.launch_runpod: true` would be refused, or `null`), the R2 write test (`r2_preflight_s`), the RunPod key (`runpod_api: "ok"` after a read-only listing; `turntable_pods` lists any `turntable-*` pod still alive), and, for the photos on disk (`input_images/rig/`, the last scan), the `plan` (photo count, size, RAM estimate, vCPU, disk) and the `pod_request` that would be sent (secrets replaced by `<redacted>`). No temporary R2 credentials are minted and no pod is created. `400` when there are no photos on disk, R2 fails, or `TURNTABLE_IMAGE` is missing.
+Checks the Turntable Studio / RunPod chain without billing anything: `problem` (the reason a `/scanner/start` with `cloud.launch_runpod: true` would be refused, or `null`), the R2 write test (`r2_preflight_s`), the RunPod key (`runpod_api: "ok"` after a read-only listing; `turntable_pods` lists any `turntable-*` pod still alive: the scanner's are `turntable-pi-<job_id>`), and, for the photos on disk (`input_images/rig/`, the last scan), the `plan` (photo count, size, RAM estimate, vCPU, disk) and the `pod_request` that would be sent (secrets replaced by `<redacted>`). No temporary R2 credentials are minted and no pod is created. `400` when there are no photos on disk, R2 fails, or `TURNTABLE_IMAGE` is missing.
 
 ## Recommended Hardware Verification Checklist
 

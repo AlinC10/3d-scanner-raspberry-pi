@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from app_paths import results_directory
 from schemas.library import (CategoryFilter, LibraryObject, LibraryPage, ModelRequest, UpdateObjectRequest, UsbDrive,
@@ -16,6 +16,8 @@ router = APIRouter(
 
 # Most objects one page may ask for
 MAX_PAGE_SIZE = 100
+# Export states during which the object's files are read (a delete waits for them)
+_EXPORT_RUNNING = {"USB": usb.RUNNING_STATES, "Bluetooth": bluetooth_export.RUNNING_STATES}
 
 
 @router.get("/objects", response_model=LibraryPage)
@@ -45,6 +47,24 @@ def get_object(object_id: str):
     except results.ResultNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return LibraryObject(**entry.as_dict())
+
+
+@router.delete("/objects/{object_id}", status_code=204)
+def delete_object(object_id: str):
+    """
+    Deletes an object for good: its models, `object.json` and the scan photos kept with it. `204` done, `404` unknown
+    object, `409` while a USB or Bluetooth export of this object is running.
+    """
+    for name, status in (("USB", usb.export_status()), ("Bluetooth", bluetooth_export.export_status())):
+        if status.get("object_id") == object_id and status.get("state") in _EXPORT_RUNNING[name]:
+            raise HTTPException(status_code=409, detail=f"A {name} export of {object_id} is running; wait or cancel it.")
+    try:
+        results.delete_result(results_directory(), object_id)
+    except results.ResultNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not delete {object_id}: {e}")
+    return Response(status_code=204)
 
 
 @router.get("/objects/{object_id}/model")
@@ -89,6 +109,24 @@ def list_usb_drives():
         return usb.list_drives()
     except usb.UsbError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/usb/eject")
+def eject_usb_drive(req: UsbExportRequest | None = None):
+    """
+    Safe removal: unmounts the stick (all its partitions) and powers it off, so it can be pulled out without damage.
+    Body optional `{"device": "/dev/sda1"}` (default: the first stick). `200` `{"device", "disk", "powered_off",
+    "safe_to_remove": true}`; `503` no stick, `409` an export is running, `500` it could not be unmounted.
+    """
+    try:
+        result = usb.eject(req.device if req else None)
+    except usb.UsbNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except usb.UsbBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except usb.UsbError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {**result, "safe_to_remove": True}
 
 
 @router.post("/objects/{object_id}/export/usb", response_model=UsbExportStatus, status_code=202)

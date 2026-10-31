@@ -100,6 +100,9 @@ Everything the front-end needs to show the connections, in one request. It only 
     "connected": true,
     "devices": [{"mac_address": "AA:BB:CC:DD:EE:FF", "name": "Speaker"}]
   },
+  "usb": {"connected": true, "export_state": "idle", "safe_to_remove": true,
+          "drives": [{"device": "/dev/sda1", "label": "STICK", "size_bytes": 15938355200, "fstype": "vfat",
+                      "mountpoint": null, "free_bytes": null, "disk": "/dev/sda"}]},
   "restore": {"wifi": "already connected (Home)", "bluetooth AA:BB:CC:DD:EE:FF": "connected", "state": "done", "seconds": 4.2}
 }
 ```
@@ -107,6 +110,7 @@ Everything the front-end needs to show the connections, in one request. It only 
 * `state` (Ethernet, Wi-Fi): the NetworkManager device state: `connected`, `connecting`, `disconnected`, `unavailable` (no cable / radio off / no such port).
 * `ethernet.interface` is the built-in port (`eth*`/`en*`); a USB adapter or `usb0` only when there is no other one; `null` when there is no Ethernet device.
 * `wifi.signal`: 0-100. `ip`: IPv4 with prefix, `null` when not connected.
+* `usb`: the USB sticks plugged in (`lsblk`, nothing is mounted by the read; `drives` as `GET /library/usb`), `export_state` and `safe_to_remove` of the USB export. Eject with `POST /library/usb/eject`.
 * `restore`: `null` when nothing was restored (no saved state, development mode), `{"state": "running"}` while it runs, then one entry per part (`"connected ..."`, `"already connected ..."`, `"failed: <reason>"`).
 
 ---

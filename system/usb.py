@@ -83,6 +83,7 @@ def list_drives() -> list[dict]:
                 "fstype": part.get("fstype"),
                 "mountpoint": mountpoint,
                 "free_bytes": shutil.disk_usage(mountpoint).free if mountpoint else None,
+                "disk": disk.get("path"),
             })
     return drives
 
@@ -114,6 +115,32 @@ def unmount(device: str) -> None:
     done = _run(["udisksctl", "unmount", "-b", device, "--no-user-interaction"])
     if done.returncode != 0 and "NotMounted" not in done.stderr:
         raise UsbError(f"Could not unmount {device}: {done.stderr.strip()}")
+
+
+def eject(device: Optional[str] = None) -> dict:
+    """
+    Safe removal of a stick: flushes the caches, unmounts every partition of its disk and powers the disk off
+    (``udisksctl power-off``; the polkit rule of ``kiosk/`` allows it). `device` is a partition from `list_drives`
+    (default: the first stick). Returns ``{"device", "disk", "powered_off"}``; ``powered_off`` False means only the
+    unmount worked (the stick is still safe to pull out).
+
+    :raises UsbNotFoundError: no such stick.
+    :raises UsbBusyError: an export is running.
+    :raises UsbError: a partition could not be unmounted.
+    """
+    with _lock:
+        if _status["state"] in RUNNING_STATES:
+            raise UsbBusyError(f"An export of {_status['object_id']} is running; wait for it to end.")
+    drive = _pick_drive(device)
+    disk = drive.get("disk") or drive["device"]
+    for part in list_drives():
+        if (part.get("disk") or part["device"]) == disk and part["mountpoint"]:
+            unmount(part["device"])
+    done = _run(["udisksctl", "power-off", "-b", disk, "--no-user-interaction"])
+    powered_off = done.returncode == 0
+    if not powered_off:
+        log.warning("[USB] %s unmounted but not powered off: %s", disk, done.stderr.strip())
+    return {"device": drive["device"], "disk": disk, "powered_off": powered_off}
 
 
 def export_files(folder: Path) -> list[tuple[Path, str]]:

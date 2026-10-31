@@ -5,7 +5,7 @@ fails gives `"error"` for that part, not a failed request.
 """
 from typing import Any
 
-from system import bluetooth, ethernet, network_state, nm, wifi
+from system import bluetooth, ethernet, network_state, nm, usb, wifi
 
 
 def _wifi(devices: list[dict]) -> dict[str, Any]:
@@ -41,6 +41,14 @@ def _bluetooth() -> dict[str, Any]:
             "devices": [{"mac_address": d.mac_address, "name": d.name} for d in devices]}
 
 
+def _usb() -> dict[str, Any]:
+    """The USB sticks plugged in now (`lsblk`, no mount) and whether one may be pulled out (no export running)."""
+    drives = usb.list_drives()
+    export = usb.export_status()
+    return {"connected": bool(drives), "drives": drives,
+            "export_state": export["state"], "safe_to_remove": export["safe_to_remove"]}
+
+
 def _part(read) -> dict[str, Any]:
     try:
         return read()
@@ -64,5 +72,6 @@ def get_network_status() -> dict[str, Any]:
         "ethernet": ethernet_part,
         "wifi": wifi_part,
         "bluetooth": _part(_bluetooth),
+        "usb": _part(_usb),
         "restore": network_state.last_restore,
     }

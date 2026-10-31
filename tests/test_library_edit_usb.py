@@ -129,6 +129,21 @@ class UsbExportTest(unittest.TestCase):
             drives = self.usb.list_drives()
         self.assertEqual([(d["device"], d["label"], d["mountpoint"]) for d in drives], [("/dev/sda1", "STICK", None)])
 
+    def test_eject_unmounts_and_powers_off_the_disk(self):
+        self.mounted = True
+        with patch.object(self.usb, "_run", self.fake_run):
+            result = self.usb.eject()
+        self.assertEqual(result, {"device": "/dev/sda1", "disk": "/dev/sda", "powered_off": True})
+        self.assertFalse(self.mounted)
+        self.assertIn(["udisksctl", "unmount"], self.calls)
+        self.assertEqual(self.calls[-1], ["udisksctl", "power-off"])
+
+    def test_eject_is_refused_during_an_export(self):
+        self.usb._status.update(state="archiving", object_id=OID)
+        self.addCleanup(self.usb._status.update, state="idle", object_id=None)
+        with self.assertRaises(self.usb.UsbBusyError):
+            self.usb.eject()
+
     def test_no_stick_is_an_error(self):
         empty = {"blockdevices": [LSBLK["blockdevices"][0]]}
         with patch.object(self.usb, "_run",
@@ -196,6 +211,7 @@ print(json.dumps({
     "export_no_stick": r(client.post(f"/library/objects/{oid}/export/usb")),
     "export_missing": client.post("/library/objects/20261027-202750-000000/export/usb").status_code,
     "status": r(client.get("/library/export/usb/status")),
+    "eject_no_stick": client.post("/library/usb/eject").status_code,
 }))
 """
 
@@ -219,6 +235,7 @@ class LibraryEditApiTest(unittest.TestCase):
         self.assertIn("No USB stick", res["export_no_stick"]["body"]["detail"])
         self.assertEqual(res["export_missing"], 404)
         self.assertEqual(res["status"]["body"]["state"], "idle")
+        self.assertEqual(res["eject_no_stick"], 503)
 
 
 if __name__ == "__main__":

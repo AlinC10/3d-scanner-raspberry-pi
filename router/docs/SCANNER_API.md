@@ -96,7 +96,7 @@ Prepares the scanner for framing and calibration.
    - Validates that state is in `[IDLE, COMPLETED, CANCELLED, ERROR]`.
    - Transitions state to `PREPARING`.
    - Powers ON the chamber lights.
-   - Runs the preflight (Cloudflare R2 read/write/delete, ToF sensor, free disk space); a failure is a `400` and nothing is touched.
+   - Runs the preflight (Cloudflare R2 read/write/delete, ToF sensor present and initialised, free disk space); a failure is a `400` and nothing is touched. A ToF reading without a valid distance (a dark object in front of the sensor) does not refuse the scan.
    - Initializes the dual cameras and starts the MJPEG live preview (there is no video encoder and no bitrate).
    - **Immediately returns HTTP 202** with the MJPEG preview URLs (`/scanner/stream/mjpeg?camera=1|2`), usable directly as `<img src>`.
 2. **Background Execution**:
@@ -199,7 +199,7 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
    * **Stage 1b (Completion without RunPod - `COMPLETED`)** (`cloud.launch_runpod = false`, tests only; the default is `true`):
      * The state becomes `COMPLETED` as soon as the photos are verified in R2. `cloud.runpod` is not imported or called, so a missing RunPod key or package does not matter. Download the photos from the bucket for the reconstruction (Turntable Studio).
    * **Stage 2 (Turntable Studio on RunPod - `PROCESSING`)** (only when `cloud.launch_runpod = true`, no confirmation asked):
-     * `cloud.job.run_cloud_job(skip_upload=True)`: R2 preflight, plan of the pod (photo count and size -> RAM estimate `cloud/resources.py` x 1.3, vCPU, disk), termination of every `turntable-*` pod left by an older job, then one pod (`gpuTypePriority: "custom"`, GPU list `RUNPOD_GPU_TYPES`) with temporary R2 credentials limited to `jobs/<job_id>/` (read-only `input/`, read-write `output/`) that expire with the pod's runtime cap (`RUNPOD_POD_MAX_RUNTIME_S`, 1 h).
+     * `cloud.job.run_cloud_job(skip_upload=True)`: R2 preflight, plan of the pod (photo count and size -> RAM estimate `cloud/resources.py` x 1.3, vCPU, disk), termination of every `turntable-pi-*` pod (the scanner's own pods, named `turntable-pi-<job_id>`; a `turntable-*` pod started from a laptop is never touched) left by an older job, then one pod (`gpuTypePriority: "custom"`, GPU list `RUNPOD_GPU_TYPES`) with temporary R2 credentials limited to `jobs/<job_id>/` (read-only `input/`, read-write `output/`) that expire with the pod's runtime cap (`RUNPOD_POD_MAX_RUNTIME_S`, 1 h).
      * Completion is read from `jobs/<job_id>/output/status.json`. Every pod is terminated in a `finally` (success, failure, timeout, cancel); at most `RUNPOD_MAX_POD_ATTEMPTS` (2) pods per job. `phase_message` changes only at milestones (photos checked, cloud server created, reconstruction started, each finished pipeline step the pod writes in `progress.json`, model downloading); the pod polling / heartbeat lines go to `cloud_message` (CLOUD-24).
      * `output.zip` is downloaded and extracted into `results/<job_id>/`, then `jobs/<job_id>/` is deleted from R2. On a failure the photos stay in R2 (retry) and the pod's `run_log.txt` is saved in `results/<job_id>/`.
    * **Stage 3 (Completion - `COMPLETED`)**: `result_id` in `/status` is the `/library` id of the model (= `job_id`). A failed job ends in `error` with `error` set.
@@ -308,6 +308,10 @@ curl -X POST http://127.0.0.1:8000/scanner/start \
        }
      }'
 ```
+
+## `POST /scanner/cloud/retry` → `202` (UX-3)
+
+Runs the 3D reconstruction of the last object scan again on RunPod after it failed (`state: "error"`) or was cancelled during `processing`: same job id and options, the photos already in the cloud (no new scan, no new upload). No body. Answer `202` `{"status": "accepted", "message": "Retrying the reconstruction of <job_id>."}`, then the state is `processing` again (same screen as after a scan) and ends `completed` (`result_id`) or `error`. `400` with `detail` when there is nothing to retry, a newer scan replaced the photos, the photos are no longer on the Pi or RunPod is not configured; `409` while a scan, a retry or an emergency stop runs. Billed like a scan. The router keeps the job id and options of the last failed cloud stage (`_cloud_retry`, in memory: lost on a server restart) and runs `_run_cloud_stage` again in a background task.
 
 ---
 
@@ -609,7 +613,7 @@ Workflow (background, `Scanner.face_scan`):
 1. **Height**: `manual_z`, the search (MediaPipe FaceLandmarker on **fresh** preview frames: a frame exposed during the move is never used; no fresh frame in 3 s is an `error`), or none. Every Z move at constant speed (`acceleration=False`), arriving from below (anti-backlash). Only the endstop in the direction of the move counts; at the top switch the search ends with an `error` (the position is no longer known).
 2. **No face**: not an error. The photo is taken at the start height and `face_result` has `face_detected: false`, `best_score: null` and a `warning` (also in `phase_message`). The score of a height adds the centering, the size, the cheek profile and the share of the face landmarks inside the frame.
 3. **Camera lock on the face**: autofocus sweep on the face box of each camera (with `focus: "auto"`), then AE/AWB settle and lock; the subject should hold still for about 10 s.
-4. **Capture**: after `settle_s`, the synchronized pair `input_images/rig/0/f_{Z}.jpg` and `input_images/rig/1/f_{Z}.jpg`; with the prepare's `upload_r2`, uploaded and verified like the object scan.
+4. **Capture**: after `settle_s` (with a working buzzer: a countdown sound and `phase_message` "photo in 1.5 s, keep your eyes open", the photos 1.5 s later, `SCAN_FACE_PHOTO_WARNING_S`) a burst of `SCAN_FACE_BURST_SHOTS` (4) synchronized pairs; MediaPipe scores the eyes on each (`1 - max(eyeBlinkLeft, eyeBlinkRight)`, the lower camera) and only the pair with the eyes most open is kept as `input_images/rig/0/f_{Z}.jpg` and `input_images/rig/1/f_{Z}.jpg`; with the prepare's `upload_r2`, uploaded and verified like the object scan.
 5. **Teardown**: motors released, lights off, cameras closed.
 6. **3D model on the Pi** (`reconstruct: true`): the state becomes `processing` (the rig is already released), `phase` is `reconstructing_face` and `phase_message` follows the steps ("Detecting face landmarks...", "Computing 3D geometry & depth...", "Baking texture...", "Exporting models (GLB, STL, OBJ)..."). The model (`obj/`, `glb/`, `stl/`, `3mf/`, `object.json` with the size in mm and the IPD) is saved in `results/<job_id>/` and listed by `/library`; `face_result.result_id` and `result_id` give its id, `face_result.metrics` the size. A failed reconstruction ends the run in `error` (`error` says why, `face_result.reconstruction_error` too; the photos are kept in `face_result.photos`). A cancel kills it (`cancelled`). Timeout `FACE_RECONSTRUCT_TIMEOUT_S` (300 s).
 7. The state becomes `completed` with `face_result`. Another capture needs another face prepare.

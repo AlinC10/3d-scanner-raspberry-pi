@@ -325,6 +325,78 @@ class _RouterCase(unittest.TestCase):
             self.mod._orchestrate_pipeline(req)
 
 
+class TestCloudRetry(_RouterCase):
+    """UX-3: POST /scanner/cloud/retry runs only the cloud stage again, same job and options, after a failure."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        rig = os.path.join(self._tmp.name, "rig", "0")
+        os.makedirs(rig)
+        open(os.path.join(rig, "f_0.jpg"), "wb").write(b"jpg")
+        self.scanner.images_dir = os.path.join(self._tmp.name, "rig")
+        self.mod._cloud_retry.clear()
+        p = patch.object(self.mod, "_runpod_config_problem", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def fail_then(self, *reports):
+        it = iter(reports)
+        return _fake_cloud_job(run=lambda kw: next(it))
+
+    def retry(self, job):
+        tasks = MagicMock()
+        with patch.dict(sys.modules, {"cloud.job": job}):
+            self.mod.retry_cloud_reconstruction(tasks)
+            tasks.add_task.call_args.args[0]()
+
+    def test_failed_job_can_be_retried_with_the_same_job_and_options(self):
+        job = self.fail_then({"result": "failed", "status": {"state": "pipeline_error"}}, {"result": "ok"})
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=job)
+        self.assertEqual(self.scanner.state, _State.ERROR)
+        self.retry(job)
+        self.assertEqual(self.scanner.state, _State.COMPLETED)
+        self.assertEqual(len(job.calls), 2)
+        self.assertEqual(job.calls[0]["job_id"], job.calls[1]["job_id"])
+        self.assertEqual(job.calls[0]["pipeline_options"], job.calls[1]["pipeline_options"])
+        self.assertIs(job.calls[1]["skip_upload"], True)
+        self.assertEqual(self.mod._cloud_retry, {})          # nothing left to retry
+        with self.assertRaises(_HTTPException) as ctx:
+            self.retry(job)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_refused_without_a_failure_after_a_new_scan_or_without_photos(self):
+        job = self.fail_then({"result": "failed"})
+        with self.assertRaises(_HTTPException) as ctx:
+            self.retry(job)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=job)
+        self.scanner.job_id = "20261031-000000-ffffff"     # a newer photo set
+        with self.assertRaises(_HTTPException) as ctx:
+            self.retry(job)
+        self.assertIn("newer scan", ctx.exception.detail)
+        self.scanner.job_id = "20261030-101500-a1b2c3"
+        os.remove(os.path.join(self.scanner.images_dir, "0", "f_0.jpg"))
+        with self.assertRaises(_HTTPException) as ctx:
+            self.retry(job)
+        self.assertIn("no longer on the Pi", ctx.exception.detail)
+
+    def test_busy_is_409_and_a_second_failure_stays_retryable(self):
+        job = self.fail_then({"result": "failed"}, {"result": "failed"})
+        self.run_pipeline(_start_req(launch_runpod=True), cloud_job=job)
+        self.mod._start_state["pending"] = True
+        with self.assertRaises(_HTTPException) as ctx:
+            self.retry(job)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.mod._start_state["pending"] = False
+        self.retry(job)
+        self.assertEqual(self.scanner.state, _State.ERROR)
+        self.assertTrue(self.mod._cloud_retry)
+        self.assertFalse(self.mod._start_state["pending"])
+
+
 class TestNullPairs(unittest.TestCase):
     def test_all_null_pairs_mean_unset_and_half_filled_pairs_are_rejected(self):
         code = (

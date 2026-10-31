@@ -22,6 +22,7 @@ once in the face scan:
 | `ready` | state becomes `prepared` (object or face prepare finished) | one short beep (880 Hz) |
 | `start` | state becomes `running` (scan or face capture started) | one short beep (880 Hz) |
 | `hold_still` | face scan: right before the cameras focus and lock on the face | two short high beeps (1320 Hz) |
+| `photo_countdown` | face scan: after the lock, the photo is taken `FACE_PHOTO_WARNING_S` (1.5 s, `SCAN_FACE_PHOTO_WARNING_S`) after it starts, so the subject opens the eyes; `phase_message` says "photo in 1.5 s, keep your eyes open". Without a buzzer only `settle_s` is waited | two beeps (1047 Hz), then a higher one (1568 Hz) |
 | `success` | state becomes `completed` | rising arpeggio C5-E5-G5-C6 |
 | `error` | state becomes `error` or `cancelled` (cancel and emergency stop included) | low long tone, then three fast beeps |
 

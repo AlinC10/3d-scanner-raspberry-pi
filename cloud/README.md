@@ -33,7 +33,7 @@ Pi / laptop                              R2 (one bucket)                        
 **In the scanner** (`router/scanner.py`, `_orchestrate_pipeline`): the photos are uploaded during the scan by the
 `UploadWorker` under `jobs/<job_id>/input/rig/0|1/` and verified, so `run_cloud_job(skip_upload=True,
 image_prefix="rig/")` starts at step 4, only when `/scanner/start` has `cloud.launch_runpod: true`. Before creating
-a pod it terminates every `turntable-*` pod of the account (`runpod.terminate_stale_pods`). The upload keeps the
+a pod it terminates every `turntable-pi-*` pod of the account (`runpod.terminate_stale_pods`; the scanner names its pods `turntable-pi-<job_id>`, so pods started from a laptop are kept). The upload keeps the
 scanner's per-attempt time limit (`UPLOAD_ATTEMPT_TIMEOUT_S`). Dry run without a pod: `POST /test/cloud/runpod-dry-run`.
 | `../runpod_job.py` | Inside the pod: download, run, upload, `status.json` |
 | `../tools/cloud_scan.py` | Runs the flow from the laptop with `input_images/` (not in the Docker image) |
