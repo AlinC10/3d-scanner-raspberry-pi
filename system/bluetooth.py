@@ -25,6 +25,9 @@ SCAN_DURATION_MAX_S = 20
 
 _MAC_RE = re.compile(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}")
 # Lines printed by `bluetoothctl scan on` for a device seen during this discovery
+# bluetoothctl colours its output even into a pipe ("[\x1b[0;92mNEW\x1b[0m] Device ..."): the codes are removed
+# first, otherwise no device is recognised as seen
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x01|\x02")
 _SEEN_RE = re.compile(r"\[(?:NEW|CHG)\]\s+Device\s+((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})")
 
 
@@ -96,7 +99,7 @@ def _seen_in_discovery(output) -> set[str]:
     """Addresses printed by `bluetoothctl scan on` ([NEW] / [CHG] Device ...): the devices in range right now."""
     if isinstance(output, bytes):
         output = output.decode(errors="replace")
-    return {m.upper() for m in _SEEN_RE.findall(output or "")}
+    return {m.upper() for m in _SEEN_RE.findall(_ANSI_RE.sub("", output or ""))}
 
 
 def _parse_info(info: str) -> dict:
@@ -146,7 +149,7 @@ def scan_devices(duration: int = SCAN_DURATION_DEFAULT_S, allowed_icons: Optiona
 
     deadline = time.monotonic() + INFO_BUDGET_S
     devices = []
-    for line in res.stdout.split("\n"):
+    for line in _ANSI_RE.sub("", res.stdout or "").split("\n"):
         # line format: "Device XX:XX:XX:XX:XX:XX Name"
         match = re.match(r"Device\s+([0-9A-Fa-f:]{17})\s+(.*)$", line.strip())
         if not match:
@@ -160,7 +163,7 @@ def scan_devices(duration: int = SCAN_DURATION_DEFAULT_S, allowed_icons: Optiona
                 info = run_bluetoothctl(["info", mac], capture_output=True, text=True).stdout
             except BluetoothConnectionError:
                 info = ""  # no details for this device (icon "unknown")
-        details = _parse_info(info)
+        details = _parse_info(_ANSI_RE.sub("", info or ""))
         in_range = mac.upper() in seen or details["rssi"] is not None
         if not (include_out_of_range or in_range or details["connected"]):
             continue
@@ -178,7 +181,7 @@ def connected_devices() -> list[BluetoothDevice]:
     if res.returncode != 0:
         return []
     devices = []
-    for line in res.stdout.splitlines():
+    for line in _ANSI_RE.sub("", res.stdout or "").splitlines():
         match = re.match(r"Device\s+([0-9A-Fa-f:]{17})\s+(.*)$", line.strip())
         if match:
             devices.append(BluetoothDevice(mac_address=match.group(1), name=match.group(2), paired=True,

@@ -60,6 +60,13 @@ out = {
         else TimeoutExpired(cmd, 1, output="[CHG] Device AA:BB:CC:DD:EE:FF RSSI: -50") if "scan" in cmd
         else hang(cmd),
     ),
+    # bluetoothctl colours its output even into a pipe: the device is still recognised as seen
+    "scan_coloured": run_with(
+        lambda: [d.mac_address for d in bt.scan_devices(duration=5)],
+        lambda cmd: ok("\x1b[0;94mDevice\x1b[0m AA:BB:CC:DD:EE:FF Phone") if cmd[1] == "devices"
+        else ok("[\x1b[0;92mNEW\x1b[0m] Device AA:BB:CC:DD:EE:FF Phone") if "scan" in cmd
+        else ok("Icon: phone\nPaired: no"),
+    ),
     "constants": [bt.BLUETOOTHCTL_TIMEOUT_S, bt.PAIR_TIMEOUT_S, bt.CONNECT_TIMEOUT_S, bt.SCAN_GRACE_S],
 }
 print(json.dumps(out))
@@ -77,6 +84,9 @@ class BluetoothTimeoutsTest(unittest.TestCase):
 
     def timeouts(self, name):
         return [c["timeout"] for c in self.r[name]["calls"]]
+
+    def test_coloured_bluetoothctl_output_is_parsed(self):
+        self.assertEqual(self.r["scan_coloured"]["value"], ["AA:BB:CC:DD:EE:FF"])
 
     def test_every_simple_command_has_the_short_deadline(self):
         for name in ("power_on", "power_off", "status"):
