@@ -19,6 +19,7 @@ from tests.test_fs_scanner import ScannerTestCase, ScannerState, scanner_module
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+@unittest.skip("SCAN-FLIP disabled temporarily")
 class TestFlipScan(ScannerTestCase):
     def run_scan(self, **kwargs):
         """Starts scan() in a thread; returns the thread and a dict that receives its exception, if any."""
@@ -157,6 +158,7 @@ class TestFlipScan(ScannerTestCase):
         self.assertTrue(any("bottom endstop" in w for w in self.s.tof_warnings))
 
 
+@unittest.skip("SCAN-FLIP disabled temporarily")
 class TestCopyPhotosSecondSide(unittest.TestCase):
     def test_the_second_side_is_kept_beside_the_first(self):
         from storage.results import copy_photos
@@ -195,6 +197,7 @@ print(json.dumps({
 """ % ROOT
 
 
+@unittest.skip("SCAN-FLIP disabled temporarily")
 class TestFlipSchema(unittest.TestCase):
     def test_flip_field_and_status(self):
         done = subprocess.run([sys.executable, "-c", SCHEMA_PROGRAM], capture_output=True, text=True, cwd=ROOT,

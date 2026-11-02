@@ -9,7 +9,7 @@ import contextlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union, Any, Dict, Tuple
+from typing import Optional, Union, Any, Dict, Tuple, Callable
 import threading
 import time
 from queue import Queue
@@ -218,8 +218,8 @@ class ScannerState:
     ERROR = "error"
     CANCELLED = "cancelled"
 
-    # States from which a new prepare_scan() cycle is allowed
-    PREPARE_ALLOWED = (IDLE, COMPLETED, CANCELLED, ERROR)
+    # States from which a new prepare_scan() cycle is allowed (PROCESSING allows decoupling rig for parallel scans)
+    PREPARE_ALLOWED = (IDLE, COMPLETED, CANCELLED, ERROR, PROCESSING)
 
     # Terminal states that cleanup() must not overwrite back to IDLE
     TERMINAL = (CANCELLED, ERROR, COMPLETED)
@@ -432,19 +432,20 @@ class Scanner:
                               ScannerState.AWAITING_FLIP) \
             and not self._manual_session
 
-    @property
-    def flip_images_dir(self) -> str:
-        """Photo root of the second side of a flip scan: input_images/session_1/rig (beside input_images/rig)."""
-        root = Path(self.images_dir)
-        return str(root.parent / FLIP_SESSION_NAME / root.name)
-
-    @property
-    def flip_seconds_left(self) -> Optional[float]:
-        """Seconds until the flip wait gives up (None outside `awaiting_flip`)."""
-        deadline = self._flip_deadline
-        if deadline is None or self.state != ScannerState.AWAITING_FLIP:
-            return None
-        return max(0.0, round(deadline - time.monotonic(), 1))
+    # [SCAN-FLIP disabled temporarily]
+    # @property
+    # def flip_images_dir(self) -> str:
+    #     """Photo root of the second side of a flip scan: input_images/session_1/rig (beside input_images/rig)."""
+    #     root = Path(self.images_dir)
+    #     return str(root.parent / FLIP_SESSION_NAME / root.name)
+    #
+    # @property
+    # def flip_seconds_left(self) -> Optional[float]:
+    #     """Seconds until the flip wait gives up (None outside `awaiting_flip`)."""
+    #     deadline = self._flip_deadline
+    #     if deadline is None or self.state != ScannerState.AWAITING_FLIP:
+    #         return None
+    #     return max(0.0, round(deadline - time.monotonic(), 1))
 
     @property
     def is_streaming(self):
@@ -2011,6 +2012,8 @@ class Scanner:
         scan_ok = False
 
         # Lock released - physical execution begins without blocking emergency_stop()
+        if job_id:
+            self.images_dir = str(Path(INPUT_IMAGES_DIR).parent / job_id / "rig")
         images_dir = str(self.images_dir)
 
         # This thread now runs the scan: the Z helpers honour a pending cancel for it (_cancel_applies)
@@ -2028,13 +2031,14 @@ class Scanner:
                 raise ScannerError(f"Could not clean the local photo directory {images_dir}: {e}")
             if Path(images_dir).is_dir() and any(Path(images_dir).iterdir()):
                 raise ScannerError(f"The local photo directory {images_dir} is not empty after the cleanup.")
-            # The second side of an older flip scan must never be mixed into this one
-            flip_root = Path(self.flip_images_dir).parent
-            if flip_root.exists():
-                try:
-                    shutil.rmtree(flip_root)
-                except OSError as e:
-                    raise ScannerError(f"Could not delete the photos of the previous second side {flip_root}: {e}")
+            # [SCAN-FLIP disabled temporarily]
+            # # The second side of an older flip scan must never be mixed into this one
+            # flip_root = Path(self.flip_images_dir).parent
+            # if flip_root.exists():
+            #     try:
+            #         shutil.rmtree(flip_root)
+            #     except OSError as e:
+            #         raise ScannerError(f"Could not delete the photos of the previous second side {flip_root}: {e}")
 
             self._begin_manifest(images_dir, job_id)
             self.start_upload_worker()
@@ -2151,35 +2155,36 @@ class Scanner:
             if self.total_photos == 0 and not self._cancel_event.is_set():
                 raise ScannerError("The scan finished without capturing any photo.")
 
-            # SCAN-FLIP: the turned-over object, ring by ring on the way down (the uploads go on during the wait)
-            if flip and not self._cancel_event.is_set():
-                choice = self._await_flip(FLIP_TIMEOUT_S if flip_timeout_s is None else float(flip_timeout_s))
-                if choice == "continue":
-                    self._scan_second_side(
-                        top_level=self._level,
-                        z_steps=z_steps,
-                        delay_z_motor=delay_z_motor,
-                        z_acceleration=z_acceleration,
-                        z_start_delay=z_start_delay,
-                        z_ramp_percent=z_ramp_percent,
-                        z_decel_percent=z_decel_percent,
-                        z_end_delay=z_end_delay,
-                        ring_kwargs=dict(
-                            angle=angle,
-                            steps=steps,
-                            delay_turntable=delay_turntable,
-                            turntable_acceleration=turntable_acceleration,
-                            turntable_start_delay=turntable_start_delay,
-                            turntable_ramp_percent=turntable_ramp_percent,
-                            turntable_decel_percent=turntable_decel_percent,
-                            turntable_end_delay=turntable_end_delay,
-                        ),
-                    )
-                elif choice in ("skip", "timeout"):
-                    self._phase_note = (
-                        "Scanned on one side only: the flip wait timed out." if choice == "timeout" else None
-                    ) or self._phase_note
-                    log.info("[Scanner] Flip %s: finishing with the first side only.", choice)
+            # [SCAN-FLIP disabled temporarily]
+            # # SCAN-FLIP: the turned-over object, ring by ring on the way down (the uploads go on during the wait)
+            # if flip and not self._cancel_event.is_set():
+            #     choice = self._await_flip(FLIP_TIMEOUT_S if flip_timeout_s is None else float(flip_timeout_s))
+            #     if choice == "continue":
+            #         self._scan_second_side(
+            #             top_level=self._level,
+            #             z_steps=z_steps,
+            #             delay_z_motor=delay_z_motor,
+            #             z_acceleration=z_acceleration,
+            #             z_start_delay=z_start_delay,
+            #             z_ramp_percent=z_ramp_percent,
+            #             z_decel_percent=z_decel_percent,
+            #             z_end_delay=z_end_delay,
+            #             ring_kwargs=dict(
+            #                 angle=angle,
+            #                 steps=steps,
+            #                 delay_turntable=delay_turntable,
+            #                 turntable_acceleration=turntable_acceleration,
+            #                 turntable_start_delay=turntable_start_delay,
+            #                 turntable_ramp_percent=turntable_ramp_percent,
+            #                 turntable_decel_percent=turntable_decel_percent,
+            #                 turntable_end_delay=turntable_end_delay,
+            #             ),
+            #         )
+            #     elif choice in ("skip", "timeout"):
+            #         self._phase_note = (
+            #             "Scanned on one side only: the flip wait timed out." if choice == "timeout" else None
+            #         ) or self._phase_note
+            #         log.info("[Scanner] Flip %s: finishing with the first side only.", choice)
 
             # Every photo of the scan is in the manifest, i.e. both files were validated and queued
             if not self._cancel_event.is_set() and self._manifest_photo_count() != self.total_photos:
@@ -2233,121 +2238,122 @@ class Scanner:
             if self.state == ScannerState.RUNNING:
                 self.state = finish_state
 
-    def _await_flip(self, timeout_s: float) -> str:
-        """
-        The pause between the two sides of a flip scan (state AWAITING_FLIP). The lights, the cameras and their
-        exposure lock stay as they are, the motors are off (the lead screw holds the carriage; the platter may move, the
-        object is turned over anyway). Returns "continue" / "skip" (`flip_decision`), "timeout" or "cancelled".
-        """
-        with self._lock:
-            if self._cancel_event.is_set() or self.state != ScannerState.RUNNING:
-                return "cancelled"
-            self._flip_choice = None
-            self._flip_event.clear()
-            self._flip_deadline = time.monotonic() + max(0.0, timeout_s)
-            self.state = ScannerState.AWAITING_FLIP
-            self._set_phase(ScanPhase.AWAITING_FLIP,
-                            "First side done: turn the object over, then continue (or finish with one side).")
-        log.info("[Scanner] First side done (%d photo(s)); waiting up to %.0f s for the object to be turned over.",
-                 self.total_photos, timeout_s)
-        choice = "timeout"
-        try:
-            while not self._cancel_event.is_set():
-                remaining = self._flip_deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                if self._flip_event.wait(min(0.2, remaining)):
-                    choice = self._flip_choice or "skip"
-                    break
-            with self._lock:
-                # flip_decision() already moved the state back to RUNNING; the timeout does it here
-                if self._cancel_event.is_set() or self.state not in (ScannerState.AWAITING_FLIP, ScannerState.RUNNING):
-                    return "cancelled"
-                if self._flip_choice is not None:
-                    choice = self._flip_choice
-                self.state = ScannerState.RUNNING
-                self._set_phase(ScanPhase.SCANNING)
-            return choice
-        finally:
-            self._flip_deadline = None
-
-    def flip_decision(self, proceed: bool) -> None:
-        """
-        Answers the flip wait: `proceed` True (POST /scanner/flip/continue, the object was turned over) photographs the
-        second side; False (POST /scanner/flip/skip) finishes with the first side only.
-
-        :raises ScannerModeError: the scanner is not waiting for a flip (400).
-        """
-        with self._lock:
-            if self.state != ScannerState.AWAITING_FLIP:
-                raise ScannerModeError(f"The scanner is not waiting for the object to be turned over (state {self.state}).")
-            self._flip_choice = "continue" if proceed else "skip"
-            # RUNNING at once (the answer and the next /status show it); the scan thread wakes up on the event
-            self.state = ScannerState.RUNNING
-            self._set_phase(ScanPhase.SCANNING)
-            self._flip_event.set()
-
-    def _scan_second_side(self, top_level: int, z_steps: int, delay_z_motor: float, z_acceleration: bool,
-                          z_start_delay: Optional[float], z_ramp_percent: float, z_decel_percent: Optional[float],
-                          z_end_delay: Optional[float], ring_kwargs: dict) -> None:
-        """
-        Second side of a flip scan: one ring at each level of the first side, from `top_level` down to 1 (same photo
-        names, in `flip_images_dir`, keys below input/session_1/rig/). The end of the object is not checked (no ToF):
-        the levels are those of the first side. Returns early on a cancel.
-
-        :raises ScannerError: a ring failed or a descent was aborted.
-        """
-        images_dir = self.flip_images_dir
-        try:
-            fc.create_clean_dir(images_dir)
-        except Exception as e:
-            raise ScannerError(f"Could not create the photo directory of the second side {images_dir}: {e}")
-        self.session = 1
-        self._cloud_prefix = f"{FLIP_SESSION_NAME}/{CLOUD_KEY_PREFIX}"
-        log.info("[Scanner] Second side: %d ring(s) on the way down.", top_level)
-
-        self.turntable_motor.enable()
-        level = top_level
-        while level >= 1 and not self._cancel_event.is_set():
-            self._level = level
-            self._set_phase(ScanPhase.SCANNING, f"Second side: ring {top_level - level + 1} of {top_level}")
-            self._capture_turntable_slice(images_dir=images_dir, level_label=level, check_tof=False, **ring_kwargs)
-            if self._cancel_event.is_set() or level == 1:
-                break
-            self.z_axis_motor.enable()
-            if self._cancel_event.is_set():
-                break
-            try:
-                moved = self.move_z_down(
-                    steps=z_steps,
-                    delay=delay_z_motor,
-                    acceleration=z_acceleration,
-                    start_delay=z_start_delay,
-                    ramp_percent=z_ramp_percent,
-                    decel_percent=z_decel_percent,
-                    end_delay=z_end_delay,
-                )
-            except BottomEndstopTriggered:
-                # Steps were lost on the way up or down: the carriage is lower than the first side's ring. One last
-                # ring here, then the side ends.
-                self.z_axis_motor.disable()
-                log.warning("[Scanner] Bottom endstop reached on the second side above level 1; last ring here.")
-                self.tof_warnings.append(
-                    f"Second side: the bottom endstop was reached before level {level - 1}; it is the last ring."
-                )
-                level -= 1
-                self._level = level
-                self._capture_turntable_slice(images_dir=images_dir, level_label=level, check_tof=False,
-                                              **ring_kwargs)
-                break
-            self.z_axis_motor.disable(interrupt=self._cancel_event)
-            if self._cancel_event.is_set():
-                break
-            if not moved:
-                raise ScannerError("The Z-axis descent of the second side was aborted before the next level.")
-            self.turntable_motor.enable()
-            level -= 1
-        self.turntable_motor.disable()
+    # [SCAN-FLIP disabled temporarily]
+    # def _await_flip(self, timeout_s: float) -> str:
+    #     """
+    #     The pause between the two sides of a flip scan (state AWAITING_FLIP). The lights, the cameras and their
+    #     exposure lock stay as they are, the motors are off (the lead screw holds the carriage; the platter may move, the
+    #     object is turned over anyway). Returns "continue" / "skip" (`flip_decision`), "timeout" or "cancelled".
+    #     """
+    #     with self._lock:
+    #         if self._cancel_event.is_set() or self.state != ScannerState.RUNNING:
+    #             return "cancelled"
+    #         self._flip_choice = None
+    #         self._flip_event.clear()
+    #         self._flip_deadline = time.monotonic() + max(0.0, timeout_s)
+    #         self.state = ScannerState.AWAITING_FLIP
+    #         self._set_phase(ScanPhase.AWAITING_FLIP,
+    #                         "First side done: turn the object over, then continue (or finish with one side).")
+    #     log.info("[Scanner] First side done (%d photo(s)); waiting up to %.0f s for the object to be turned over.",
+    #              self.total_photos, timeout_s)
+    #     choice = "timeout"
+    #     try:
+    #         while not self._cancel_event.is_set():
+    #             remaining = self._flip_deadline - time.monotonic()
+    #             if remaining <= 0:
+    #                 break
+    #             if self._flip_event.wait(min(0.2, remaining)):
+    #                 choice = self._flip_choice or "skip"
+    #                 break
+    #         with self._lock:
+    #             # flip_decision() already moved the state back to RUNNING; the timeout does it here
+    #             if self._cancel_event.is_set() or self.state not in (ScannerState.AWAITING_FLIP, ScannerState.RUNNING):
+    #                 return "cancelled"
+    #             if self._flip_choice is not None:
+    #                 choice = self._flip_choice
+    #             self.state = ScannerState.RUNNING
+    #             self._set_phase(ScanPhase.SCANNING)
+    #         return choice
+    #     finally:
+    #         self._flip_deadline = None
+    #
+    # def flip_decision(self, proceed: bool) -> None:
+    #     """
+    #     Answers the flip wait: `proceed` True (POST /scanner/flip/continue, the object was turned over) photographs the
+    #     second side; False (POST /scanner/flip/skip) finishes with the first side only.
+    #
+    #     :raises ScannerModeError: the scanner is not waiting for a flip (400).
+    #     """
+    #     with self._lock:
+    #         if self.state != ScannerState.AWAITING_FLIP:
+    #             raise ScannerModeError(f"The scanner is not waiting for the object to be turned over (state {self.state}).")
+    #         self._flip_choice = "continue" if proceed else "skip"
+    #         # RUNNING at once (the answer and the next /status show it); the scan thread wakes up on the event
+    #         self.state = ScannerState.RUNNING
+    #         self._set_phase(ScanPhase.SCANNING)
+    #         self._flip_event.set()
+    #
+    # def _scan_second_side(self, top_level: int, z_steps: int, delay_z_motor: float, z_acceleration: bool,
+    #                       z_start_delay: Optional[float], z_ramp_percent: float, z_decel_percent: Optional[float],
+    #                       z_end_delay: Optional[float], ring_kwargs: dict) -> None:
+    #     """
+    #     Second side of a flip scan: one ring at each level of the first side, from `top_level` down to 1 (same photo
+    #     names, in `flip_images_dir`, keys below input/session_1/rig/). The end of the object is not checked (no ToF):
+    #     the levels are those of the first side. Returns early on a cancel.
+    #
+    #     :raises ScannerError: a ring failed or a descent was aborted.
+    #     """
+    #     images_dir = self.flip_images_dir
+    #     try:
+    #         fc.create_clean_dir(images_dir)
+    #     except Exception as e:
+    #         raise ScannerError(f"Could not create the photo directory of the second side {images_dir}: {e}")
+    #     self.session = 1
+    #     self._cloud_prefix = f"{FLIP_SESSION_NAME}/{CLOUD_KEY_PREFIX}"
+    #     log.info("[Scanner] Second side: %d ring(s) on the way down.", top_level)
+    #
+    #     self.turntable_motor.enable()
+    #     level = top_level
+    #     while level >= 1 and not self._cancel_event.is_set():
+    #         self._level = level
+    #         self._set_phase(ScanPhase.SCANNING, f"Second side: ring {top_level - level + 1} of {top_level}")
+    #         self._capture_turntable_slice(images_dir=images_dir, level_label=level, check_tof=False, **ring_kwargs)
+    #         if self._cancel_event.is_set() or level == 1:
+    #             break
+    #         self.z_axis_motor.enable()
+    #         if self._cancel_event.is_set():
+    #             break
+    #         try:
+    #             moved = self.move_z_down(
+    #                 steps=z_steps,
+    #                 delay=delay_z_motor,
+    #                 acceleration=z_acceleration,
+    #                 start_delay=z_start_delay,
+    #                 ramp_percent=z_ramp_percent,
+    #                 decel_percent=z_decel_percent,
+    #                 end_delay=z_end_delay,
+    #             )
+    #         except BottomEndstopTriggered:
+    #             # Steps were lost on the way up or down: the carriage is lower than the first side's ring. One last
+    #             # ring here, then the side ends.
+    #             self.z_axis_motor.disable()
+    #             log.warning("[Scanner] Bottom endstop reached on the second side above level 1; last ring here.")
+    #             self.tof_warnings.append(
+    #                 f"Second side: the bottom endstop was reached before level {level - 1}; it is the last ring."
+    #             )
+    #             level -= 1
+    #             self._level = level
+    #             self._capture_turntable_slice(images_dir=images_dir, level_label=level, check_tof=False,
+    #                                           **ring_kwargs)
+    #             break
+    #         self.z_axis_motor.disable(interrupt=self._cancel_event)
+    #         if self._cancel_event.is_set():
+    #             break
+    #         if not moved:
+    #             raise ScannerError("The Z-axis descent of the second side was aborted before the next level.")
+    #         self.turntable_motor.enable()
+    #         level -= 1
+    #     self.turntable_motor.disable()
 
     # Strategies of the face capture: search the height ("sweep_best_score", "direct_stop") or photograph at once
     FACE_STRATEGIES = ("sweep_best_score", "direct_stop", "none")
@@ -2842,6 +2848,8 @@ class Scanner:
         reconstruct: bool = True,
         title: Optional[str] = None,
         fast_framing: bool = True,
+        job_id: Optional[str] = None,
+        on_capture_done: Optional[Callable[[], None]] = None,
     ) -> dict:
         """
         Face capture, after a face prepare (`POST /scanner/face/prepare`: homing, climb to the start height, lights,
@@ -2887,6 +2895,9 @@ class Scanner:
             self._face_z_delay = float(z_delay)
         upload_r2 = self._face_upload_r2
         scan_ok = False
+        if job_id:
+            self.job_id = job_id
+            self.images_dir = Path("input_images") / job_id / "face"
         images_dir = str(self.images_dir)
         paths = []
         target_z = float(self.z_position_mm or 0.0)
@@ -2911,7 +2922,7 @@ class Scanner:
                     fc.create_clean_dir(images_dir)
                 except Exception as e:
                     raise ScannerError(f"Could not clean local photo directory {images_dir}: {e}")
-                self._begin_manifest(images_dir)
+                self._begin_manifest(images_dir, self.job_id)
                 if upload_r2:
                     self.start_upload_worker()
 
@@ -3051,6 +3062,12 @@ class Scanner:
             self.face_result = {k: result.get(k) for k in
                                 ("optimal_z_mm", "best_score", "face_detected", "warning", "photos", "r2_uploaded",
                                  "eyes_open", "framing", "result_id", "metrics", "reconstruction_error")}
+
+        if on_capture_done is not None:
+            try:
+                on_capture_done()
+            except Exception as e:
+                log.warning("on_capture_done callback failed: %s", e)
 
         if reconstruct:
             # The rig is free (motors, lights and cameras are off): the run is now PROCESSING until the model is saved

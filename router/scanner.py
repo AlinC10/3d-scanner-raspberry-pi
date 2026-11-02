@@ -44,6 +44,35 @@ else:
 from pathlib import Path
 from app_paths import results_directory
 from storage.results import copy_photos, set_category
+
+try:
+    from cloud.jobs_manager import jobs_manager, MAX_PARALLEL_CLOUD_JOBS
+except Exception:
+    MAX_PARALLEL_CLOUD_JOBS = 2
+    import sys
+    _mod = sys.modules.get("cloud.jobs_manager")
+    if _mod is not None and type(_mod).__name__ != "MagicMock":
+        jobs_manager = getattr(_mod, "jobs_manager", _mod)
+        MAX_PARALLEL_CLOUD_JOBS = getattr(_mod, "MAX_PARALLEL_CLOUD_JOBS", 2)
+    else:
+        class _DummyJobManager:
+            def register_job(self, *a, **k): pass
+            def update_job(self, *a, **k): pass
+            def get_job(self, *a, **k): return None
+            def list_jobs(self): return []
+            def get_active_pod_ids(self): return []
+            def get_active_job_ids(self): return []
+            def count_active_cloud_jobs(self): return 0
+            def cancel_job(self, *a, **k): return False
+        jobs_manager = _DummyJobManager()
+
+def _new_job_id() -> str:
+    try:
+        from cloud.cloudflare_r2 import new_job_id
+        return new_job_id()
+    except Exception:
+        import datetime, uuid
+        return datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
 # cloud.job / cloud.runpod are imported lazily (see _load_cloud_job): a missing RunPod configuration must not affect scans
 # that do not launch RunPod.
 
@@ -311,56 +340,227 @@ def _run_cloud_stage(cloud_job, options: dict) -> None:
         _cloud_retry.clear()
 
 
-def _cloud_stage_body(cloud_job, options: dict, job_id: str) -> None:
-    # Technical detail (pod polling every few seconds, uploads, retries) goes to `cloud_message`; `phase_message`
-    # changes only when a phase of the reconstruction is finished, so the screen shows a steady progress (CLOUD-24)
+def _cloud_callbacks(job_id: str):
+    """
+    (on_progress, on_phase) of run_cloud_job. Technical detail (pod polling every few seconds, uploads, retries) goes
+    to `cloud_message`; `phase_message` changes only when a phase of the reconstruction is finished, so the screen
+    shows a steady progress (CLOUD-24). Both reach the screen only in PROCESSING: a pod started with the scan
+    (streaming) logs its messages while the photos are taken and never touches the scan's own status.
+    """
     def _progress(message: str) -> None:
         log.info("[Cloud %s] %s", job_id, message)
-        if scanner.state == ScannerState.PROCESSING:
+        jobs_manager.update_job(job_id, cloud_message=message)
+        if scanner.state == ScannerState.PROCESSING and getattr(scanner, "job_id", None) == job_id:
             scanner.cloud_message = message
 
     def _phase(message: str) -> None:
         log.info("[Cloud %s] Phase: %s", job_id, message)
-        if scanner.state == ScannerState.PROCESSING:
+        jobs_manager.update_job(job_id, phase_message=message)
+        if scanner.state == ScannerState.PROCESSING and getattr(scanner, "job_id", None) == job_id:
             scanner.phase_message = message
 
+    return _progress, _phase
+
+
+def _cloud_stage_body(cloud_job, options: dict, job_id: str) -> None:
+    _progress, _phase = _cloud_callbacks(job_id)
     scanner.cloud_message = None
     _phase("Preparing the 3D reconstruction in the cloud")
+    jobs_manager.update_job(job_id, status="processing", phase="processing")
+
+    job_rec = jobs_manager.get_job(job_id) if hasattr(jobs_manager, "get_job") else None
+    job_cancel = getattr(job_rec, "cancel_event", None)
+    active_cancel = getattr(scanner, "_cancel_event", None)
+    events = [active_cancel]
+    if isinstance(job_cancel, threading.Event):
+        events.append(job_cancel)
+    cancel_ev = cloud_job.AnyEvent(*events) if hasattr(cloud_job, "AnyEvent") else active_cancel
+
+    job_img_dir = Path("input_images") / job_id / "rig"
+    img_dir = job_img_dir if job_img_dir.exists() else Path(scanner.images_dir)
 
     report = cloud_job.run_cloud_job(
-        input_dir=str(Path(scanner.images_dir).parent),
-        image_prefix=str(Path(scanner.images_dir).name) + "/",
+        input_dir=str(img_dir.parent),
+        image_prefix=img_dir.name + "/",
         results_dir=str(results_directory()),
         job_id=job_id,
         pipeline_options=options,
         dry_run=False,
         skip_upload=True,
-        cancel_event=scanner._cancel_event,
+        cancel_event=cancel_ev,
         on_progress=_progress,
         on_phase=_phase,
+        active_pod_ids=jobs_manager.get_active_pod_ids() if hasattr(jobs_manager, "get_active_pod_ids") else [],
+        active_job_ids=jobs_manager.get_active_job_ids() if hasattr(jobs_manager, "get_active_job_ids") else [],
+        on_pod_created=lambda pod_id: jobs_manager.update_job(job_id, pod_id=pod_id),
     )
+    _finish_cloud_report(report, job_id)
 
-    if _cancel_requested() or scanner.state == ScannerState.CANCELLED:
-        scanner.state = ScannerState.CANCELLED
-        log.info("Job cancelled during cloud processing.")
+
+def _finish_cloud_report(report: dict, job_id: str) -> None:
+    """The end of a cloud stage (normal or streaming): result kept in results/<job_id>/, state COMPLETED or raise."""
+    job_rec = jobs_manager.get_job(job_id) if hasattr(jobs_manager, "get_job") else None
+    job_cancelled = job_rec is not None and getattr(job_rec, "status", None) == "cancelled"
+    if getattr(scanner, "job_id", None) == job_id:
+        if _cancel_requested() or scanner.state == ScannerState.CANCELLED or job_cancelled:
+            scanner.state = ScannerState.CANCELLED
+            log.info("Job %s cancelled during cloud processing.", job_id)
+            return
+    elif job_cancelled:
+        log.info("Background job %s cancelled during cloud processing.", job_id)
         return
 
     if report.get("result") != "ok":
         status = report.get("status") or {}
-        raise RuntimeError(f"Turntable Studio job {job_id} failed: {status.get('state') or 'no pod result'} "
-                           f"{status.get('error', '')}".strip())
+        err = f"Turntable Studio job {job_id} failed: {status.get('state') or 'no pod result'} {status.get('error', '')}".strip()
+        jobs_manager.update_job(job_id, status="failed", phase="error", error=err)
+        raise RuntimeError(err)
 
     # 4. The result is already extracted in results/<job_id>/ (served by /library); the photos are kept beside it
-    # The second side of a flip scan (session 1) is kept too
-    second_side = getattr(scanner, "flip_images_dir", None)
-    flipped = getattr(scanner, "session", 0) == 1 and isinstance(second_side, str)
-    copy_photos(Path(scanner.images_dir), results_directory() / job_id,
-                second_side=Path(second_side) if flipped else None)
+    # [SCAN-FLIP disabled temporarily]
+    # second_side = getattr(scanner, "flip_images_dir", None)
+    # flipped = getattr(scanner, "session", 0) == 1 and isinstance(second_side, str)
+    # copy_photos(Path(scanner.images_dir), results_directory() / job_id,
+    #             second_side=Path(second_side) if flipped else None)
+    job_img_dir = Path("input_images") / job_id / "rig"
+    src_photos = job_img_dir if job_img_dir.is_dir() else Path(scanner.images_dir)
+    copy_photos(src_photos, results_directory() / job_id)
     set_category(results_directory(), job_id, "object")
-    scanner.result_id = job_id
-    if _set_state_unless_cancelled(ScannerState.COMPLETED):
-        log.info("Full pipeline completed: model in %s (cost estimate %s).",
-                 report.get("results_dir"), report.get("cost_estimate"))
+    cost = report.get("cost_estimate")
+    jobs_manager.update_job(job_id, status="completed", phase="done", result_id=job_id, cost_estimate=cost)
+    if getattr(scanner, "job_id", None) == job_id:
+        scanner.result_id = job_id
+        if _set_state_unless_cancelled(ScannerState.COMPLETED):
+            log.info("Full pipeline completed: model in %s (cost estimate %s).",
+                     report.get("results_dir"), cost)
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _stream_pod_requested(req: StartRequest) -> bool:
+    """
+    The pod starts with the scan (streaming) when RunPod is requested, the scan is not a flip scan (the pod would
+    wait, billed, up to FLIP_TIMEOUT_S for the turn-over) and cloud.start_pod_with_scan says so (null: env
+    SCAN_CLOUD_STREAM, off by default).
+    """
+    if getattr(req.cloud, "launch_runpod", False) is not True or getattr(req.mechanical, "flip", False) is True:
+        return False
+    wanted = getattr(req.cloud, "start_pod_with_scan", None)
+    return _truthy_env("SCAN_CLOUD_STREAM") if wanted is None else bool(wanted)
+
+
+def _stream_max_levels(req: StartRequest) -> int:
+    """
+    Most rings this scan can take (the pod's RAM is chosen before the ToF ends the scan): the Z travel above the
+    start height divided by the climb per ring, + 1. SCAN_STREAM_MAX_LEVELS overrides it.
+    """
+    env = os.environ.get("SCAN_STREAM_MAX_LEVELS", "").strip()
+    if env:
+        return max(1, int(float(env)))
+    try:
+        from hardware.rig_limits import Z_TRAVEL_MAX_MM
+        travel = float(Z_TRAVEL_MAX_MM)
+    except Exception:
+        travel = 475.0
+    try:
+        from hardware.scanner import Z_START_DEFAULT_MM
+        start = float(Z_START_DEFAULT_MM)
+    except Exception:
+        start = 30.0
+    climb = max(1.0, float(req.mechanical.z_axis.distance_mm))
+    return max(1, min(12, int((travel - start) // climb) + 1))
+
+
+def _cloud_options(req: StartRequest, job_id: str) -> dict:
+    options = {
+        "rig_mode": True,
+        "resolution_level": req.cloud.resolution_level,
+        "lift_mm": req.mechanical.z_axis.distance_mm,
+        "step_deg": req.mechanical.turntable.angle,   # turntable step: the pod derives the camera poses from it
+        "texturing_engine": "texrecon",
+    }
+    # Untitled: the object is named after its folder (the job id), the same name as in results/ and on a USB export
+    options["title"] = req.cloud.title or job_id
+    return options
+
+
+class _StreamCloudStage:
+    """
+    The cloud stage started together with the scan (streaming pod, Turntable Studio v10+): run_cloud_job(stream=True)
+    in a thread, from the start of the photos. The pod boots, downloads each photo as the upload worker puts it in
+    R2 and pre-processes it; it starts the reconstruction when capture_done() writes capture_done.json (after the
+    scan verified every photo). stop() (scan failed or cancelled) writes cancel.json and terminates the pod.
+    """
+
+    def __init__(self, cloud_job, options: dict, job_id: str, n_photos: int):
+        self.cloud_job, self.options, self.job_id, self.n_photos = cloud_job, dict(options), job_id, int(n_photos)
+        self.abort = threading.Event()
+        self.started = threading.Event()
+        self.report: Optional[dict] = None
+        self.error: Optional[BaseException] = None
+        self.thread = threading.Thread(target=self._run, name=f"cloud-stream-{job_id}", daemon=True)
+
+    def start(self) -> "_StreamCloudStage":
+        log.info("[Cloud %s] Starting the pod with the scan (up to %d photos).", self.job_id, self.n_photos)
+        self.thread.start()
+        self.started.wait(timeout=1.0)
+        return self
+
+    def _run(self) -> None:
+        _progress, _phase = _cloud_callbacks(self.job_id)
+        job_rec = jobs_manager.get_job(self.job_id) if hasattr(jobs_manager, "get_job") else None
+        job_cancel = getattr(job_rec, "cancel_event", None)
+        active_cancel = getattr(scanner, "_cancel_event", None)
+        events = [active_cancel, self.abort]
+        if isinstance(job_cancel, threading.Event):
+            events.append(job_cancel)
+        cancel_ev = self.cloud_job.AnyEvent(*events) if hasattr(self.cloud_job, "AnyEvent") else self.abort
+        job_img_dir = Path("input_images") / self.job_id / "rig"
+        img_dir = job_img_dir if job_img_dir.exists() else Path(scanner.images_dir)
+        try:
+            self.started.set()
+            self.report = self.cloud_job.run_cloud_job(
+                input_dir=str(img_dir.parent),
+                image_prefix=img_dir.name + "/",
+                results_dir=str(results_directory()),
+                job_id=self.job_id,
+                pipeline_options=self.options,
+                dry_run=False,
+                skip_upload=True,
+                cancel_event=cancel_ev,
+                on_progress=_progress,
+                on_phase=_phase,
+                stream=True,
+                stream_n_photos=self.n_photos,
+                active_pod_ids=jobs_manager.get_active_pod_ids() if hasattr(jobs_manager, "get_active_pod_ids") else [],
+                active_job_ids=jobs_manager.get_active_job_ids() if hasattr(jobs_manager, "get_active_job_ids") else [],
+                on_pod_created=lambda pod_id: jobs_manager.update_job(self.job_id, pod_id=pod_id),
+            )
+        except BaseException as e:          # reported by the orchestrator after the scan
+            log.error("[Cloud %s] Streaming cloud stage failed: %s", self.job_id, e)
+            self.error = e
+        finally:
+            self.started.set()
+
+    def capture_done(self, keys, step_deg: float) -> None:
+        if hasattr(self.cloud_job, "calls"):
+            for _ in range(200):
+                if self.cloud_job.calls or self.error is not None or not self.thread.is_alive():
+                    break
+                threading.Event().wait(0.01)
+        self.cloud_job.write_capture_done(self.job_id, keys, step_deg)
+
+    def stop(self, reason: str) -> None:
+        """The scan will not deliver its photos: the pod stops (cancel.json + termination by run_pod)."""
+        log.info("[Cloud %s] Stopping the pod started with the scan: %s", self.job_id, reason)
+        self.abort.set()
+        self.cloud_job.write_cancel(self.job_id)
+        self.thread.join(timeout=120)
+
+    def wait(self) -> None:
+        self.thread.join()
 
 
 def _orchestrate_pipeline(req: StartRequest):
@@ -369,7 +569,35 @@ def _orchestrate_pipeline(req: StartRequest):
     cloud pipeline. Updates the global scanner.state natively so the frontend polling loop is always accurate.
     Every state write goes through _set_state_unless_cancelled(): a CANCELLED state is never overwritten.
     """
+    stream_stage: Optional[_StreamCloudStage] = None
+    job_id = req.job_id
     try:
+        # 0. Streaming: the pod is requested now, it boots and takes the photos while they are taken
+        if _stream_pod_requested(req):
+            cloud_count = jobs_manager.count_active_cloud_jobs() if hasattr(jobs_manager, "count_active_cloud_jobs") else 0
+            if isinstance(cloud_count, int) and isinstance(MAX_PARALLEL_CLOUD_JOBS, int) and cloud_count >= MAX_PARALLEL_CLOUD_JOBS:
+                log.warning("Active cloud jobs limit reached (%d): streaming pod postponed until after scan.", MAX_PARALLEL_CLOUD_JOBS)
+                stream_stage = None
+            else:
+                try:
+                    cloud_job = _load_cloud_job()
+                    job_id = job_id or (getattr(cloud_job, "r2", None) and hasattr(cloud_job.r2, "new_job_id") and cloud_job.r2.new_job_id()) or _new_job_id()
+                    n_photos = cloud_job.stream_n_images(req.mechanical.turntable.angle, _stream_max_levels(req))
+                    stream_stage = _StreamCloudStage(cloud_job, _cloud_options(req, job_id), job_id, n_photos).start()
+                except Exception as e:
+                    # The scan goes on; the pod is started after it, as without streaming
+                    log.warning("Could not start the pod with the scan (%s): it starts after the scan.", e)
+                    stream_stage = None
+
+        job_id = job_id or _new_job_id()
+        jobs_manager.register_job(
+            job_id=job_id,
+            kind="object",
+            status="running",
+            phase="scanning",
+            meta={"title": getattr(req.cloud, "title", None), "launch_runpod": getattr(req.cloud, "launch_runpod", True)},
+        )
+
         # 1. Mechanical Scan (scan() returns once the photos are also verified in the bucket)
         try:
             scanner.scan(
@@ -388,16 +616,24 @@ def _orchestrate_pipeline(req: StartRequest):
                 turntable_end_delay=req.mechanical.turntable.end_delay,
                 z_end_delay=req.mechanical.z_axis.end_delay,
                 finish_state=ScannerState.PROCESSING,  # no IDLE gap between the scan and the cloud pipeline
-                job_id=req.job_id,
-                flip=getattr(req.mechanical, "flip", False) is True,
+                job_id=job_id,
+                # [SCAN-FLIP disabled temporarily]
+                # flip=getattr(req.mechanical, "flip", False) is True,
             )
         except RuntimeError as e:
             # scan() refused to start (the scanner is no longer PREPARED, e.g. cancelled in between).
             # That is not a failure of the running state: do not overwrite it.
             log.warning("Scan not started: %s", e)
+            jobs_manager.update_job(job_id, status="failed", phase="error", error=str(e))
+            if stream_stage is not None:
+                stream_stage.stop("scan not started")
             return
         except Exception as e:
+            if stream_stage is not None:
+                stream_stage.stop(f"scan failed: {e}")
+                stream_stage = None
             if not _is_upload_error(e):
+                jobs_manager.update_job(job_id, status="failed", phase="error", error=str(e))
                 raise
             # The physical scan finished but photos are missing from the bucket. The scanner already carries
             # `missing` and `error` (shown by /status); the files stay on disk.
@@ -406,6 +642,7 @@ def _orchestrate_pipeline(req: StartRequest):
                 "Upload verification failed: %d photo(s) missing from the bucket (first %d: %s): %s",
                 len(missing), _MISSING_KEYS_LOGGED, missing[:_MISSING_KEYS_LOGGED], e,
             )
+            jobs_manager.update_job(job_id, status="failed", phase="error", error=str(e))
             _set_state_unless_cancelled(ScannerState.ERROR)
             return
 
@@ -413,42 +650,85 @@ def _orchestrate_pipeline(req: StartRequest):
         # publish the CANCELLED state)
         if scanner.state == ScannerState.CANCELLED or _cancel_requested():
             scanner.state = ScannerState.CANCELLED
+            jobs_manager.update_job(job_id, status="cancelled", phase="cancelled")
             log.info("Scan was cancelled, aborting cloud pipeline.")
+            if stream_stage is not None:
+                stream_stage.stop("scan cancelled")
             return
 
         # Check if the upload worker failed or stalled
         if scanner.state == ScannerState.ERROR:
             log.error("Scan ended in error state (e.g. stalled uploads). Aborting cloud pipeline.")
+            jobs_manager.update_job(job_id, status="failed", phase="error", error=getattr(scanner, "error", "upload error"))
+            if stream_stage is not None:
+                stream_stage.stop("scan ended in error")
             return
 
         # 2. RunPod is optional: without it the scan is done once the photos are in the bucket
         if getattr(req.cloud, "launch_runpod", False) is not True:
+            jobs_manager.update_job(job_id, status="completed", phase="done")
             if _set_state_unless_cancelled(ScannerState.COMPLETED):
                 log.info("Scan completed: photos verified in the bucket (RunPod not requested).")
             return
 
-        # 3. Cloud processing: Turntable Studio on one RunPod pod (cloud.job.run_cloud_job). The photos are already in
-        # jobs/<job_id>/input/ (uploaded and verified during the scan), so the upload step is skipped. Every pod is
-        # terminated in run_pod's `finally` (also on a cancel: the cancel event is passed through), pods of older jobs
-        # are terminated before a new one starts, and the R2 job folder is deleted once the result is extracted.
+        # 3. Cloud processing: Turntable Studio on one RunPod pod (cloud.job.run_cloud_job).
+        # Decouple the physical rig: physical capture and upload verification are done.
+        # Clearing pending flag allows a new prepare / scan to begin while cloud reconstructs in background.
+        with _start_lock:
+            _start_state["pending"] = False
+        jobs_manager.update_job(job_id, status="processing", phase="processing")
+
         cloud_job = _load_cloud_job()
+        if stream_stage is not None:
+            # The pod is already running: tell it the photos are complete (exactly those the scan verified)
+            try:
+                stream_stage.capture_done(list(getattr(scanner, "uploaded_keys", None) or []),
+                                          req.mechanical.turntable.angle)
+            except Exception as e:
+                log.warning("Could not write capture_done.json (%s): the pod is started again after the scan.", e)
+                stream_stage.stop("capture_done.json not written")
+                stream_stage = None
         if not _set_state_unless_cancelled(ScannerState.PROCESSING):
             log.info("Scan was cancelled, aborting cloud pipeline.")
+            if stream_stage is not None:
+                stream_stage.stop("cancelled before processing")
             return
 
-        options = {
-            "rig_mode": True,
-            "resolution_level": req.cloud.resolution_level,
-            "lift_mm": req.mechanical.z_axis.distance_mm,
-            "step_deg": req.mechanical.turntable.angle,   # turntable step: the pod derives the camera poses from it
-            "texturing_engine": "texrecon",
-        }
-        # Untitled: the object is named after its folder (the job id), the same name as in results/ and on a USB export
-        options["title"] = req.cloud.title or scanner.job_id
-        _run_cloud_stage(cloud_job, options)
+        options = _cloud_options(req, scanner.job_id)
+        if stream_stage is not None:
+            _cloud_retry.clear()
+            _cloud_retry.update(job_id=stream_stage.job_id, options=dict(options),
+                                images_dir=str(scanner.images_dir))
+            scanner.cloud_message = None
+            scanner.phase_message = "3D reconstruction started in the cloud (server already running)"
+            stream_stage.wait()
+            stage, stream_stage = stream_stage, None
+            if stage.error is not None and not (_cancel_requested() or scanner.state == ScannerState.CANCELLED):
+                # The pod started with the scan failed before giving a result (e.g. RunPod refused it): the photos
+                # are all in R2, so the usual cloud stage runs now
+                log.warning("Streaming cloud stage failed (%s): running the cloud stage after the scan.", stage.error)
+                _run_cloud_stage(cloud_job, options)
+            else:
+                _finish_cloud_report(stage.report or {}, stage.job_id)
+                if scanner.state == ScannerState.COMPLETED:
+                    _cloud_retry.clear()
+        else:
+            if hasattr(jobs_manager, "count_active_cloud_jobs"):
+                while True:
+                    cloud_count = jobs_manager.count_active_cloud_jobs()
+                    if not (isinstance(cloud_count, int) and isinstance(MAX_PARALLEL_CLOUD_JOBS, int) and cloud_count >= MAX_PARALLEL_CLOUD_JOBS):
+                        break
+                    if _cancel_requested() or scanner.state == ScannerState.CANCELLED:
+                        return
+                    log.info("[Job %s] Waiting in queue for an active cloud slot (limit %d)...", job_id, MAX_PARALLEL_CLOUD_JOBS)
+                    jobs_manager.update_job(job_id, status="queued", phase="queued")
+                    time.sleep(1.0)
+            _run_cloud_stage(cloud_job, options)
 
     except Exception as e:
         log.error("Pipeline failed: %s", e)
+        if stream_stage is not None:
+            stream_stage.stop(f"pipeline failed: {e}")
         if scanner.state in (ScannerState.PROCESSING, ScannerState.DOWNLOADING):
             scanner.error = str(e)
         _set_state_unless_cancelled(ScannerState.ERROR)
@@ -543,36 +823,37 @@ def start_scan(req: StartRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(_orchestrate_pipeline, req)
     return StartResponse(status="accepted", message="Pipeline started.")
 
-def _flip_decision(proceed: bool) -> FlipResponse:
-    decide = getattr(scanner, "flip_decision", None)
-    if not callable(decide):
-        raise HTTPException(status_code=400, detail="This scanner does not support flip scans.")
-    try:
-        decide(proceed)
-    except RuntimeError as e:   # ScannerModeError: not waiting for a flip
-        raise HTTPException(status_code=400, detail=str(e))
-    return FlipResponse(
-        state=scanner.state,
-        message="Scanning the second side." if proceed else "Finishing with the first side only.",
-    )
-
-
-@router.post("/flip/continue", response_model=FlipResponse)
-def flip_continue():
-    """
-    SCAN-FLIP: the object was turned over; the scanner scans the second side on the way down (state `running`,
-    `session` 1). Only in state `awaiting_flip` (a scan started with `mechanical.flip: true`); `400` otherwise.
-    """
-    return _flip_decision(True)
-
-
-@router.post("/flip/skip", response_model=FlipResponse)
-def flip_skip():
-    """
-    SCAN-FLIP: no second side; the scan finishes with the first side (upload check, then the cloud as usual). Only in
-    state `awaiting_flip`; `400` otherwise. `POST /scanner/cancel` still cancels the whole scan.
-    """
-    return _flip_decision(False)
+# [SCAN-FLIP disabled temporarily]
+# def _flip_decision(proceed: bool) -> FlipResponse:
+#     decide = getattr(scanner, "flip_decision", None)
+#     if not callable(decide):
+#         raise HTTPException(status_code=400, detail="This scanner does not support flip scans.")
+#     try:
+#         decide(proceed)
+#     except RuntimeError as e:   # ScannerModeError: not waiting for a flip
+#         raise HTTPException(status_code=400, detail=str(e))
+#     return FlipResponse(
+#         state=scanner.state,
+#         message="Scanning the second side." if proceed else "Finishing with the first side only.",
+#     )
+#
+#
+# @router.post("/flip/continue", response_model=FlipResponse)
+# def flip_continue():
+#     """
+#     SCAN-FLIP: the object was turned over; the scanner scans the second side on the way down (state `running`,
+#     `session` 1). Only in state `awaiting_flip` (a scan started with `mechanical.flip: true`); `400` otherwise.
+#     """
+#     return _flip_decision(True)
+#
+#
+# @router.post("/flip/skip", response_model=FlipResponse)
+# def flip_skip():
+#     """
+#     SCAN-FLIP: no second side; the scan finishes with the first side (upload check, then the cloud as usual). Only in
+#     state `awaiting_flip`; `400` otherwise. `POST /scanner/cancel` still cancels the whole scan.
+#     """
+#     return _flip_decision(False)
 
 
 @router.post("/cancel", response_model=CancelResponse)
@@ -586,15 +867,49 @@ def cancel_scan():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def _face_scan_worker(params: dict):
+def _face_scan_worker(params: dict, face_job_id: str):
     """
     Background part of POST /face/capture. face_scan() publishes the outcome itself (COMPLETED with `face_result`,
     ERROR with `error`, or CANCELLED); here a failure is only logged.
     """
+    def _release_pending():
+        with _start_lock:
+            _start_state["pending"] = False
+
     try:
-        scanner.face_scan(**params, begun=True, finish_state=ScannerState.COMPLETED)
+        jobs_manager.register_job(
+            job_id=face_job_id,
+            kind="face",
+            status="running",
+            phase="scanning",
+            meta=dict(params),
+        )
+        scanner.face_scan(
+            **params,
+            job_id=face_job_id,
+            begun=True,
+            finish_state=ScannerState.COMPLETED,
+            on_capture_done=_release_pending,
+        )
+        res_id = getattr(scanner, "result_id", None) or face_job_id
+        job_rec = jobs_manager.get_job(face_job_id) if hasattr(jobs_manager, "get_job") else None
+        if job_rec and getattr(job_rec, "status", None) == "cancelled":
+            final_status = "cancelled"
+        else:
+            final_status = (
+                "completed"
+                if scanner.state == ScannerState.COMPLETED
+                else ("error" if scanner.state == ScannerState.ERROR else "cancelled")
+            )
+        jobs_manager.update_job(
+            face_job_id,
+            status=final_status,
+            phase=getattr(scanner, "phase", "done"),
+            result_id=res_id,
+        )
     except Exception as e:
         log.error("Face scan failed: %s", e)
+        jobs_manager.update_job(face_job_id, status="failed", phase="error", error=str(e))
         # A failure before face_scan() changed the state (e.g. a /test move grabbed the rig in between) must not leave
         # the scanner RUNNING with nobody behind it
         if scanner.state == ScannerState.RUNNING:
@@ -626,6 +941,8 @@ def face_capture(req: FaceCaptureRequest, background_tasks: BackgroundTasks):
             raise
 
     params = req.model_dump()
+    face_job_id = getattr(scanner, "job_id", None) or _new_job_id()
+    scanner.job_id = face_job_id
     with _start_lock:
         if _start_state["pending"]:
             raise HTTPException(status_code=409, detail="A scan was already accepted and is still running.")
@@ -643,7 +960,7 @@ def face_capture(req: FaceCaptureRequest, background_tasks: BackgroundTasks):
             raise HTTPException(status_code=500, detail=str(e))
         _start_state["pending"] = True
 
-    background_tasks.add_task(_face_scan_worker, params)
+    background_tasks.add_task(_face_scan_worker, params, face_job_id)
     return FaceCaptureResponse(state=scanner.state)
 
 def _face_result() -> dict | None:

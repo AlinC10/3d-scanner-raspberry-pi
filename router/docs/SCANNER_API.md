@@ -98,7 +98,7 @@ Prepares the scanner for framing and calibration.
 
 ### Behavior
 1. **Immediate Execution (~1.5s)**:
-   - Validates that state is in `[IDLE, COMPLETED, CANCELLED, ERROR]`.
+   - Validates that state is in `[IDLE, COMPLETED, CANCELLED, ERROR, PROCESSING]` (`PROCESSING` allows decoupling the physical rig to prepare/run another scan while cloud reconstruction runs).
    - Transitions state to `PREPARING`.
    - Powers ON the chamber lights.
    - Runs the preflight (Cloudflare R2 read/write/delete, ToF sensor present and initialised, free disk space); a failure is a `400` and nothing is touched. A ToF reading without a valid distance (a dark object in front of the sensor) does not refuse the scan.

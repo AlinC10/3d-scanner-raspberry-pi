@@ -287,6 +287,7 @@ def run_pod(
     boot_timeout_s: Optional[float] = None,
     on_phase: Optional[Callable[[str], None]] = None,
     read_progress: Optional[Callable[[], Optional[str]]] = None,
+    on_pod_created: Optional[Callable[[str], None]] = None,
 ) -> Optional[PodRun]:
     """
     Creates one pod, waits until its status.json appears in R2 (or the pod exits, is cancelled, runs too long,
@@ -310,6 +311,11 @@ def run_pod(
         return None
     run = PodRun(pod_id=created["id"], started_at=time.time(), pod_info=_pod_summary(created))
     say(f"Created pod {run.pod_id}: {run.pod_info}")
+    if on_pod_created is not None:
+        try:
+            on_pod_created(run.pod_id)
+        except Exception as e:
+            logger.warning("on_pod_created callback failed: %s", e)
     phase("Cloud server created: loading the reconstruction software")
     if float(run.pod_info.get("costPerHr") or 0) > MAX_GPU_PRICE:
         say(f"Warning: the pod costs {run.pod_info['costPerHr']} $/h, above RUNPOD_MAX_GPU_PRICE = {MAX_GPU_PRICE:g} "
@@ -394,6 +400,7 @@ def run_job_pods(
     read_started: Optional[Callable[[], bool]] = None,
     on_phase: Optional[Callable[[str], None]] = None,
     read_progress: Optional[Callable[[], Optional[str]]] = None,
+    on_pod_created: Optional[Callable[[str], None]] = None,
 ) -> List[PodRun]:
     """
     Runs the job on at most MAX_POD_ATTEMPTS pods. A new pod is started only when the previous one
@@ -411,7 +418,8 @@ def run_job_pods(
         if attempt > 1 and on_phase is not None:
             on_phase(f"Retrying the reconstruction on a new cloud server (attempt {attempt} of {MAX_POD_ATTEMPTS})")
         run = run_pod(client, make_body(ram), read_status, cancel_event, max_runtime_s, on_progress=say,
-                      read_started=read_started, on_phase=on_phase, read_progress=read_progress)
+                      read_started=read_started, on_phase=on_phase, read_progress=read_progress,
+                      on_pod_created=on_pod_created)
         if run is None:
             say("No pod could be created with these filters.")
             break

@@ -8,6 +8,12 @@ job.py — The whole cloud flow for one scan, run from the Pi or the laptop:
 
 The R2 job folder is deleted only after output.zip was downloaded AND extracted; after a failure the photos
 stay in R2, so the job can be retried with skip_upload=True.
+
+Streaming (stream=True, Turntable Studio image v10+, its plans/PLAN_STREAMING_DAG.md): the pod is requested when the
+scan STARTS. The photos are not there yet, so the pod is planned for the most photos the scan can take
+(plan_stream_job) and nothing is verified first; the pod downloads each photo as it arrives in jobs/<id>/input/ and
+pre-computes what it can. The scanner writes jobs/<id>/input/capture_done.json once every photo is uploaded and
+verified (write_capture_done), or cancel.json when the scan fails or is cancelled (write_cancel).
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -67,6 +73,82 @@ def _merge_cloud_stats(stats_path: Path, report: Dict[str, Any], runs) -> None:
         logger.warning(f"Could not add the cloud data to {stats_path}: {e}")
 
 
+# Photo size of the IMX477 rig (the stream plan is made before the first photo exists)
+STREAM_PHOTO_SIZE = (4056, 3040)
+STREAM_PHOTO_MB = 2.0                # one JPEG of the rig, rounded up (1.6-2.0 MB measured)
+CAPTURE_DONE_NAME, CANCEL_NAME = "capture_done.json", "cancel.json"
+
+
+def stream_n_images(step_deg: float, max_levels: int, cameras: int = 2) -> int:
+    """Most photos a scan can take: cameras x shots per ring x rings."""
+    return int(cameras) * int(round(360.0 / float(step_deg))) * max(1, int(max_levels))
+
+
+def plan_stream_job(n_images: int, resolution_level: int = 1, min_vcpu: int = DEFAULT_MIN_VCPU,
+                    width: int = STREAM_PHOTO_SIZE[0], height: int = STREAM_PHOTO_SIZE[1]) -> Dict[str, Any]:
+    """plan_job for a scan not taken yet: the same RAM / disk formulas on the largest photo count it can reach."""
+    input_gb = n_images * STREAM_PHOTO_MB / 1024
+    estimate = estimate_ram_gb(n_images, width, height, resolution_level)
+    return {
+        "n_images": int(n_images),
+        "width": width,
+        "height": height,
+        "input_gb": round(input_gb, 3),
+        "resolution_level": resolution_level,
+        "ram_estimate_gb": round(estimate, 2),
+        "min_ram_gb": int(math.ceil(estimate * RAM_MARGIN)),
+        "min_vcpu": int(min_vcpu),
+        "disk_gb": rp.disk_gb_for(n_images, input_gb, resolution_level),
+        "files": {},
+        "stream": True,
+    }
+
+
+def write_capture_done(job_id: str, keys, step_deg: Optional[float] = None, bucket: Optional[str] = None,
+                       client=None) -> Dict[str, Any]:
+    """
+    jobs/<id>/input/capture_done.json: the end of a streamed scan, with every photo the scanner verified in R2
+    (`keys`: full object keys or keys relative to input/). The pod then works on exactly these photos.
+    """
+    prefix = r2.input_prefix(job_id)
+    files = sorted(k[len(prefix):] if k.startswith(prefix) else k.lstrip("/") for k in keys)
+    levels = sorted({int(Path(f).stem[2]) for f in files if len(Path(f).stem) > 2 and Path(f).stem[2].isdigit()})
+    body = {"n_images": len(files), "levels": levels, "files": files, "step_deg": step_deg,
+            "finished_at": time.time()}
+    if not r2.put_json(body, r2.input_key(job_id, CAPTURE_DONE_NAME), bucket, client=client):
+        raise r2.R2Error(f"Could not write {CAPTURE_DONE_NAME} for job {job_id}")
+    return body
+
+
+def write_cancel(job_id: str, bucket: Optional[str] = None, client=None) -> bool:
+    """jobs/<id>/input/cancel.json: a streaming pod stops at once (besides being terminated). Never raises."""
+    try:
+        return bool(r2.put_json({"cancelled_at": time.time()}, r2.input_key(job_id, CANCEL_NAME), bucket,
+                                client=client))
+    except Exception as e:
+        logger.warning(f"Could not write {CANCEL_NAME} for job {job_id}: {e}")
+        return False
+
+
+class AnyEvent:
+    """Set when any of the given events is set (run_pod waits on it like on a threading.Event)."""
+
+    def __init__(self, *events):
+        self.events = [e for e in events if e is not None]
+
+    def is_set(self) -> bool:
+        return any(e.is_set() for e in self.events)
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        end = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                break
+            time.sleep(0.2 if left is None else min(0.2, left))
+        return self.is_set()
+
+
 def plan_job(input_dir: str, resolution_level: int = 1, min_vcpu: int = DEFAULT_MIN_VCPU,
              image_prefix: str = "") -> Dict[str, Any]:
     """
@@ -98,6 +180,7 @@ def plan_job(input_dir: str, resolution_level: int = 1, min_vcpu: int = DEFAULT_
 # "3. Bridge SFM & Image Undistortion") -> the milestone shown to the user when that step is finished. Matched by the
 # number the step name starts with; a step that is not listed is shown by its own name.
 POD_STEP_LABELS = {
+    "0": "cloud server ready, waiting for the photos",     # streaming pod, before the last photo
     "1": "cameras found",
     "2": "turntable camera poses computed",
     "2.5": "object masks computed",
@@ -144,6 +227,11 @@ def run_cloud_job(
     image_prefix: str = "",
     terminate_old_pods: bool = True,
     on_phase: Optional[Callable[[str], None]] = None,
+    stream: bool = False,
+    stream_n_photos: Optional[int] = None,
+    active_pod_ids: Optional[Sequence[str]] = None,
+    active_job_ids: Optional[Sequence[str]] = None,
+    on_pod_created: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Runs one scan in the cloud. pipeline_options go to run_pipeline() in the pod (e.g. {"rig_mode": True,
@@ -154,6 +242,9 @@ def run_cloud_job(
     on_progress gets every message (technical detail: pod polling, uploads...); on_phase only the milestones (photos
     checked, cloud server created, reconstruction started, each finished pipeline step the pod reports in
     progress.json, model downloaded), each one once.
+    stream: start the pod now, while the photos are still being taken (see the module docstring): the plan uses
+    stream_n_photos (stream_n_images), nothing is uploaded or verified here, and the job runs once the scanner wrote
+    capture_done.json. input_dir is not read.
     image_prefix: see plan_job. terminate_old_pods: first terminate every "turntable-pi-*" pod of the account (only the scanner's own pods (an
     earlier job's pod left alive by a crash), so a new scan never runs next to a forgotten, billed pod.
     """
@@ -170,10 +261,16 @@ def run_cloud_job(
     report: Dict[str, Any] = {"job_id": job_id, "bucket": bucket, "timings_s": {}, "dry_run": dry_run}
     t = report["timings_s"]
 
-    plan = plan_job(input_dir, int(options.get("resolution_level", 1)), min_vcpu, image_prefix)
+    if stream:
+        n_photos = int(stream_n_photos or stream_n_images(float(options.get("step_deg", 18.0)), 4))
+        plan = plan_stream_job(n_photos, int(options.get("resolution_level", 1)), min_vcpu)
+        skip_upload = True
+    else:
+        plan = plan_job(input_dir, int(options.get("resolution_level", 1)), min_vcpu, image_prefix)
     files = plan.pop("files")
     report["plan"] = plan
-    say(f"Job {job_id}: {plan['n_images']} photos ({plan['input_gb']:.2f} GB, {plan['width']}x{plan['height']}), "
+    say(f"Job {job_id}: {'up to ' if stream else ''}{plan['n_images']} photos ({plan['input_gb']:.2f} GB, "
+        f"{plan['width']}x{plan['height']}), "
         f"RAM estimate {plan['ram_estimate_gb']} GB -> min {plan['min_ram_gb']} GB, "
         f"{plan['min_vcpu']} vCPU, disk {plan['disk_gb']} GB")
 
@@ -185,7 +282,11 @@ def run_cloud_job(
 
     if delete_stale_after_s is not None and not dry_run:
         try:
-            stale = r2.delete_stale_jobs(delete_stale_after_s, bucket, client=client, keep=[job_id])
+            keep_jobs = list(set([job_id] + list(active_job_ids or ())))
+            try:
+                stale = r2.delete_stale_jobs(delete_stale_after_s, bucket, client=client, keep=keep_jobs)
+            except TypeError:
+                stale = r2.delete_stale_jobs(delete_stale_after_s, bucket, client=client, keep=[job_id])
             report["deleted_stale_jobs"] = stale
             if stale:
                 say(f"Deleted {len(stale)} old job folder(s) from R2: {', '.join(stale)}")
@@ -200,7 +301,9 @@ def run_cloud_job(
         mb = plan["input_gb"] * 1024
         say(f"Uploaded {len(res['uploaded'])} photos ({mb:.0f} MB) in {t['upload']} s "
             f"({mb / max(t['upload'], 1e-3):.1f} MB/s), failed: {len(res['failed'])}")
-    if not dry_run:
+    if stream and not dry_run:
+        phase("Starting a cloud server while the photos are taken")
+    elif not dry_run:
         missing = r2.verify_keys(expected, bucket, prefix=r2.input_prefix(job_id), client=client)
         if missing:
             raise r2.R2Error(f"{len(missing)} photo(s) missing in R2, not starting a pod: {missing[:5]}")
@@ -209,6 +312,8 @@ def run_cloud_job(
 
     ttl = int(rp.POD_MAX_RUNTIME_S)
     job_spec = dict(options, job_id=job_id)
+    if stream:
+        job_spec["stream"] = True
 
     def make_env() -> Dict[str, str]:
         env = r2.pod_credentials_env(job_id, ttl) if not dry_run else {
@@ -262,7 +367,11 @@ def run_cloud_job(
 
     rp_client = rp.RunPodClient()
     if terminate_old_pods:
-        old_pods = rp.terminate_stale_pods(rp_client)
+        keep_pods = tuple(active_pod_ids or ())
+        try:
+            old_pods = rp.terminate_stale_pods(rp_client, keep=keep_pods)
+        except TypeError:
+            old_pods = rp.terminate_stale_pods(rp_client)
         if old_pods:
             say(f"Terminated {len(old_pods)} pod(s) left by older jobs: {', '.join(old_pods)}")
 
@@ -270,7 +379,8 @@ def run_cloud_job(
     t0 = time.time()
     runs = rp.run_job_pods(rp_client, make_body, plan["min_ram_gb"], read_status,
                            cancel_event=cancel_event, on_progress=say, before_retry=clear_status,
-                           read_started=read_started, on_phase=on_phase, read_progress=read_progress)
+                           read_started=read_started, on_phase=on_phase, read_progress=read_progress,
+                           on_pod_created=on_pod_created)
     t["pods"] = round(time.time() - t0, 2)
     report["pods"] = [{
         "pod_id": r.pod_id, "outcome": r.outcome, "terminated": r.terminated, "elapsed_s": round(r.elapsed_s, 1),

@@ -383,14 +383,15 @@ class MechanicalConfig(BaseModel):
 
     turntable: Annotated[TurntableScanConfig, Field(description="Configuration for the rotating turntable.")] = Field(default_factory=TurntableScanConfig)
     z_axis: Annotated[ZAxisScanConfig, Field(description="Configuration for the vertical Z-axis.")] = Field(default_factory=ZAxisScanConfig)
-    flip: Annotated[bool, Field(
-        description=(
-            "Scan both sides of the object (SCAN-FLIP). After the first side (bottom to top, as without flip) the "
-            "scanner waits in state `awaiting_flip` for the object to be turned over: POST /scanner/flip/continue "
-            "scans the second side on the way down at the same heights, POST /scanner/flip/skip (or no answer within "
-            "`flip_seconds_left`) finishes with the first side. Default false: one side, no question."
-        )
-    )] = False
+    # [SCAN-FLIP disabled temporarily]
+    # flip: Annotated[bool, Field(
+    #     description=(
+    #         "Scan both sides of the object (SCAN-FLIP). After the first side (bottom to top, as without flip) the "
+    #         "scanner waits in state `awaiting_flip` for the object to be turned over: POST /scanner/flip/continue "
+    #         "scans the second side on the way down at the same heights, POST /scanner/flip/skip (or no answer within "
+    #         "`flip_seconds_left`) finishes with the first side. Default false: one side, no question."
+    #     )
+    # )] = False
 
 
 class CloudConfig(BaseModel):
@@ -412,6 +413,14 @@ class CloudConfig(BaseModel):
             "on (0 = full 12 MP, 1 = default, 3 = fastest). Also sizes the pod's RAM request."
         )
     )] = 1
+    start_pod_with_scan: Annotated[bool | None, Field(
+        description=(
+            "Start the RunPod pod when the scan STARTS (streaming, Turntable Studio image v10+) instead of after the "
+            "last photo: the pod boots and downloads / pre-processes the photos while they are taken, the model is "
+            "ready ~1 min sooner, for ~10-50 s more of pod time. Only with `launch_runpod`, never for a flip scan "
+            "(the pod would wait for the turn-over). Null = the Pi's default (env SCAN_CLOUD_STREAM=1 turns it on)."
+        )
+    )] = None
     title: Annotated[str | None, Field(
         max_length=120,
         description=(
@@ -495,11 +504,12 @@ class CancelResponse(BaseModel):
     status: str = "success"
     state: str = "cancelled"
 
-class FlipResponse(BaseModel):
-    """Answer of POST /scanner/flip/continue and /flip/skip (SCAN-FLIP)."""
-    status: str = "accepted"
-    state: str = "awaiting_flip"
-    message: str = ""
+# [SCAN-FLIP disabled temporarily]
+# class FlipResponse(BaseModel):
+#     """Answer of POST /scanner/flip/continue and /flip/skip (SCAN-FLIP)."""
+#     status: str = "accepted"
+#     state: str = "awaiting_flip"
+#     message: str = ""
 
 class StartResponse(BaseModel):
     status: str = "accepted"
