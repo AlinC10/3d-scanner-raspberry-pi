@@ -231,3 +231,5 @@ adafruit-circuitpython-vl53l1x
 # and pin the exact versions that were verified on the rig.
 # The ToF sensor is a VL53L1X (adafruit-circuitpython-vl53l1x above); nothing imports vl53l0x.
 rpi-hardware-pwm
+# QR code (SVG) of the download link of an export (system/qr_export.py)
+segno

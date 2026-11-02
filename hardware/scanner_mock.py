@@ -26,7 +26,7 @@ from hardware.scanner import (
     ScannerState, ScanPhase, ScanMode, ScannerModeError, ScannerError, ScannerBusyError, ScannerStoppingError,
     ScannerUploadError,
     ArduinoUnavailableError, ARDUINO_UNAVAILABLE_MESSAGE,
-    Z_TRAVEL_MAX_MM, Z_START_DEFAULT_MM, INPUT_IMAGES_DIR, UPLOAD_DRAIN_TIMEOUT_S,
+    Z_TRAVEL_MAX_MM, Z_START_DEFAULT_MM, INPUT_IMAGES_DIR, UPLOAD_DRAIN_TIMEOUT_S, FLIP_TIMEOUT_S,
 )
 
 log = logging.getLogger(__name__)
@@ -311,6 +311,10 @@ class ScannerMock:
         self._face_upload_r2 = True
         self.job_id: Optional[str] = None
         self.result_id: Optional[str] = None
+        self.flip_images_dir = str(Path(INPUT_IMAGES_DIR).parent / "session_1" / Path(INPUT_IMAGES_DIR).name)
+        self._flip_event = threading.Event()
+        self._flip_choice: Optional[str] = None
+        self._flip_deadline: Optional[float] = None
         self._reset_status()
 
     # ── status ────────────────────────────────────────────────────────────────
@@ -325,6 +329,7 @@ class ScannerMock:
         self.tof_warnings = []
         self.total_photos = 0
         self.face_result = None
+        self.session = 0
 
     def _set_phase(self, phase: str, message: Optional[str] = None, error: Optional[str] = None):
         self.phase = phase
@@ -350,7 +355,24 @@ class ScannerMock:
 
     @property
     def scan_owns_rig(self) -> bool:
-        return self.state in (ScannerState.PREPARING, ScannerState.PREPARED, ScannerState.RUNNING)
+        return self.state in (ScannerState.PREPARING, ScannerState.PREPARED, ScannerState.RUNNING,
+                              ScannerState.AWAITING_FLIP)
+
+    @property
+    def flip_seconds_left(self) -> Optional[float]:
+        if self._flip_deadline is None or self.state != ScannerState.AWAITING_FLIP:
+            return None
+        return max(0.0, round(self._flip_deadline - time.monotonic(), 1))
+
+    def flip_decision(self, proceed: bool) -> None:
+        """Like `Scanner.flip_decision`."""
+        with self._lock:
+            if self.state != ScannerState.AWAITING_FLIP:
+                raise ScannerModeError(f"The scanner is not waiting for the object to be turned over (state {self.state}).")
+            self._flip_choice = "continue" if proceed else "skip"
+            self.state = ScannerState.RUNNING
+            self._set_phase(ScanPhase.SCANNING)
+            self._flip_event.set()
 
     # ── motion ────────────────────────────────────────────────────────────────
     @contextlib.contextmanager
@@ -457,8 +479,12 @@ class ScannerMock:
                     self._set_phase(ScanPhase.ERROR, error=str(e))
 
     # ── scan ──────────────────────────────────────────────────────────────────
-    def scan(self, angle: float = 18.0, z_move_mm: float = 100.0, finish_state: str = ScannerState.IDLE, **kwargs):
-        """Simulated scan: one ring per level until the carriage is above the object, two photos per shot."""
+    def scan(self, angle: float = 18.0, z_move_mm: float = 100.0, finish_state: str = ScannerState.IDLE,
+             flip: bool = False, flip_timeout_s: Optional[float] = None, **kwargs):
+        """
+        Simulated scan: one ring per level until the carriage is above the object, two photos per shot. With `flip`
+        it waits in `awaiting_flip` like the real scanner and simulates the second side on the way down.
+        """
         with self._lock:
             if self.state != ScannerState.PREPARED:
                 raise RuntimeError("System must be prepared before scanning.")
@@ -484,6 +510,23 @@ class ScannerMock:
                 break
             self.move_z_up_distance(z_move_mm)
             self.level += 1
+        if flip and not self._cancel_event.is_set() and self._await_flip(
+                FLIP_TIMEOUT_S if flip_timeout_s is None else flip_timeout_s) == "continue":
+            self.session = 1
+            top = self.level
+            for level in range(top, 0, -1):
+                self.level = level
+                self.phase_message = f"Second side: ring {top - level + 1} of {top}"
+                for _ in range(shots):
+                    if self._cancel_event.wait(_SIM_STEP_S):
+                        break
+                    self.photos_captured += 2
+                    self.photos_uploaded = self.photos_captured
+                    self.total_photos = self.photos_captured
+                if self._cancel_event.is_set():
+                    break
+                if level > 1:
+                    self.move_z_down_distance(z_move_mm)
         if self._cancel_event.is_set():
             return
         self._set_phase(ScanPhase.VERIFYING, "Simulated upload verification")
@@ -495,8 +538,36 @@ class ScannerMock:
             self._set_phase(ScanPhase.DONE)
         self._teardown()
 
+    def _await_flip(self, timeout_s: float) -> str:
+        with self._lock:
+            if self._cancel_event.is_set():
+                return "cancelled"
+            self._flip_choice = None
+            self._flip_event.clear()
+            self._flip_deadline = time.monotonic() + timeout_s
+            self.state = ScannerState.AWAITING_FLIP
+            self._set_phase(ScanPhase.AWAITING_FLIP,
+                            "First side done: turn the object over, then continue (or finish with one side).")
+        choice = "timeout"
+        while not self._cancel_event.is_set():
+            remaining = self._flip_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._flip_event.wait(min(0.2, remaining)):
+                choice = self._flip_choice or "skip"
+                break
+        self._flip_deadline = None
+        with self._lock:
+            if self._cancel_event.is_set() or self.state not in (ScannerState.AWAITING_FLIP, ScannerState.RUNNING):
+                return "cancelled"
+            if self._flip_choice is not None:
+                choice = self._flip_choice
+            self.state = ScannerState.RUNNING
+            self._set_phase(ScanPhase.SCANNING)
+        return choice
+
     _FACE_SCAN_REFUSED_STATES = (
-        ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING, ScannerState.DOWNLOADING,
+        ScannerState.RUNNING, ScannerState.AWAITING_FLIP, ScannerState.PREPARING, ScannerState.PROCESSING, ScannerState.DOWNLOADING,
     )
 
     def _face_detection_problem(self) -> Optional[str]:
@@ -552,10 +623,12 @@ class ScannerMock:
         z_delay: Optional[float] = None,
         reconstruct: bool = True,
         title: Optional[str] = None,
+        fast_framing: bool = True,
     ) -> dict:
         """
         Simulated face capture from the prepared height: sweeps or moves directly, and captures mock photos. The mock
-        photos are not faces: `reconstruct` is accepted and ignored (no 3D model, `result_id` stays null).
+        photos are not faces: `reconstruct` is accepted and ignored (no 3D model, `result_id` stays null). With
+        `fast_framing` (and no injected analyzer) the simulated face is reached in one computed jump.
         """
         if not begun:
             self.begin_face_scan(strategy=strategy, search_range_mm=search_range_mm, step_mm=step_mm,
@@ -569,6 +642,7 @@ class ScannerMock:
         target_z = self.z_mm
         best_score = None
         face_detected = None
+        framing = None
 
         def go_to(z: float):
             if z > self.z_mm:
@@ -586,7 +660,12 @@ class ScannerMock:
 
                 if manual_z is not None:
                     go_to(float(manual_z))
+                elif strategy != "none" and fast_framing and analyzer is None \
+                        and self.z_mm <= 240.0 <= self.z_mm + search_range_mm:
+                    go_to(240.0)   # the simulated face: framed after one computed jump
+                    best_score, face_detected, framing = 1.85, True, "jump"
                 elif strategy != "none":
+                    framing = "sweep"
                     simulated_apex_z = 240.0
                     best_score = -1.0
                     best_z = self.z_mm
@@ -635,6 +714,7 @@ class ScannerMock:
             "warning": warning,
             "photos": list(paths),
             "r2_uploaded": bool(upload_r2),
+            "framing": framing,
         }
         if self._cancel_event.is_set():
             self._set_phase(ScanPhase.CANCELLED)

@@ -19,6 +19,7 @@ from hardware.camera.config import (
     AF_ROI,
     AF_DROP_FRACTION,
     AF_MIN_RISE,
+    AF_HINT_SPAN_STEPS,
     VCM_MIN_POS,
     VCM_MAX_POS,
 )
@@ -107,6 +108,7 @@ class DualCameraRPISync(BaseDualCamera):
     # The sensor is configured at the requested size (4056x3040, or the 2x2 binned 2028x1520 mode: same field of view)
     supported_photo_sizes = SUPPORTED_PHOTO_RESOLUTIONS
     supports_lock_auto = True        # prepare_scan(lock_auto=True) freezes AE/AWB (cam1's exposure and gain -> cam2)
+    supports_autofocus_hint = True   # prepare_scan(autofocus_hint=(pos1, pos2)): autofocus around known positions
 
     def __init__(
         self,
@@ -784,6 +786,7 @@ class DualCameraRPISync(BaseDualCamera):
             self.focus_sweep_autofocus(
                 step=int(kwargs.get("autofocus_step") or AF_STEP),
                 roi=tuple(kwargs.get("autofocus_roi") or AF_ROI),
+                hint=kwargs.get("autofocus_hint"),
             )
             autofocus_done = True
 
@@ -893,10 +896,33 @@ class DualCameraRPISync(BaseDualCamera):
                 break
         return scores
 
-    def focus_sweep_autofocus(self, step: int = AF_STEP, roi: tuple = AF_ROI) -> List[int]:
+    @staticmethod
+    def _hint_window(hint: Any, step: int) -> Optional[List[List[int]]]:
+        """The coarse positions around each hinted lens position (same length per lens); None for an unusable hint."""
+        try:
+            centres = [int(h) for h in hint]
+        except (TypeError, ValueError):
+            return None
+        if len(centres) != 2 or any(not VCM_MIN_POS <= c <= VCM_MAX_POS for c in centres):
+            return None
+        offsets = range(-AF_HINT_SPAN_STEPS * step, AF_HINT_SPAN_STEPS * step + 1, step)
+        return [[min(max(c + off, VCM_MIN_POS), VCM_MAX_POS) for off in offsets] for c in centres]
+
+    @staticmethod
+    def _peak_inside(scores: Dict[int, float], window: List[int]) -> bool:
+        """True when the best score of a hinted pass is not on an edge of its window (unless that edge is a range end)."""
+        best = max(scores, key=scores.get)
+        low, high = window[0], window[-1]
+        return (best != low or low == VCM_MIN_POS) and (best != high or high == VCM_MAX_POS)
+
+    def focus_sweep_autofocus(self, step: int = AF_STEP, roi: tuple = AF_ROI, hint: Any = None) -> List[int]:
         """
         ``roi`` is one (x, y, w, h) frame-fraction box for both cameras, or a pair of boxes (cam1, cam2), e.g. the face
         as each camera sees it.
+
+        ``hint`` (``(pos1, pos2)``, FACE-FAST): the coarse pass visits only AF_HINT_SPAN_STEPS coarse steps on each
+        side of these lens positions; when a lens finds its best score on an edge of that window, the full coarse
+        sweep runs instead.
 
         Software autofocus over the RUNNING pipeline: both lenses sweep the VCM range from 0 with a coarse step, each
         stopping as soon as its score drops after the peak (`_coarse_sweep`), then a fine pass around each best
@@ -917,10 +943,22 @@ class DualCameraRPISync(BaseDualCamera):
         self._af_frame = [None, None]
         self._af_active = [True, True]
         try:
-            first = self._coarse_sweep(coarse, roi)
+            first = None
+            window = self._hint_window(hint, step) if hint is not None else None
+            if window is not None:
+                first = self._sweep(window, roi)
+                if all(self._peak_inside(first[c], window[c]) for c in range(2)):
+                    log.info("DualCameraRPISync: Hinted autofocus around %s: %d positions per lens",
+                             list(hint), len(window[0]))
+                else:
+                    log.info("DualCameraRPISync: The focus peak is outside the hinted window %s; full sweep.",
+                             list(hint))
+                    first = None
+            if first is None:
+                first = self._coarse_sweep(coarse, roi)
+                log.info("DualCameraRPISync: Coarse sweep visited %d / %d positions (cam1, cam2 = %d, %d)",
+                         max(len(s) for s in first), len(coarse), len(first[0]), len(first[1]))
             best = [max(s, key=s.get) for s in first]
-            log.info("DualCameraRPISync: Coarse sweep visited %d / %d positions (cam1, cam2 = %d, %d)",
-                     max(len(s) for s in first), len(coarse), len(first[0]), len(first[1]))
 
             fine_step = max(1, step // 5)
             offsets = list(range(-step, step + 1, fine_step))

@@ -22,6 +22,13 @@ try:
 except NameError:
     class FacePrepareRequest: pass
 
+try:
+    FlipResponse
+except NameError:
+    class FlipResponse:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
 # What a prepare readies the rig for (hardware.scanner.ScanMode); plain strings so the mock scanner needs nothing more
 MODE_OBJECT = "object"
 MODE_FACE = "face"
@@ -344,7 +351,11 @@ def _cloud_stage_body(cloud_job, options: dict, job_id: str) -> None:
                            f"{status.get('error', '')}".strip())
 
     # 4. The result is already extracted in results/<job_id>/ (served by /library); the photos are kept beside it
-    copy_photos(Path(scanner.images_dir), results_directory() / job_id)
+    # The second side of a flip scan (session 1) is kept too
+    second_side = getattr(scanner, "flip_images_dir", None)
+    flipped = getattr(scanner, "session", 0) == 1 and isinstance(second_side, str)
+    copy_photos(Path(scanner.images_dir), results_directory() / job_id,
+                second_side=Path(second_side) if flipped else None)
     set_category(results_directory(), job_id, "object")
     scanner.result_id = job_id
     if _set_state_unless_cancelled(ScannerState.COMPLETED):
@@ -378,6 +389,7 @@ def _orchestrate_pipeline(req: StartRequest):
                 z_end_delay=req.mechanical.z_axis.end_delay,
                 finish_state=ScannerState.PROCESSING,  # no IDLE gap between the scan and the cloud pipeline
                 job_id=req.job_id,
+                flip=getattr(req.mechanical, "flip", False) is True,
             )
         except RuntimeError as e:
             # scan() refused to start (the scanner is no longer PREPARED, e.g. cancelled in between).
@@ -531,6 +543,38 @@ def start_scan(req: StartRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(_orchestrate_pipeline, req)
     return StartResponse(status="accepted", message="Pipeline started.")
 
+def _flip_decision(proceed: bool) -> FlipResponse:
+    decide = getattr(scanner, "flip_decision", None)
+    if not callable(decide):
+        raise HTTPException(status_code=400, detail="This scanner does not support flip scans.")
+    try:
+        decide(proceed)
+    except RuntimeError as e:   # ScannerModeError: not waiting for a flip
+        raise HTTPException(status_code=400, detail=str(e))
+    return FlipResponse(
+        state=scanner.state,
+        message="Scanning the second side." if proceed else "Finishing with the first side only.",
+    )
+
+
+@router.post("/flip/continue", response_model=FlipResponse)
+def flip_continue():
+    """
+    SCAN-FLIP: the object was turned over; the scanner scans the second side on the way down (state `running`,
+    `session` 1). Only in state `awaiting_flip` (a scan started with `mechanical.flip: true`); `400` otherwise.
+    """
+    return _flip_decision(True)
+
+
+@router.post("/flip/skip", response_model=FlipResponse)
+def flip_skip():
+    """
+    SCAN-FLIP: no second side; the scan finishes with the first side (upload check, then the cloud as usual). Only in
+    state `awaiting_flip`; `400` otherwise. `POST /scanner/cancel` still cancels the whole scan.
+    """
+    return _flip_decision(False)
+
+
 @router.post("/cancel", response_model=CancelResponse)
 def cancel_scan():
     """
@@ -640,6 +684,10 @@ def get_status():
         items = [str(item) for item in value]
         return items[:limit] if limit else items
 
+    def _seconds(name):
+        value = getattr(scanner, name, None)
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
     mode = getattr(scanner, "mode", None)
     return StatusResponse(
         state=scanner.state,
@@ -649,6 +697,8 @@ def get_status():
         phase=_text("phase"),
         phase_message=_text("phase_message"),
         level=_count("level"),
+        session=_count("session"),
+        flip_seconds_left=_seconds("flip_seconds_left"),
         photos_captured=_count("photos_captured"),
         photos_uploaded=_count("photos_uploaded"),
         missing=_texts("missing", _MISSING_KEYS_REPORTED),

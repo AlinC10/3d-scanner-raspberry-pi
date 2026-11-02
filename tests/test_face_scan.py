@@ -77,7 +77,7 @@ class TestFaceScanSchemas(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(self.r["capture_defaults"], {
             "strategy": "sweep_best_score", "search_range_mm": 150.0, "step_mm": 8.0, "manual_z": None,
-            "settle_s": 0.150, "z_delay": None, "title": None, "reconstruct": True,
+            "settle_s": 0.150, "z_delay": None, "title": None, "reconstruct": True, "fast_framing": True,
         })
         self.assertEqual(self.r["prepare_defaults"], {
             "enable_stream": True, "illumination_brightness": 0.5, "start_z_mm": 180.0, "upload_r2": False,
@@ -114,7 +114,8 @@ class TestFaceScanSchemas(unittest.TestCase):
         self.assertEqual(self.r["response_state"], "running")
         self.assertEqual(self.r["result_default"], {
             "optimal_z_mm": None, "best_score": None, "face_detected": None, "warning": None, "photos": [],
-            "r2_uploaded": False, "eyes_open": None, "result_id": None, "metrics": None, "reconstruction_error": None,
+            "r2_uploaded": False, "eyes_open": None, "framing": None, "result_id": None, "metrics": None,
+            "reconstruction_error": None,
         })
         self.assertEqual(self.r["status_face_result"]["mode"], "face")
         self.assertFalse(self.r["status_face_result"]["face_result"]["face_detected"])
@@ -586,6 +587,172 @@ class TestFaceScanScanner(unittest.TestCase):
         self.assertEqual(scanner._face_camera_settings["exposure_time"], 5000)
         self.assertTrue(scanner._face_camera_settings["copy_colour_gains"])
         self.assertFalse(scanner._face_upload_r2)
+
+
+
+def _framing(nose_y=0.5, visible=1.0, score=2.5, box_h=0.4, both=True):
+    """One StereoFramingAnalyzer evaluation of both cameras."""
+    cam = {"detected": True, "score": score / 2, "nose_y": nose_y, "visible_ratio": visible,
+           "bbox_norm": (0.3, 0.3, 0.3, box_h)}
+    return {"both_detected": both, "any_detected": True, "total_score": score, "avg_nose_y": nose_y,
+            "left": dict(cam), "right": dict(cam)}
+
+
+class _ScriptedAnalyzer:
+    """Answers evaluate_stereo_pair from a list (the last answer repeats)."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.calls = 0
+
+    def evaluate_stereo_pair(self, left, right):
+        self.calls += 1
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+class TestFaceFast(unittest.TestCase):
+    """FACE-FAST: no sweep when the face is framed, a computed jump, the preloaded detector, the autofocus hint."""
+
+    # The scripted scanner of TestFaceScanScanner (not inherited: its tests must not run twice)
+    _scanner = TestFaceScanScanner._scanner
+    _run = TestFaceScanScanner._run
+
+    def _moves(self, scanner):
+        up = patch.object(scanner, "move_z_up_distance", return_value=True)
+        down = patch.object(scanner, "move_z_down_distance", return_value=True)
+        mocks = up.start(), down.start()
+        self.addCleanup(up.stop)
+        self.addCleanup(down.stop)
+        return mocks
+
+    def test_a_face_already_framed_is_photographed_without_moving(self):
+        scanner = self._scanner()
+        up, down = self._moves(scanner)
+        analyzer = _ScriptedAnalyzer([_framing()])
+        result, _ = self._run(scanner, analyzer=analyzer)
+        self.assertEqual(result["framing"], "already_framed")
+        self.assertEqual(result["optimal_z_mm"], 180.0)
+        self.assertTrue(result["face_detected"])
+        self.assertEqual(result["best_score"], 2.5)
+        self.assertEqual(analyzer.calls, 1)
+        up.assert_not_called()
+        down.assert_not_called()
+        self.assertEqual(scanner.face_result["framing"], "already_framed")
+        self.assertIn("autofocus_roi", scanner.cams.prepare_scan.call_args.kwargs)
+
+    def test_a_face_cut_by_the_frame_is_not_framed(self):
+        from hardware.scanner import Scanner
+        self.assertTrue(Scanner._face_is_framed(_framing()))
+        self.assertFalse(Scanner._face_is_framed(_framing(visible=0.9)))     # chin or forehead outside the frame
+        self.assertFalse(Scanner._face_is_framed(_framing(nose_y=0.6)))
+        self.assertFalse(Scanner._face_is_framed(_framing(score=1.0)))
+        self.assertFalse(Scanner._face_is_framed(_framing(both=False)))
+        self.assertFalse(Scanner._face_is_framed(None))
+
+    def test_the_jump_is_computed_from_the_nose_position_and_the_face_size(self):
+        from hardware.scanner import Scanner, FACE_HEIGHT_MM
+        # Nose 0.2 of the frame above the centre, face 0.4 of the frame tall: 0.2 * 190 / 0.4 = 95 mm up
+        self.assertAlmostEqual(Scanner._face_jump_mm(_framing(nose_y=0.3)), 0.2 * FACE_HEIGHT_MM / 0.4)
+        self.assertAlmostEqual(Scanner._face_jump_mm(_framing(nose_y=0.6)), -0.1 * FACE_HEIGHT_MM / 0.4)
+        self.assertIsNone(Scanner._face_jump_mm(_framing(both=False)))
+        self.assertIsNone(Scanner._face_jump_mm({"both_detected": True, "avg_nose_y": 0.3}))   # no face box
+
+    def test_one_computed_jump_frames_the_face(self):
+        scanner = self._scanner()
+        up, down = self._moves(scanner)
+        analyzer = _ScriptedAnalyzer([_framing(nose_y=0.3), _framing()])
+        result, _ = self._run(scanner, analyzer=analyzer)
+        self.assertEqual(result["framing"], "jump")
+        self.assertEqual(result["optimal_z_mm"], 275.0)                  # 180 + round(95)
+        self.assertEqual([c.kwargs["distance"] for c in up.call_args_list], [95.0])
+        down.assert_not_called()
+        self.assertEqual(analyzer.calls, 2)
+
+    def test_the_jump_stays_inside_the_search_range(self):
+        scanner = self._scanner()
+        up, _ = self._moves(scanner)
+        analyzer = _ScriptedAnalyzer([_framing(nose_y=0.1), _framing()])   # 190 mm up, range only 40
+        result, _ = self._run(scanner, analyzer=analyzer, search_range_mm=40.0)
+        self.assertEqual(result["optimal_z_mm"], 220.0)
+        self.assertEqual(up.call_args_list[0].kwargs["distance"], 40.0)
+
+    def test_a_jump_that_does_not_frame_the_face_falls_back_to_the_sweep_from_the_start(self):
+        import hardware.scanner as scanner_module
+        scanner = self._scanner()
+        up, down = self._moves(scanner)
+        # At 180: nose high (jump +95). At 275: face cut (no frame). Back at 180, the sweep: best at 188
+        sweep = [_framing(nose_y=0.4, score=s, visible=0.9) for s in (0.8, 1.6, 1.0)]
+        analyzer = _ScriptedAnalyzer([_framing(nose_y=0.3), _framing(visible=0.5, nose_y=0.5)] + sweep)
+        with patch.object(scanner_module, "FACE_JUMP_ATTEMPTS", 1):
+            result, _ = self._run(scanner, analyzer=analyzer, search_range_mm=16.0)
+        self.assertEqual(result["framing"], "sweep")
+        self.assertEqual(result["optimal_z_mm"], 188.0)
+        self.assertEqual(result["best_score"], 1.6)
+        self.assertEqual(scanner.z_position_mm, 188.0)
+
+    def test_fast_framing_off_always_sweeps(self):
+        scanner = self._scanner()
+        up, _ = self._moves(scanner)
+        analyzer = _ScriptedAnalyzer([_framing()])
+        result, _ = self._run(scanner, analyzer=analyzer, search_range_mm=16.0, fast_framing=False)
+        self.assertEqual(result["framing"], "sweep")
+        self.assertTrue(up.called)
+
+    def test_the_detector_preloaded_by_the_prepare_serves_the_capture_and_is_closed(self):
+        _FakeDetector.instances.clear()
+        scanner = self._scanner()
+        self._moves(scanner)
+        with patch("face_scan.face_scanner.FaceScanner", _FakeDetector), \
+                patch("hardware.scanner.FACE_PRELOAD_DETECTOR", True), \
+                patch.object(scanner, "_face_detection_problem", return_value=None):
+            scanner._preload_face_detector()
+            scanner._face_detector_loader[0].join(5)
+            self.assertEqual(len(_FakeDetector.instances), 1)
+            result, _ = self._run(scanner)
+        self.assertEqual(len(_FakeDetector.instances), 1)                 # no second detector for the search
+        self.assertTrue(_FakeDetector.instances[0].closed)
+        self.assertEqual(result["framing"], "already_framed")             # the fake face is whole and centred
+
+    def test_a_cancel_releases_the_preloaded_detector(self):
+        _FakeDetector.instances.clear()
+        scanner = self._scanner()
+        with patch("face_scan.face_scanner.FaceScanner", _FakeDetector), \
+                patch("hardware.scanner.FACE_PRELOAD_DETECTOR", True), \
+                patch.object(scanner, "_face_detection_problem", return_value=None):
+            scanner._preload_face_detector()
+            scanner._face_detector_loader[0].join(5)
+        scanner.emergency_stop()
+        self.assertTrue(_FakeDetector.instances[0].closed)
+        self.assertIsNone(scanner._face_detector_loader)
+
+    def test_no_preload_without_face_detection(self):
+        scanner = self._scanner()
+        with patch.object(scanner, "_face_detection_problem", return_value="MediaPipe is not installed"), \
+                patch("hardware.scanner.FACE_PRELOAD_DETECTOR", True):
+            scanner._preload_face_detector()
+        self.assertIsNone(scanner._face_detector_loader)
+        self.assertIsNone(scanner._take_face_detector())
+
+    def test_the_autofocus_starts_from_the_lens_positions_of_the_previous_face(self):
+        scanner = self._scanner()
+        self._moves(scanner)
+        scanner.cams.supports_autofocus_hint = True
+        scanner.cams.autofocus_positions = [610, 620]
+        self._run(scanner, strategy="none")
+        self.assertNotIn("autofocus_hint", scanner.cams.prepare_scan.call_args.kwargs)   # first face: full sweep
+        self.assertEqual(scanner._face_af_positions, [610, 620])
+
+        second = self._scanner()
+        second._face_af_positions = list(scanner._face_af_positions)
+        second.cams.supports_autofocus_hint = True
+        self._run(second, strategy="none")
+        self.assertEqual(second.cams.prepare_scan.call_args.kwargs["autofocus_hint"], (610, 620))
+
+        fixed = self._scanner(focus=400)                                   # a fixed focus never gets a hint
+        fixed._face_af_positions = [610, 620]
+        fixed.cams.supports_autofocus_hint = True
+        self._run(fixed, strategy="none")
+        self.assertNotIn("autofocus_hint", fixed.cams.prepare_scan.call_args.kwargs)
 
 
 ROUTER_PROGRAM = r"""

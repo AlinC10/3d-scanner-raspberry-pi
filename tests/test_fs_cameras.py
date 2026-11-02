@@ -571,6 +571,42 @@ class TestAutofocus(RealModeCase):
         self.assertTrue(passed({0: 100.0, 30: 150.0, 60: 140.0}))
         self.assertFalse(passed({0: 100.0, 30: 150.0, 60: 160.0}))   # still rising
 
+    def _visited_by_cam1(self, drv, **prepare_kwargs):
+        visited = []
+        original = FakeFocuser.set_position
+
+        def record(focuser, pos, settle=True):
+            if focuser is drv.cam1.focuser:
+                visited.append(pos)
+            original(focuser, pos, settle)
+
+        with patch.object(FakeFocuser, "set_position", record):
+            drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0, **prepare_kwargs)
+        return visited
+
+    def test_a_hint_sweeps_only_around_the_known_position(self):
+        # FACE-FAST: the face of the previous capture was in focus near 630
+        drv = self.driver()
+        visited = self._visited_by_cam1(drv, autofocus_hint=(630, 630))
+        self.assertEqual(visited[:7], [540, 570, 600, 630, 660, 690, 720])   # +- 3 coarse steps
+        self.assertEqual(len(visited), 7 + 11 + 1)                           # window, fine pass, final set
+        self.assertEqual(drv.autofocus_positions, [642, 642])
+
+    def test_a_hint_whose_window_misses_the_peak_falls_back_to_the_full_sweep(self):
+        drv = self.driver()
+        visited = self._visited_by_cam1(drv, autofocus_hint=(200, 200))     # peak at 640: best on the window edge
+        self.assertEqual(visited[:7], [110, 140, 170, 200, 230, 260, 290])
+        self.assertEqual(visited[7:7 + 23], list(range(0, 661, 30)))
+        self.assertEqual(drv.autofocus_positions, [642, 642])
+
+    def test_an_unusable_hint_is_ignored(self):
+        drv = self.driver()
+        for hint in ((5000, 1), "x", (1,)):
+            self.assertIsNone(drv._hint_window(hint, 30), hint)
+        visited = self._visited_by_cam1(drv, autofocus_hint=(5000, 1))
+        self.assertEqual(visited[0], 0)
+        self.assertEqual(drv.autofocus_positions, [642, 642])
+
     def test_sweep_frame_collection_is_switched_off_afterwards(self):
         drv = self.driver()
         drv.prepare_scan(focus="auto", lock_auto=True, settle_time=0)

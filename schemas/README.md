@@ -75,7 +75,7 @@ Optional JSON bodies of `POST /scanner/stream/active` (`camera_id`, `1`-`2`) and
 #### `StartRequest`
 Payload for `POST /scanner/start` (`extra="forbid"`: unknown keys anywhere in the body are a `422`).
 * `job_id`: `str` (default: `"meshroom-job"`) — Unique identifier for cloud run and asset naming.
-* `mechanical`: `MechanicalConfig` — Mechanical motion settings.
+* `mechanical`: `MechanicalConfig` — Mechanical motion settings: `turntable`, `z_axis`, and `flip` (`bool`, default `false`, SCAN-FLIP: after the first side the scanner waits in `awaiting_flip` for `POST /scanner/flip/continue` or `/flip/skip`).
 * `cloud`: `CloudConfig` — RunPod switch (`launch_runpod`) and computing parameters.
 
 #### `FacePrepareRequest`
@@ -96,6 +96,7 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
 * `settle_s`: `float` (default `0.15`, `0.05 <= v <= 2`).
 * `z_delay`: `float | null` (default `null` = the prepare's value).
 * `title`: `str | null` (default `null` = the job id) — name of the face model.
+* `fast_framing`: `bool` (default `true`, FACE-FAST) — no height search when the face is already framed where the carriage is; else a jump computed from the nose position; the step by step search only as a fallback. `false` = always the search.
 * `reconstruct`: `bool` (default `true`) — local 3D face model on the Pi (`hardware/face_reconstruction.py`, FACE-20); state `processing` while it runs, `error` if it fails.
 * Every distance must be a whole number of Z motor steps (multiples of `0.01` mm): `422` before anything moves.
 
@@ -114,6 +115,7 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
 ```
 
 #### `StatusResponse` (`200 OK`)
+* New 2026-11-01: `session` (`0`, or `1` on the second side of a flip scan), `flip_seconds_left` (in `awaiting_flip`, else `null`); `face_result.framing` (`already_framed` / `jump` / `sweep` / `null`).
 * New 2026-10-30: `job_id`, `result_id` (`/library` id of the saved model); `face_result` adds `result_id`, `metrics`, `reconstruction_error`; phase `reconstructing_face`.
 ```json
 {
@@ -124,6 +126,8 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
   "phase": "scanning",
   "phase_message": "Ring 2: capturing",
   "level": 2,
+  "session": 0,
+  "flip_seconds_left": null,
   "photos_captured": 24,
   "photos_uploaded": 22,
   "missing": [],
@@ -134,7 +138,7 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
   "upload_drain_timeout_s": 300.0
 }
 ```
-`mode` is what the last prepare readied the rig for (`"object"`, `"face"`, `null`). `face_result` (`FaceCaptureResult`: `optimal_z_mm`, `best_score`, `face_detected`, `warning`, `photos`, `r2_uploaded`) is set once a face scan completed. `seconds_since_last_upload` / `upload_drain_timeout_s` show the upload progress (`null` when no upload runs). The progress fields are optional with safe defaults (`phase`/`phase_message`/`error`: `null`, counters: `0`, lists: `[]`). `missing` lists the R2 keys not found at the final verification; `error` carries the reason of an `error` state. See `router/docs/SCANNER_API.md`.
+`mode` is what the last prepare readied the rig for (`"object"`, `"face"`, `null`). `face_result` (`FaceCaptureResult`: `optimal_z_mm`, `best_score`, `face_detected`, `warning`, `photos`, `r2_uploaded`, `eyes_open`, `framing`, `result_id`, `metrics`, `reconstruction_error`) is set once a face scan completed. `seconds_since_last_upload` / `upload_drain_timeout_s` show the upload progress (`null` when no upload runs). The progress fields are optional with safe defaults (`phase`/`phase_message`/`error`: `null`, counters: `0`, lists: `[]`). `missing` lists the R2 keys not found at the final verification; `error` carries the reason of an `error` state. See `router/docs/SCANNER_API.md`.
 
 #### `StartResponse` (`202 Accepted`)
 ```json
@@ -153,6 +157,9 @@ Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`
 }
 ```
 The face scan runs in the background; its result is `StatusResponse.face_result`.
+
+#### `FlipResponse` (`200 OK`)
+Answer of `POST /scanner/flip/continue` and `/flip/skip`: `{"status": "accepted", "state": "running", "message": "Scanning the second side."}`.
 
 #### `CancelResponse` (`200 OK`)
 ```json

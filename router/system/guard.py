@@ -3,7 +3,7 @@ from fastapi import HTTPException
 # While the scanner is in one of these states it owns the uplink: the photos are uploaded to R2 (or about to be). A
 # radio scan slows the Wi-Fi down (Wi-Fi and Bluetooth share the antenna of the Pi) and a power or connection change
 # can cut it (SYS-10, SYS-21). Reading the status is always allowed.
-SCAN_BUSY_STATES = ("preparing", "running", "processing", "downloading")
+SCAN_BUSY_STATES = ("preparing", "running", "awaiting_flip", "processing", "downloading")
 
 
 def network_change_allowed() -> None:

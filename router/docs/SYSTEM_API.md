@@ -39,7 +39,7 @@ FastAPI App (/main_prod.py)
 ## Rules that apply to every endpoint
 
 ### During a scan (`409`)
-While the scanner is `preparing`, `running`, `processing` or `downloading`, or still uploading photos, every endpoint that **scans the radio or changes a connection** answers `409` (`router/system/guard.py`). Wi-Fi and Bluetooth share the antenna of the Pi 5: a radio scan slows the upload, and a power or connection change can cut it. **Reading** (`GET /system/status`, the `.../status` endpoints, `GET /system/wifi/saved`) is always allowed and never disturbs the network.
+While the scanner is `preparing`, `running`, `awaiting_flip`, `processing` or `downloading`, or still uploading photos, every endpoint that **scans the radio or changes a connection** answers `409` (`router/system/guard.py`). Wi-Fi and Bluetooth share the antenna of the Pi 5: a radio scan slows the upload, and a power or connection change can cut it. **Reading** (`GET /system/status`, the `.../status` endpoints, `GET /system/wifi/saved`) is always allowed and never disturbs the network.
 
 ### Error codes
 Every network error is `{"detail": "<message>"}` with:

@@ -8,6 +8,8 @@ os.environ.setdefault("SCAN_Z_HOME_SETTLE_S", "0")
 os.environ.setdefault("BUZZER_GPIO_PIN", "off")
 # One photo pair per face capture (the burst has its own tests in tests/test_face_scan.py)
 os.environ.setdefault("SCAN_FACE_BURST_SHOTS", "1")
+# The face prepare does not load MediaPipe in the background (FACE-FAST has its own tests in tests/test_face_scan.py)
+os.environ.setdefault("SCAN_FACE_PRELOAD_DETECTOR", "0")
 
 # Mock hardware, camera, and cloud dependencies for test runs without hardware
 for mod in [

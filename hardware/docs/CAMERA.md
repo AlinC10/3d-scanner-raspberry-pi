@@ -99,6 +99,7 @@ Hardware constants and operational presets are centralized in [`hardware/camera/
 * `AF_STEP = 30`: DAC step size during contrast-detection autofocus sweep.
 * `AF_ROI = (0.3, 0.3, 0.4, 0.4)`: Center 40% region of interest for Laplacian variance sharpness scoring.
 * `AF_DROP_FRACTION = 0.03`, `AF_MIN_RISE = 0.20`: early stop of the coarse sweep in `DualCameraRPISync`: a lens stops at the first position more than 3% below its best score so far, once that best is at least 20% above the score at position 0 (the flat blurred start of the range cannot stop it). The single-camera `ArducamIMX477.focus_sweep_autofocus` still sweeps the whole range.
+* `AF_HINT_SPAN_STEPS = 3`: with `focus_sweep_autofocus(hint=(pos1, pos2))` (`prepare_scan(autofocus_hint=...)`, FACE-FAST) the coarse pass of `DualCameraRPISync` visits only the hint ±3 coarse steps (7 positions per lens instead of up to 35); if a lens finds its best score on an edge of that window (and the edge is not the end of the range), the normal coarse sweep runs instead. The fine pass is the same.
 
 ---
 

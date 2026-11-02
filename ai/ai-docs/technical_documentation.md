@@ -588,7 +588,7 @@ new STLLoader().load(url(id, "stl", "low"), geo => scene.add(new THREE.Mesh(geo,
 
 ## 11. Network and system management
 
-While the scanner is `preparing`, `running`, `processing`, `downloading` or still uploading, the actions marked **guarded** answer `409`. Reading state is always allowed.
+While the scanner is `preparing`, `running`, `awaiting_flip`, `processing`, `downloading` or still uploading, the actions marked **guarded** answer `409`. Reading state is always allowed.
 
 ### 11.1 `GET /system/status`
 
@@ -680,7 +680,7 @@ For a service / calibration page. Every motion endpoint answers `409` while a sc
 | GET | `/test/tof` | | `{"status": "success", "distance_mm": 412, "valid": true, "available": true}` (`status: "invalid"`, `distance_mm: null` without a reading) |
 | POST | `/test/lights/enable` | `{"brightness": 0.5}` (optional, 0 to 1) | `{"status": "success", "state": "enabled", "brightness": 0.5, "message": "..."}` |
 | POST | `/test/lights/disable` | | `{"status": "success", "state": "disabled", "message": "..."}` |
-| GET | `/test/buzzer` | | `{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "photo_countdown", "success", "error"]}` |
+| GET | `/test/buzzer` | | `{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "photo_countdown", "flip", "success", "error"]}` |
 | POST | `/test/buzzer/play` | `{"pattern": "success"}` | `{"status": "success", "pattern": "success"}`; `503` without buzzer |
 | POST | `/test/buzzer/tone` | `{"frequency_hz": 880, "duration_s": 0.5}` (110-1760 Hz, up to 5 s) | `{"status": "success", "frequency_hz": 880.0, "duration_s": 0.5}` |
 | GET | `/test/motor/status` | | `{"turntable": "enabled", "z_axis": "disabled"}` |

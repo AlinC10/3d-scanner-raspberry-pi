@@ -7,7 +7,7 @@ from app_paths import results_directory
 from schemas.library import (CategoryFilter, LibraryObject, LibraryPage, ModelRequest, UpdateObjectRequest, UsbDrive,
                              UsbExportRequest, UsbExportStatus, BluetoothExportRequest, BluetoothExportStatus)
 from storage import results
-from system import bluetooth as bt, bluetooth_export, usb
+from system import bluetooth as bt, bluetooth_export, qr_export, usb
 
 router = APIRouter(
     prefix="/library",
@@ -17,7 +17,8 @@ router = APIRouter(
 # Most objects one page may ask for
 MAX_PAGE_SIZE = 100
 # Export states during which the object's files are read (a delete waits for them)
-_EXPORT_RUNNING = {"USB": usb.RUNNING_STATES, "Bluetooth": bluetooth_export.RUNNING_STATES}
+_EXPORT_RUNNING = {"USB": usb.RUNNING_STATES, "Bluetooth": bluetooth_export.RUNNING_STATES,
+                   "QR": qr_export.RUNNING_STATES}
 
 
 @router.get("/objects", response_model=LibraryPage)
@@ -55,7 +56,8 @@ def delete_object(object_id: str):
     Deletes an object for good: its models, `object.json` and the scan photos kept with it. `204` done, `404` unknown
     object, `409` while a USB or Bluetooth export of this object is running.
     """
-    for name, status in (("USB", usb.export_status()), ("Bluetooth", bluetooth_export.export_status())):
+    for name, status in (("USB", usb.export_status()), ("Bluetooth", bluetooth_export.export_status()),
+                         ("QR", qr_export.export_status())):
         if status.get("object_id") == object_id and status.get("state") in _EXPORT_RUNNING[name]:
             raise HTTPException(status_code=409, detail=f"A {name} export of {object_id} is running; wait or cancel it.")
     try:
@@ -188,3 +190,45 @@ def bluetooth_export_status():
 def cancel_bluetooth_export():
     """Stops the running Bluetooth export (the device stays connected). `cancelled`: whether one was running."""
     return {"cancelled": bluetooth_export.cancel()}
+
+
+@router.post("/objects/{object_id}/export/qr", status_code=202)
+def export_object_to_qr(object_id: str):
+    """
+    Download link for a phone: the object's archive `<id>.zip` (the model files) is uploaded to the R2 export bucket
+    and a signed link valid for 24 h is made. Runs in the background: poll `GET /library/export/qr/status` until
+    `state` is `done` (then `url` and the QR code at `GET /library/export/qr/image.svg`) or `error`. An archive already
+    uploaded for the same models is reused (only a new link). 404 unknown object, 409 an export is running, 503 R2 is
+    not configured.
+    """
+    try:
+        folder = results.finished_folder(results_directory(), object_id)
+    except results.ResultNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    try:
+        return qr_export.start_export(folder)
+    except qr_export.QrExportBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except qr_export.QrExportUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except qr_export.QrExportError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/export/qr/status")
+def qr_export_status():
+    """Progress of the last QR export: `state` `idle` | `archiving` | `uploading` | `done` | `error` | `expired`."""
+    return qr_export.export_status()
+
+
+@router.get("/export/qr/image.svg")
+def qr_export_image(scale: Annotated[int, Query(ge=2, le=20, description="Pixels per QR module.")] = 8):
+    """The QR code of the current download link (SVG). 404 when no link is ready (or it expired), 503 no QR library."""
+    status = qr_export.export_status()
+    if status["state"] != "done" or not status["url"]:
+        raise HTTPException(status_code=404, detail="No download link is ready; start POST /library/objects/{id}/export/qr.")
+    try:
+        svg = qr_export.qr_svg(status["url"], scale=scale)
+    except qr_export.QrExportError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})

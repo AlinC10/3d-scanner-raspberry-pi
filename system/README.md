@@ -109,3 +109,7 @@ Helper function that inspects a `subprocess.CompletedProcess` instance. If `res.
 object to `<id>.zip` (`start_export`, `export_status`). Used by `/library/usb` and `/library/objects/{id}/export/usb`
 (`router/docs/LIBRARY_API.md`). Without a desktop session the server needs the polkit rule
 `kiosk/50-3d-scanner-udisks.rules`.
+
+## QR export (`qr_export.py`)
+
+The archive of one object (`usb.export_files`: the model files and object.json) is uploaded to the R2 bucket `R2_EXPORT_BUCKET` (default `scanner-exports`, only for exports, never cleaned by the scan jobs) and a signed GET link valid `EXPORT_LINK_TTL_S` (24 h) is made; `qr_svg` draws it (segno). An archive with the same fingerprint (names, sizes, mtimes of the files) is reused. The bucket is created when missing if the R2 key may (Admin Read & Write); otherwise create it in the dashboard, with a lifecycle rule deleting objects after 1 day. Used by `/library/objects/{id}/export/qr`, `/library/export/qr/status`, `/library/export/qr/image.svg`.

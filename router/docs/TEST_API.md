@@ -16,7 +16,7 @@ Interactive OpenAPI docs are accessible at: `http://127.0.0.1:8000/docs#/Hardwar
 > [!WARNING]
 > **Without the Arduino**: `/test/motor/enable`, `/test/motor/disable`, `/test/motor/home-bottom`, `/test/motor/move-to-top`, `/test/motor/z-move` and `/test/turntable/rotate` first check that the Arduino answers (the bridge reconnects if needed) and answer `503 Service Unavailable` with a message naming the Arduino when it does not. `/test/cleanup`, the sensors, lights and cameras keep working.
 >
-> **Busy guard**: the endpoints that move or (de)energize the motors (`/test/motor/*`, `/test/turntable/rotate`, `/test/cleanup`) answer `409 Conflict` unless the scanner is `idle`, `completed`, `cancelled` or `error`. During `preparing`, `prepared`, `running`, `processing` and `downloading` use `POST /scanner/cancel` first. Read-only endpoints (endstops, ToF, status) are always available.
+> **Busy guard**: the endpoints that move or (de)energize the motors (`/test/motor/*`, `/test/turntable/rotate`, `/test/cleanup`) answer `409 Conflict` unless the scanner is `idle`, `completed`, `cancelled` or `error`. During `preparing`, `prepared`, `running`, `awaiting_flip`, `processing` and `downloading` use `POST /scanner/cancel` first. Read-only endpoints (endstops, ToF, status) are always available.
 
 ---
 
@@ -121,12 +121,12 @@ Allowed in any state (no motor and no light is involved); a test sound interrupt
 ### `GET /test/buzzer`
 
 ```json
-{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "photo_countdown", "success", "error"]}
+{"available": true, "pin": 23, "patterns": ["ready", "start", "hold_still", "photo_countdown", "flip", "success", "error"]}
 ```
 
 ### `POST /test/buzzer/play`
 
-Body `{"pattern": "success"}`: one of `ready`, `start`, `hold_still`, `photo_countdown`, `success`, `error` (another value: `422`). Answer `{"status": "success", "pattern": "success"}`.
+Body `{"pattern": "success"}`: one of `ready`, `start`, `hold_still`, `photo_countdown`, `flip`, `success`, `error` (another value: `422`). Answer `{"status": "success", "pattern": "success"}`.
 
 ### `POST /test/buzzer/tone`
 

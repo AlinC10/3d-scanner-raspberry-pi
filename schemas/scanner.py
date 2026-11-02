@@ -383,6 +383,14 @@ class MechanicalConfig(BaseModel):
 
     turntable: Annotated[TurntableScanConfig, Field(description="Configuration for the rotating turntable.")] = Field(default_factory=TurntableScanConfig)
     z_axis: Annotated[ZAxisScanConfig, Field(description="Configuration for the vertical Z-axis.")] = Field(default_factory=ZAxisScanConfig)
+    flip: Annotated[bool, Field(
+        description=(
+            "Scan both sides of the object (SCAN-FLIP). After the first side (bottom to top, as without flip) the "
+            "scanner waits in state `awaiting_flip` for the object to be turned over: POST /scanner/flip/continue "
+            "scans the second side on the way down at the same heights, POST /scanner/flip/skip (or no answer within "
+            "`flip_seconds_left`) finishes with the first side. Default false: one side, no question."
+        )
+    )] = False
 
 
 class CloudConfig(BaseModel):
@@ -446,6 +454,9 @@ class FaceCaptureResult(BaseModel):
     r2_uploaded: bool = False
     # Eye openness of the kept photo pair (0 closed .. 1 open, the lower camera), null when it was not checked (UX-6)
     eyes_open: float | None = None
+    # How the height was found (FACE-FAST): "already_framed" (no move), "jump" (computed from the nose position),
+    # "sweep" (the classic search); null for manual_z or strategy "none"
+    framing: str | None = None
     # Local 3D reconstruction of the stereo pair (rpi_face_mesh, FACE-20): the /library id of the model in
     # results/<result_id>/ (null when it did not run or failed), the face metrics, and why it failed
     result_id: str | None = None
@@ -465,6 +476,8 @@ class StatusResponse(BaseModel):
     phase_message: str | None = None    # human readable detail of the phase (in `processing`: the last milestone)
     cloud_message: str | None = None    # `processing` on RunPod: last technical message (pod state, time, retries)
     level: int = 0                      # current ring (0 = bottom)
+    session: int = 0                    # side of the object being scanned: 0, or 1 = turned over (mechanical.flip)
+    flip_seconds_left: float | None = None   # in `awaiting_flip`: seconds before the scan finishes with one side
     photos_captured: int = 0
     photos_uploaded: int = 0
     missing: list[str] = []             # R2 keys that could not be verified in the bucket
@@ -481,6 +494,12 @@ class StatusResponse(BaseModel):
 class CancelResponse(BaseModel):
     status: str = "success"
     state: str = "cancelled"
+
+class FlipResponse(BaseModel):
+    """Answer of POST /scanner/flip/continue and /flip/skip (SCAN-FLIP)."""
+    status: str = "accepted"
+    state: str = "awaiting_flip"
+    message: str = ""
 
 class StartResponse(BaseModel):
     status: str = "accepted"
@@ -619,6 +638,15 @@ class FaceCaptureRequest(BaseModel):
         description=(
             "Build the 3D face model on the Pi from the stereo pair after the photo (rpi_face_mesh); the model is "
             "saved in results/<result_id>/ and listed by /library. False = photos only."
+        )
+    )] = True
+
+    fast_framing: Annotated[bool, Field(
+        description=(
+            "FACE-FAST: before the height search, check the face where the carriage is (both cameras see the whole "
+            "face, nose centred: photo at once, no move), else try a jump computed from the nose position; the step "
+            "by step search runs only when that did not frame the face. False = always the full search. "
+            "`face_result.framing` says which way was used."
         )
     )] = True
 

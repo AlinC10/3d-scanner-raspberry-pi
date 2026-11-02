@@ -6,6 +6,10 @@ AF_ROI           = (0.3, 0.3, 0.4, 0.4)   # (x, y, w, h) as frame fractions
 # noise of the flat, blurred start of the range cannot stop it before the peak). Without such a rise it sweeps to the end.
 AF_DROP_FRACTION = 0.03
 AF_MIN_RISE      = 0.20
+# Autofocus from a known lens position (FACE-FAST: the face of the previous capture is at about the same distance):
+# the coarse pass visits only the hint +- AF_HINT_SPAN_STEPS coarse steps; a best score on the edge of that window
+# (the peak is outside it) falls back to the full sweep.
+AF_HINT_SPAN_STEPS = 3
 
 # Default camera settings
 DEFAULT_PHOTO_RESOLUTION = (4056, 3040)  # Full sensor resolution

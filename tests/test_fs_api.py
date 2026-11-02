@@ -137,7 +137,8 @@ class TestRequestSchemas(unittest.TestCase):
     def test_status_response_defaults_and_fields(self):
         self.assertEqual(self.r["status"], {
             "state": "idle", "mode": None, "total_photos": 0, "stream_urls": None, "phase": None, "phase_message": None,
-            "cloud_message": None, "level": 0, "photos_captured": 0, "photos_uploaded": 0, "missing": [], "error": None,
+            "cloud_message": None, "level": 0, "session": 0, "flip_seconds_left": None, "photos_captured": 0,
+            "photos_uploaded": 0, "missing": [], "error": None,
             "tof_warnings": [], "face_result": None, "job_id": None, "result_id": None, "seconds_since_last_upload": None,
             "upload_drain_timeout_s": None,
         })

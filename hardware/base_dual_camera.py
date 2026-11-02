@@ -41,12 +41,17 @@ class BaseDualCamera(ABC):
         ``copy_colour_gains=True``), and the returned dicts carry ``locked``/``ready``. Drivers without it always lock
         AE/AWB inside every ``prepare_scan`` (the ``lock_auto`` and ``copy_colour_gains`` arguments are accepted and
         ignored).
+      - ``supports_autofocus_hint``: ``prepare_scan(..., autofocus_hint=(pos1, pos2))`` with ``focus="auto"`` starts
+        the autofocus sweep around those lens positions (e.g. the face of the previous capture) instead of over the
+        whole range, and falls back to the full sweep when the peak is not inside that window. Drivers without it
+        ignore the argument.
       - ``supported_photo_sizes``: the still sizes (W, H) the driver can capture without cropping the field of view,
         or None when it does not restrict them. A driver that sets it refuses any other ``size`` in its constructor.
     """
 
     supports_preview_stream: bool = False
     supports_lock_auto: bool = False
+    supports_autofocus_hint: bool = False
     supported_photo_sizes: Optional[Tuple[Tuple[int, int], ...]] = None
 
     def __init__(

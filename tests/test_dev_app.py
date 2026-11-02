@@ -137,6 +137,43 @@ with TestClient(app) as client:
     wait_for(client, ("prepared", "error"))
     client.post("/scanner/cancel")
 
+    # SCAN-FLIP: the scan waits for the object to be turned over, then scans the second side
+    out["flip_not_waiting"] = client.post("/scanner/flip/continue").status_code
+    client.post("/scanner/prepare", json={"z_start_mm": 20})
+    wait_for(client, ("prepared", "error"))
+    # (the test client runs the background scan inside the POST: the flip is answered from another thread)
+    import threading
+    flip = {}
+
+    def flipper():
+        end = time.time() + 60
+        while time.time() < end:
+            st = client.get("/scanner/status").json()
+            if st["state"] == "awaiting_flip":
+                flip["photos"] = st["photos_captured"]
+                flip["wait"] = [st["state"], st["phase"], st["session"], (st["flip_seconds_left"] or 0) > 0,
+                                st["photos_captured"] > 0]
+                flip["lights"] = client.post("/test/lights/enable").status_code
+                cont = client.post("/scanner/flip/continue")
+                flip["continue"] = [cont.status_code, cont.json().get("state")]
+                flip["skip_late"] = client.post("/scanner/flip/skip").status_code
+                return
+            time.sleep(0.05)
+
+    flipper_thread = threading.Thread(target=flipper, daemon=True)
+    flipper_thread.start()
+    out["flip_start"] = client.post("/scanner/start", json={"cloud": {"launch_runpod": False},
+                                                            "mechanical": {"flip": True}}).status_code
+    flipper_thread.join(60)
+    out["flip_wait"] = flip.get("wait")
+    out["flip_lights"] = flip.get("lights")
+    out["flip_continue"] = flip.get("continue")
+    out["flip_skip_late"] = flip.get("skip_late")
+    final = wait_for(client, ("completed", "error", "cancelled"), timeout=60)
+    out["flip_final"] = [final["state"], final["session"], final["photos_captured"] == 2 * flip.get("photos", -1),
+                         final["flip_seconds_left"]]
+    client.post("/scanner/cancel")
+
     # without the Arduino: every motor request is a 503 that names it, the rest of the server works
     router.scanner.scanner.arduino_available = False
     prep = client.post("/scanner/prepare", json={})
@@ -164,6 +201,15 @@ class DevAppTest(unittest.TestCase):
             raise RuntimeError(done.stderr[-3000:])
         cls.r = json.loads(done.stdout.strip().splitlines()[-1])
 
+    def test_flip_scan_waits_for_the_object_to_be_turned_over(self):
+        self.assertEqual(self.r["flip_not_waiting"], 400)
+        self.assertEqual(self.r["flip_start"], 202)
+        self.assertEqual(self.r["flip_wait"], ["awaiting_flip", "awaiting_flip", 0, True, True])
+        self.assertEqual(self.r["flip_lights"], 409)          # the lights still belong to the scan
+        self.assertEqual(self.r["flip_continue"], [200, "running"])
+        self.assertEqual(self.r["flip_skip_late"], 400)
+        self.assertEqual(self.r["flip_final"], ["completed", 1, True, None])
+
     def test_the_preview_endpoints_have_one_implementation_under_both_prefixes(self):
         self.assertEqual(self.r["shared"], {"mjpeg": True, "active": True, "quality": True, "sync-status": True})
         self.assertTrue(self.r["openapi_ok"])
@@ -190,7 +236,7 @@ class DevAppTest(unittest.TestCase):
 
     def test_buzzer_endpoints(self):
         self.assertEqual(self.r["buzzer_status"],
-                         {"available": True, "pin": None, "patterns": ["ready", "start", "hold_still", "photo_countdown", "success", "error"]})
+                         {"available": True, "pin": None, "patterns": ["ready", "start", "hold_still", "photo_countdown", "flip", "success", "error"]})
         self.assertEqual(self.r["buzzer_play"], 200)
         self.assertEqual(self.r["buzzer_bad_pattern"], 422)
         self.assertEqual(self.r["buzzer_tone"], {"status": "success", "frequency_hz": 880.0, "duration_s": 0.5})

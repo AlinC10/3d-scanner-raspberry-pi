@@ -44,6 +44,9 @@ stateDiagram-v2
         FinalizeUpload --> [*]
     }
 
+    RUNNING --> AWAITING_FLIP: First side done (mechanical.flip = true)
+    AWAITING_FLIP --> RUNNING: POST /scanner/flip/continue (second side, top to bottom) or /flip/skip or timeout
+    AWAITING_FLIP --> CANCELLED: POST /scanner/cancel
     RUNNING --> COMPLETED: Photos verified in R2 (cloud.launch_runpod = false, default)
     RUNNING --> PROCESSING: Photos verified in R2 (cloud.launch_runpod = true)
     PROCESSING --> DOWNLOADING: RunPod photogrammetry completes
@@ -78,6 +81,8 @@ stateDiagram-v2
 | `POST` | `/scanner/start` | `202 Accepted` | Launches the physical scan and the verified upload to R2; the RunPod pipeline only when `cloud.launch_runpod` is `true` |
 | `POST` | `/scanner/face/prepare` | `202 Accepted` | Prepares a face scan (mode `face`): lights, stream, homing and climb to `start_z_mm`; poll `/status` until `prepared` |
 | `POST` | `/scanner/face/capture` | `202 Accepted` | After the face prepare: finds the height, locks the cameras on the face, takes the stereo pair, verified upload; poll `/status` until `completed` |
+| `POST` | `/scanner/flip/continue` | `200 OK` | Flip scan (`mechanical.flip`), state `awaiting_flip`: the object was turned over, scan the second side |
+| `POST` | `/scanner/flip/skip` | `200 OK` | Flip scan, state `awaiting_flip`: finish with the first side only |
 | `POST` | `/scanner/cancel` | `200 OK` | Emergency stop: cuts motor power, kills lights, closes streams, terminates cloud pods |
 | `GET` | `/scanner/status` | `200 OK` | Polls current state, phase, photo counters (captured / uploaded / missing), failure reason, and active stream URLs |
 | `GET` | `/scanner/stream/mjpeg` | `200 OK` | Direct multipart MJPEG stream for browser `<img>` tags (`?camera=1\|2`) with on-demand encoding |
@@ -196,6 +201,12 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
      * Climbs Z-axis by `z_move_mm` (default `100.0mm`) per elevation ring until the top limit switch triggers.
      * An upload worker retries failed uploads with backoff (one attempt of one file lasts at most 5 minutes); when the scan ends it waits for the uploads to drain (**5 minutes without a single success** is the limit) and the bucket is verified against the manifest.
      * When the scan ends, the uploads are verified against the list of expected keys in the R2 bucket. Missing photos end the run in `error` (see below) and stay on disk.
+   * **Stage 1a (Second side - `AWAITING_FLIP`, then `RUNNING`)** (only with `mechanical.flip = true`, SCAN-FLIP):
+     * When the first side ends (end of the object seen by the ToF, or the top switch), the scanner stops in state and phase `awaiting_flip`: lights, cameras and the exposure lock stay as they are (the photos of both sides must match), the motors are off, the uploads of the first side go on. The buzzer plays `flip`. `flip_seconds_left` in `/status` counts down `SCAN_FLIP_TIMEOUT_S` (600 s).
+     * `POST /scanner/flip/continue`: state `running`, `session` 1. One ring at each level of the first side, from the top one down to level 1 (the carriage descends `z_axis.distance_mm` between rings; no ToF check). Same photo names, folder `input_images/session_1/rig/<camera>/`, R2 keys `jobs/<job_id>/input/session_1/rig/...`. A bottom-endstop hit on the way down takes one last ring there and ends the side (warning in `tof_warnings`).
+     * `POST /scanner/flip/skip`, or no answer before the timeout: the scan finishes with the first side (the timeout says so in `phase_message`).
+     * `POST /scanner/cancel`: the whole scan is cancelled, as usual.
+     * The first side keeps the plain `rig/` layout, so the reconstruction works as before. **Turntable Studio does not read `session_1/` yet**: until it does, the pod reconstructs the first side only (the second side is uploaded and kept in `results/<job_id>/photos/session_1/rig/`).
    * **Stage 1b (Completion without RunPod - `COMPLETED`)** (`cloud.launch_runpod = false`, tests only; the default is `true`):
      * The state becomes `COMPLETED` as soon as the photos are verified in R2. `cloud.runpod` is not imported or called, so a missing RunPod key or package does not matter. Download the photos from the bucket for the reconstruction (Turntable Studio).
    * **Stage 2 (Turntable Studio on RunPod - `PROCESSING`)** (only when `cloud.launch_runpod = true`, no confirmation asked):
@@ -228,7 +239,8 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
       "decel_percent": null,
       "start_delay": null,
       "end_delay": null
-    }
+    },
+    "flip": false
   },
   "cloud": {
     "launch_runpod": true,
@@ -258,6 +270,7 @@ Starts the automated scanning workflow: physical scan, photo upload to R2 and ve
 | `z_axis.decel_percent` | `float \| null` | `null` | Optional separate deceleration fraction for Z-axis. |
 | `z_axis.start_delay` | `float \| null` | `null` | Starting launch delay for Z-axis if acceleration is enabled, range `0.0001`–`0.05`. |
 | `z_axis.end_delay` | `float \| null` | `null` | Optional slow-stop step delay for the Z-axis, range `0.005`–`0.030`; `null` (default) disables it. |
+| `flip` | `bool` | `false` | Scan both sides (SCAN-FLIP): after the first side the scanner waits in `awaiting_flip` for `POST /scanner/flip/continue` (second side, top to bottom, at the same heights) or `/flip/skip`. See Stage 1a. |
 | `job_id` | `string \| null` | `null` | Id of the job: R2 prefix `jobs/<job_id>/` and folder `results/<job_id>/`. Format `YYYYMMDD-HHMMSS-xxxxxx` (the `/library` id, else 422); `null` = a new one (shown in `/status`). |
 | `cloud.launch_runpod` | `bool` | `true` | `true` (default): Turntable Studio on RunPod after the scan (object scans are always reconstructed in the cloud). `false` (tests only): the scan stops (`completed`) once the photos are verified in R2. `true`: a Turntable Studio pod starts automatically afterwards. With `true`, `/start` answers `400` when `RUNPOD_API_KEY`, `TURNTABLE_IMAGE`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_R2_API_TOKEN` or the `R2_*` keys are missing. |
 | `cloud.resolution_level` | `int` | `1` | Turntable Studio dense level `0..3` (each level halves both photo sides; also sizes the pod RAM). |
@@ -313,6 +326,10 @@ curl -X POST http://127.0.0.1:8000/scanner/start \
 
 Runs the 3D reconstruction of the last object scan again on RunPod after it failed (`state: "error"`) or was cancelled during `processing`: same job id and options, the photos already in the cloud (no new scan, no new upload). No body. Answer `202` `{"status": "accepted", "message": "Retrying the reconstruction of <job_id>."}`, then the state is `processing` again (same screen as after a scan) and ends `completed` (`result_id`) or `error`. `400` with `detail` when there is nothing to retry, a newer scan replaced the photos, the photos are no longer on the Pi or RunPod is not configured; `409` while a scan, a retry or an emergency stop runs. Billed like a scan. The router keeps the job id and options of the last failed cloud stage (`_cloud_retry`, in memory: lost on a server restart) and runs `_run_cloud_stage` again in a background task.
 
+## `POST /scanner/flip/continue` and `POST /scanner/flip/skip` → `200` (SCAN-FLIP)
+
+Answer the pause of a flip scan (`mechanical.flip: true`, state `awaiting_flip`). No body. `continue`: the object was turned over, the second side is scanned on the way down; `skip`: finish with the first side only. Answer `{"status": "accepted", "state": "running", "message": "..."}`; the state is `running` at once (then `uploading` / `verifying` / `processing` as after any scan). `400` when the scanner is not in `awaiting_flip` (too early, already answered, timed out). `POST /scanner/cancel` cancels the whole scan instead.
+
 ---
 
 ## 3. Cancel / Emergency Stop (`POST /scanner/cancel`)
@@ -362,6 +379,8 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
   "phase": "scanning",
   "phase_message": "Ring 2: capturing",
   "level": 2,
+  "session": 0,
+  "flip_seconds_left": null,
   "photos_captured": 24,
   "photos_uploaded": 22,
   "missing": [],
@@ -382,12 +401,14 @@ Polling endpoint used by the frontend to track the active state, the phase, phot
 | `phase_message` | `string \| null` | Human readable detail of the phase. In `processing` on RunPod: the last milestone (changes a few times per job). |
 | `cloud_message` | `string \| null` | In `processing` on RunPod: the last technical message (pod state, minutes elapsed, retries), updated every few seconds. `null` otherwise. |
 | `level` | `int` | Current ring (`0` = first). |
+| `session` | `int` | Side of the object being scanned: `0`, or `1` = the turned-over object of a flip scan (`mechanical.flip`). |
+| `flip_seconds_left` | `float \| null` | In `awaiting_flip`: seconds before the scan finishes with the first side only. `null` otherwise. |
 | `photos_captured` | `int` | Photos taken by the cameras. |
 | `photos_uploaded` | `int` | Photos confirmed uploaded to R2. |
 | `missing` | `string[]` | R2 keys not found at the final verification (at most 50 are returned). Non-empty only with `state: "error"`. |
 | `error` | `string \| null` | Why the run ended in `error`. |
 | `tof_warnings` | `string[]` | Time-of-flight sensor warnings (e.g. invalid readings) raised during the scan. |
-| `face_result` | `object \| null` | Set when a face scan completed: `optimal_z_mm`, `best_score` (`null` without a search or when no face was found), `face_detected` (`null` without a search, `false` = no face found, the photo was taken at the start height), `warning`, `photos` (paths on the Pi), `r2_uploaded`, `result_id` / `metrics` / `reconstruction_error` (local 3D model). Reset by the next prepare or face scan. |
+| `face_result` | `object \| null` | Set when a face scan completed: `optimal_z_mm`, `best_score` (`null` without a search or when no face was found), `face_detected` (`null` without a search, `false` = no face found, the photo was taken at the start height), `warning`, `photos` (paths on the Pi), `r2_uploaded`, `eyes_open`, `framing` (`already_framed` / `jump` / `sweep`: how the height was found, `null` for `manual_z` or strategy `none`), `result_id` / `metrics` / `reconstruction_error` (local 3D model). Reset by the next prepare or face scan. |
 | `job_id` | `string \| null` | Id of the current photo set: R2 prefix `jobs/<job_id>/`. |
 | `result_id` | `string \| null` | `/library` id of the 3D model saved by the last run (cloud object scan or face scan); `null` until one is saved. |
 | `seconds_since_last_upload` | `float \| null` | Seconds since the last successful upload to R2 (or since the upload or the drain started, whichever is later). `null` when no upload is running. |
@@ -405,6 +426,7 @@ When `scan()` finishes the physical scan but the verification finds photos missi
 | `preparing` | Cameras streaming, carriage homing, cloud sanitizing | 15–30 seconds |
 | `prepared` | Carriage in position, AE/AWB locked, ready to scan | Until `/start` |
 | `running` | Turntable rotating, taking photos, uploading to R2; or a face capture in progress | 2–5 minutes (face capture: under a minute plus the upload) |
+| `awaiting_flip` | Flip scan (`mechanical.flip`): first side done, waiting for the object to be turned over; answer with `POST /scanner/flip/continue` or `/flip/skip` | Until the answer, at most `flip_seconds_left` (10 min) |
 | `processing` | Finalising after the scan: Turntable Studio on RunPod (`cloud.launch_runpod = true`) or the 3D face model on the Pi (phase `reconstructing_face`) | seconds; 10–20 s for a face, up to the pod cap (60 min) with RunPod |
 | `downloading` | Downloading completed 3D model from R2 (RunPod only) | 10–30 seconds |
 | `completed` | Photos verified in R2 (default), a face scan done (`face_result`), or, with RunPod, 3D model ready in output folder | Finished |
@@ -583,7 +605,7 @@ A face scan has the same two steps as an object scan: a **prepare** that readies
 | `upload_r2` | `true` | Upload and verify the photo pair; the bucket is cleaned by this prepare. |
 | `camera_config` | defaults of `DualCameraConfig` | As for `/scanner/prepare`. `focus: "auto"`: the lenses stay on the saved position during the search and an autofocus sweep runs **on the face** at the height found. An integer or a pair: that position, no autofocus. `exposure_time` / `analogue_gain` / `colour_gains`: used for the photo; otherwise AE/AWB settle on the face and are locked before it. |
 
-What it does: checks that MediaPipe, OpenCV and the face model are there (`400` otherwise: nothing has moved), the preflight (Arduino, cloud only with `upload_r2`, disk space; **not** the ToF sensor), lights and cameras, then in the background: homing, climb to `start_z_mm`, light stabilisation, the cameras left **unlocked** (AE/AWB follow the subject). The state becomes `prepared` with `mode: "face"`. Errors: like `/scanner/prepare` (`400`, `409`, `422`, `503`).
+What it does: checks that MediaPipe, OpenCV and the face model are there (`400` otherwise: nothing has moved), the preflight (Arduino, cloud only with `upload_r2`, disk space; **not** the ToF sensor), lights and cameras, then in the background: the MediaPipe detector starts loading (FACE-FAST, ready for the capture; `SCAN_FACE_PRELOAD_DETECTOR=0` turns it off), homing, climb to `start_z_mm`, light stabilisation, the cameras left **unlocked** (AE/AWB follow the subject). The state becomes `prepared` with `mode: "face"`. Errors: like `/scanner/prepare` (`400`, `409`, `422`, `503`).
 
 ### 9.2 Capture (`POST /scanner/face/capture`, body `FaceCaptureRequest`)
 
@@ -606,13 +628,15 @@ What it does: checks that MediaPipe, OpenCV and the face model are there (`400` 
 | `settle_s` | `0.150` | Pause before the photo (`0.05..2`). |
 | `z_delay` | `null` | Step delay (s) of this capture's Z moves; `null` keeps the prepare's `z_delay`. |
 | `reconstruct` | `true` | Build the 3D face model on the Pi after the photo (`rpi_face_mesh`); `false` = photos only. |
+| `fast_framing` | `true` | FACE-FAST: before the search, check the face where the carriage is and try a jump computed from the nose position (see step 1); `false` = always the step by step search. |
+| `title` | `null` | Name of the face model in `/library` (`null` = the job id). |
 
 Every distance must be a whole number of Z steps (multiples of `0.01 mm`). Unknown keys are refused (`422`), including `home`, `start_z_mm`, `upload_r2` and `illumination_brightness` (they belong to the prepare; the carriage is always homed by the prepare).
 
 Workflow (background, `Scanner.face_scan`):
-1. **Height**: `manual_z`, the search (MediaPipe FaceLandmarker on **fresh** preview frames: a frame exposed during the move is never used; no fresh frame in 3 s is an `error`), or none. Every Z move at constant speed (`acceleration=False`), arriving from below (anti-backlash). Only the endstop in the direction of the move counts; at the top switch the search ends with an `error` (the position is no longer known).
+1. **Height**: `manual_z`, the search (MediaPipe FaceLandmarker on **fresh** preview frames: a frame exposed during the move is never used; no fresh frame in 3 s is an `error`), or none. With `fast_framing` (FACE-FAST) the search starts with: (a) **already framed**: both cameras see the whole face (at least 98 % of the face mesh inside each frame), the nose within 0.05 of the vertical centre and a score of at least 1.2: the photo is taken there, nothing moves (`framing: "already_framed"`); (b) **computed jump**: the nose offset from the centre times the mm one frame height covers at the face (a face is about `SCAN_FACE_HEIGHT_MM` 190 mm tall, the face box gives its height in the frame), rounded to whole mm and kept inside the search range, checked on fresh frames, at most `SCAN_FACE_JUMP_ATTEMPTS` (2) times (`framing: "jump"`); (c) otherwise back to the prepared height and the step by step search (`framing: "sweep"`). `SCAN_FACE_JUMP_SIGN=-1` is for cameras mounted upside down. Every Z move at constant speed (`acceleration=False`), arriving from below (anti-backlash). Only the endstop in the direction of the move counts; at the top switch the search ends with an `error` (the position is no longer known).
 2. **No face**: not an error. The photo is taken at the start height and `face_result` has `face_detected: false`, `best_score: null` and a `warning` (also in `phase_message`). The score of a height adds the centering, the size, the cheek profile and the share of the face landmarks inside the frame.
-3. **Camera lock on the face**: autofocus sweep on the face box of each camera (with `focus: "auto"`), then AE/AWB settle and lock; the subject should hold still for about 10 s.
+3. **Camera lock on the face**: autofocus sweep on the face box of each camera (with `focus: "auto"`), then AE/AWB settle and lock; the subject should hold still for about 10 s. From the second face on (same server run), the autofocus starts around the lens positions of the previous face (`autofocus_hint`, ±3 coarse steps instead of the whole range; the full sweep when the peak is outside that window).
 4. **Capture**: after `settle_s` (with a working buzzer: a countdown sound and `phase_message` "photo in 1.5 s, keep your eyes open", the photos 1.5 s later, `SCAN_FACE_PHOTO_WARNING_S`) a burst of `SCAN_FACE_BURST_SHOTS` (4) synchronized pairs; MediaPipe scores the eyes on each (`1 - max(eyeBlinkLeft, eyeBlinkRight)`, the lower camera) and only the pair with the eyes most open is kept as `input_images/rig/0/f_{Z}.jpg` and `input_images/rig/1/f_{Z}.jpg`; with the prepare's `upload_r2`, uploaded and verified like the object scan.
 5. **Teardown**: motors released, lights off, cameras closed.
 6. **3D model on the Pi** (`reconstruct: true`): the state becomes `processing` (the rig is already released), `phase` is `reconstructing_face` and `phase_message` follows the steps ("Detecting face landmarks...", "Computing 3D geometry & depth...", "Baking texture...", "Exporting models (GLB, STL, OBJ)..."). The model (`obj/`, `glb/`, `stl/`, `3mf/`, `object.json` with the size in mm and the IPD) is saved in `results/<job_id>/` and listed by `/library`; `face_result.result_id` and `result_id` give its id, `face_result.metrics` the size. A failed reconstruction ends the run in `error` (`error` says why, `face_result.reconstruction_error` too; the photos are kept in `face_result.photos`). A cancel kills it (`cancelled`). Timeout `FACE_RECONSTRUCT_TIMEOUT_S` (300 s).
@@ -633,7 +657,12 @@ Errors before the `202`: `400` the scanner is not `prepared` with `mode: "face"`
     "face_detected": true,
     "warning": null,
     "photos": ["<project>/input_images/rig/0/f_240.jpg", "<project>/input_images/rig/1/f_240.jpg"],
-    "r2_uploaded": true
+    "r2_uploaded": true,
+    "eyes_open": 0.93,
+    "framing": "jump",
+    "result_id": "20261101-101500-a1b2c3",
+    "metrics": {"dimensions_mm": {"width": 150.0}, "interpupillary_distance_mm": 63.0, "fit_rms_mm": {}},
+    "reconstruction_error": null
   }
 }
 ```

@@ -224,25 +224,30 @@ def _write_object_json(folder: Path, obj: dict) -> None:
 PHOTOS_DIR = "photos"
 
 
-def copy_photos(images_dir: Path, folder: Path) -> int:
+def copy_photos(images_dir: Path, folder: Path, second_side: Optional[Path] = None) -> int:
     """
     Copies the scan photos (``rig/0|1/*.jpg`` and ``manifest.json``) into ``folder/photos/rig/``: the layout Turntable
-    Studio reads, so the folder can be reconstructed again. Returns the number of files copied; never raises (the model is already saved: a failure is logged).
+    Studio reads, so the folder can be reconstructed again. ``second_side`` (the turned-over object of a flip scan,
+    ``input_images/session_1/rig``) goes to ``folder/photos/session_1/rig/``. Returns the number of files copied; never
+    raises (the model is already saved: a failure is logged).
     """
     import shutil
-    images_dir = Path(images_dir)
-    dest = Path(folder) / PHOTOS_DIR / images_dir.name
+    sources = [(Path(images_dir), Path(folder) / PHOTOS_DIR / Path(images_dir).name)]
+    if second_side is not None and Path(second_side).is_dir():
+        side = Path(second_side)
+        sources.append((side, Path(folder) / PHOTOS_DIR / side.parent.name / side.name))
     copied = 0
-    try:
-        for path in sorted(p for p in images_dir.rglob("*") if p.is_file()):
-            if path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".json"):
-                continue
-            target = dest / path.relative_to(images_dir)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
-            copied += 1
-    except OSError as e:
-        log.warning("Could not copy the photos of %s into %s: %s", images_dir, dest, e)
+    for source, dest in sources:
+        try:
+            for path in sorted(p for p in source.rglob("*") if p.is_file()):
+                if path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".json"):
+                    continue
+                target = dest / path.relative_to(source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+                copied += 1
+        except OSError as e:
+            log.warning("Could not copy the photos of %s into %s: %s", source, dest, e)
     return copied
 
 

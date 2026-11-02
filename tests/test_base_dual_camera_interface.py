@@ -12,7 +12,7 @@ from hardware.dual_camera_xvs import DualCameraXVS
 
 # Everything the scanner and the routers use on `scanner.dual_cameras`: it must exist on every driver
 INTERFACE = (
-    "supports_preview_stream", "supports_lock_auto",
+    "supports_preview_stream", "supports_lock_auto", "supports_autofocus_hint",
     "stream_size", "stream_quality", "autofocus_positions", "last_capture_info",
     "active_camera", "active", "add_spectator", "remove_spectator", "has_spectators", "wait_jpeg", "get_sync_status",
     "get_latest_lores_frames",
@@ -86,9 +86,11 @@ class InterfaceDeclaredInTheBaseTest(unittest.TestCase):
     def test_capability_flags(self):
         self.assertTrue(DualCameraRPISync.supports_preview_stream)
         self.assertTrue(DualCameraRPISync.supports_lock_auto)
+        self.assertTrue(DualCameraRPISync.supports_autofocus_hint)
         for cls in (BaseDualCamera, DualCamera, DualCameraXVS):
             self.assertFalse(cls.supports_preview_stream, cls.__name__)
             self.assertFalse(cls.supports_lock_auto, cls.__name__)
+            self.assertFalse(cls.supports_autofocus_hint, cls.__name__)
 
     def test_secondary_drivers_do_not_override_the_shared_preview_members(self):
         for cls in (DualCamera, DualCameraXVS):

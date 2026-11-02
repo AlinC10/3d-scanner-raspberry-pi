@@ -62,8 +62,10 @@ def _photo_set(images_dir, level=1, shot=0, content=b"jpeg"):
 def make_scanner():
     s = Scanner(camera_mode="staggered")
     # Every scanner gets its own photo directory: scan() writes the manifest and the photos there
-    s.images_dir = tempfile.mkdtemp(prefix="scanner_test_images_")
-    atexit.register(shutil.rmtree, s.images_dir, True)
+    # (input_images/rig like the real layout, so the second side of a flip scan lands in <tmp>/session_1/rig)
+    root = tempfile.mkdtemp(prefix="scanner_test_images_")
+    atexit.register(shutil.rmtree, root, True)
+    s.images_dir = os.path.join(root, "rig")
     s.turntable_motor = MagicMock()
     s.z_axis_motor = MagicMock()
     s.up_endstop = MagicMock(is_active=False)

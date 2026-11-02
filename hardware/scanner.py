@@ -2,8 +2,10 @@ import heapq
 import itertools
 import json
 import logging
+import math
 import random
 import shutil
+import contextlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,6 +80,14 @@ CLOUD_MANIFEST_NAME = "_manifest.json"
 # of recent jobs stay (a failed cloud job keeps its photos for a retry). 0 = every older job.
 R2_STALE_JOB_S = float(os.environ.get("SCAN_R2_STALE_JOB_S", str(24 * 3600)))
 
+# SCAN-FLIP: the second side of the object (turned over by hand between the two sessions). Its photos go to
+# input_images/session_1/rig/<camera>/ (same names as the first side) and to jobs/<job_id>/input/session_1/rig/ in R2.
+# The first side keeps the plain rig/ layout, so a Turntable Studio that knows nothing about the second side still
+# reconstructs the first one.
+FLIP_SESSION_NAME = "session_1"
+# How long the scanner waits in `awaiting_flip` for POST /scanner/flip/continue or /skip; then it finishes with one side
+FLIP_TIMEOUT_S = _env_float("SCAN_FLIP_TIMEOUT_S", 600.0)
+
 # A photo whose mean luma (0-255) is below this is black: a closed lens cap, dead lights or a manual exposure of 0.
 # The first photo pair of a scan is checked so a whole scan of black photos is never taken (SCAN_BLACK_FRAME_CHECK=0
 # disables the check).
@@ -126,6 +136,23 @@ FACE_BURST_SHOTS = max(1, int(_env_float("SCAN_FACE_BURST_SHOTS", 4)))
 FACE_EYES_OPEN_MIN = _env_float("SCAN_FACE_EYES_OPEN_MIN", 0.5)
 # Width the burst photos are scaled to before MediaPipe (speed; the eyes stay large enough at the rig's distance)
 FACE_EYES_CHECK_WIDTH = 1280
+# FACE-FAST. A face is "already framed" when both cameras see it whole (at least this share of the face mesh inside each
+# frame), the nose within FACE_FRAMED_NOSE_BAND of the vertical centre and the score at least FACE_FRAMED_MIN_SCORE:
+# then the height search is skipped.
+FACE_FRAMED_MIN_VISIBLE = _env_float("SCAN_FACE_FRAMED_MIN_VISIBLE", 0.98)
+FACE_FRAMED_NOSE_BAND = _env_float("SCAN_FACE_FRAMED_NOSE_BAND", 0.05)
+FACE_FRAMED_MIN_SCORE = _env_float("SCAN_FACE_FRAMED_MIN_SCORE", 1.2)
+# Otherwise the height is computed from the nose position: a face (MediaPipe box, forehead to chin) is about this tall,
+# so the box height in the frame gives the mm per frame height. SIGN: +1 when a face low in the picture means the
+# cameras are too high (upright cameras); -1 for cameras mounted upside down. At most FACE_JUMP_ATTEMPTS jumps, then
+# the classic sweep from the prepared height.
+FACE_HEIGHT_MM = _env_float("SCAN_FACE_HEIGHT_MM", 190.0)
+FACE_JUMP_SIGN = 1.0 if _env_float("SCAN_FACE_JUMP_SIGN", 1.0) >= 0 else -1.0
+FACE_JUMP_ATTEMPTS = max(0, int(_env_float("SCAN_FACE_JUMP_ATTEMPTS", 2)))
+# The MediaPipe detector is loaded in the background by the face prepare (SCAN_FACE_PRELOAD_DETECTOR=0 turns it off);
+# the capture waits at most this long for it
+FACE_PRELOAD_DETECTOR = os.environ.get("SCAN_FACE_PRELOAD_DETECTOR", "1") != "0"
+FACE_DETECTOR_WAIT_S = _env_float("SCAN_FACE_DETECTOR_WAIT_S", 15.0)
 # Pause after the carriage has reached the bottom endstop in finish_preparation(), before it climbs to the start position
 # (lets the carriage and the endstop settle; a cancel ends it at once).
 Z_HOME_SETTLE_S = _env_float("SCAN_Z_HOME_SETTLE_S", 1.0)
@@ -183,6 +210,8 @@ class ScannerState:
     PREPARING = "preparing"
     PREPARED = "prepared"
     RUNNING = "running"
+    # SCAN-FLIP: the first side is done, the rig waits for the object to be turned over (lights and cameras stay on)
+    AWAITING_FLIP = "awaiting_flip"
     PROCESSING = "processing"
     DOWNLOADING = "downloading"
     COMPLETED = "completed"
@@ -213,6 +242,7 @@ class ScanPhase:
     PREPARING = "preparing"
     PREPARED = "prepared"
     SCANNING = "scanning"
+    AWAITING_FLIP = "awaiting_flip"   # between the two sides of a flip scan (SCAN-FLIP)
     UPLOADING = "uploading"
     VERIFYING = "verifying"
     RECONSTRUCTING_FACE = "reconstructing_face"   # local 3D face model on the Pi (FACE-20)
@@ -226,6 +256,7 @@ T8_THREADED_ROD_STEP = 8 # mm
 STATE_SOUNDS = {
     ScannerState.PREPARED: "ready",
     ScannerState.RUNNING: "start",
+    ScannerState.AWAITING_FLIP: "flip",
     ScannerState.COMPLETED: "success",
     ScannerState.ERROR: "error",
     ScannerState.CANCELLED: "error",
@@ -326,6 +357,14 @@ class Scanner:
 
         # Root of the photo tree and of manifest.json (an instance attribute so tests can point it elsewhere)
         self.images_dir = INPUT_IMAGES_DIR
+        # Side of the object being photographed (SCAN-FLIP: 0 = first side, 1 = turned over) and the R2 key prefix of
+        # its photos, below jobs/<job_id>/input/
+        self.session = 0
+        self._cloud_prefix = CLOUD_KEY_PREFIX
+        # The wait between the two sides: the choice of POST /scanner/flip/continue|skip and when the wait gives up
+        self._flip_event = threading.Event()
+        self._flip_choice: Optional[str] = None
+        self._flip_deadline: Optional[float] = None
 
         # used for uploading the images when they are captured
         self.upload_queue = Queue()
@@ -373,6 +412,10 @@ class Scanner:
         self._face_upload_r2 = True
         # Step delay of the face scan's Z moves (FACE-19): set by the face prepare, a capture may override it
         self._face_z_delay = FACE_Z_DELAY_DEFAULT_S
+        # FACE-FAST: the MediaPipe detector loading in the background since the face prepare ((thread, holder) or
+        # None), and the lens positions of the last face autofocus (the next face is at about the same distance)
+        self._face_detector_loader: Optional[Tuple[threading.Thread, dict]] = None
+        self._face_af_positions: Optional[list] = None
         # Whether prepare_scan() of the selected camera driver accepts lock_auto (set by setup_and_stream)
         self._lock_auto_supported = False
         # True while the cameras/lights were started by a manual /test endpoint (setup_and_stream(preflight=False)),
@@ -385,8 +428,23 @@ class Scanner:
         True while a /scanner/prepare or scan owns the rig (state PREPARING / PREPARED / RUNNING): the lights, motors
         and cameras are then driven by the scan only. A manual /test stream session does not count.
         """
-        return self.state in (ScannerState.PREPARING, ScannerState.PREPARED, ScannerState.RUNNING) \
+        return self.state in (ScannerState.PREPARING, ScannerState.PREPARED, ScannerState.RUNNING,
+                              ScannerState.AWAITING_FLIP) \
             and not self._manual_session
+
+    @property
+    def flip_images_dir(self) -> str:
+        """Photo root of the second side of a flip scan: input_images/session_1/rig (beside input_images/rig)."""
+        root = Path(self.images_dir)
+        return str(root.parent / FLIP_SESSION_NAME / root.name)
+
+    @property
+    def flip_seconds_left(self) -> Optional[float]:
+        """Seconds until the flip wait gives up (None outside `awaiting_flip`)."""
+        deadline = self._flip_deadline
+        if deadline is None or self.state != ScannerState.AWAITING_FLIP:
+            return None
+        return max(0.0, round(deadline - time.monotonic(), 1))
 
     @property
     def is_streaming(self):
@@ -474,7 +532,8 @@ class Scanner:
             return False
         if getattr(self._tls, "automated", False):
             return True
-        return self.state in (ScannerState.PREPARING, ScannerState.PREPARED, ScannerState.RUNNING)
+        return self.state in (ScannerState.PREPARING, ScannerState.PREPARED, ScannerState.RUNNING,
+                              ScannerState.AWAITING_FLIP)
 
     def _begin_z_motion(self) -> bool:
         """
@@ -538,12 +597,13 @@ class Scanner:
     def _cloud_key(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None) -> str:
         """
         The R2 object key of a photo: jobs/<job_id>/input/rig/ + its path relative to the photo root (e.g.
-        "jobs/20261030-101500-a1b2c3/input/rig/0/f_1000.jpg"), the layout Turntable Studio reads (rig_mode).
+        "jobs/20261030-101500-a1b2c3/input/rig/0/f_1000.jpg"), the layout Turntable Studio reads (rig_mode). The
+        second side of a flip scan uses jobs/<job_id>/input/session_1/rig/ (`_cloud_prefix`).
 
         :raises ValueError: if the path is not below the photo root.
         """
         rel = Path(path).relative_to(base_dir if base_dir is not None else self.images_dir)
-        return r2.input_key(self.job_id or "unassigned", f"{CLOUD_KEY_PREFIX}{rel.as_posix()}")
+        return r2.input_key(self.job_id or "unassigned", f"{self._cloud_prefix}{rel.as_posix()}")
 
     def _enqueue_upload(self, path: str, key: str) -> None:
         with self._upload_lock:
@@ -781,6 +841,8 @@ class Scanner:
         name of results/<job_id>/): `job_id`, or a new sortable id.
         """
         self.job_id = job_id or r2.new_job_id()
+        self.session = 0
+        self._cloud_prefix = CLOUD_KEY_PREFIX
         with self._manifest_lock:
             self._manifest_dir = str(images_dir)
             self._manifest = self._new_manifest()
@@ -892,6 +954,7 @@ class Scanner:
                     "size": size,
                     "level": level,
                     "shot": shot,
+                    "session": self.session,
                     "camera": index,
                     "exposure_time": cam.get("exposure_time"),
                     "analogue_gain": cam.get("analogue_gain"),
@@ -1502,6 +1565,8 @@ class Scanner:
             z_delay = FACE_Z_DELAY_DEFAULT_S if face else Z_PREPARE_DELAY_S
         if face:
             self._face_z_delay = float(z_delay)
+            # FACE-FAST: the detector loads (1-2 s) while the carriage homes and the light stabilises
+            self._preload_face_detector()
         # This thread now runs the prepare sequence: the Z helpers honour a pending cancel for it (_cancel_applies)
         self._tls.automated = True
         try:
@@ -1874,7 +1939,9 @@ class Scanner:
         turntable_end_delay: Optional[float] = TURNTABLE_END_DELAY_DEFAULT,
         z_end_delay: Optional[float] = None,
         finish_state: str = ScannerState.IDLE,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        flip: bool = False,
+        flip_timeout_s: Optional[float] = None,
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.
@@ -1899,6 +1966,11 @@ class Scanner:
         :param finish_state: State to leave the scanner in after a scan that completed normally. cleanup() resets it
             to IDLE, which would briefly allow a new /prepare before the cloud pipeline starts; the orchestrator
             passes PROCESSING to close that gap. Failed and cancelled scans keep their own terminal state.
+        :param flip: SCAN-FLIP. After the first side the scanner waits in `awaiting_flip` (lights, cameras and the
+            exposure lock stay as they are) for `flip_decision()`: "continue" photographs the turned-over object on the
+            way down, ring by ring at the heights of the first side (no ToF), into `flip_images_dir`; "skip", or no
+            answer within `flip_timeout_s`, finishes with the first side only.
+        :param flip_timeout_s: How long the flip wait lasts (default FLIP_TIMEOUT_S).
 
         The physical scan ends first (motors released, lights off, cameras closed). The state stays RUNNING while the
         remaining uploads drain (phase "uploading") and the bucket is verified against the manifest (phase
@@ -1956,6 +2028,13 @@ class Scanner:
                 raise ScannerError(f"Could not clean the local photo directory {images_dir}: {e}")
             if Path(images_dir).is_dir() and any(Path(images_dir).iterdir()):
                 raise ScannerError(f"The local photo directory {images_dir} is not empty after the cleanup.")
+            # The second side of an older flip scan must never be mixed into this one
+            flip_root = Path(self.flip_images_dir).parent
+            if flip_root.exists():
+                try:
+                    shutil.rmtree(flip_root)
+                except OSError as e:
+                    raise ScannerError(f"Could not delete the photos of the previous second side {flip_root}: {e}")
 
             self._begin_manifest(images_dir, job_id)
             self.start_upload_worker()
@@ -2072,6 +2151,36 @@ class Scanner:
             if self.total_photos == 0 and not self._cancel_event.is_set():
                 raise ScannerError("The scan finished without capturing any photo.")
 
+            # SCAN-FLIP: the turned-over object, ring by ring on the way down (the uploads go on during the wait)
+            if flip and not self._cancel_event.is_set():
+                choice = self._await_flip(FLIP_TIMEOUT_S if flip_timeout_s is None else float(flip_timeout_s))
+                if choice == "continue":
+                    self._scan_second_side(
+                        top_level=self._level,
+                        z_steps=z_steps,
+                        delay_z_motor=delay_z_motor,
+                        z_acceleration=z_acceleration,
+                        z_start_delay=z_start_delay,
+                        z_ramp_percent=z_ramp_percent,
+                        z_decel_percent=z_decel_percent,
+                        z_end_delay=z_end_delay,
+                        ring_kwargs=dict(
+                            angle=angle,
+                            steps=steps,
+                            delay_turntable=delay_turntable,
+                            turntable_acceleration=turntable_acceleration,
+                            turntable_start_delay=turntable_start_delay,
+                            turntable_ramp_percent=turntable_ramp_percent,
+                            turntable_decel_percent=turntable_decel_percent,
+                            turntable_end_delay=turntable_end_delay,
+                        ),
+                    )
+                elif choice in ("skip", "timeout"):
+                    self._phase_note = (
+                        "Scanned on one side only: the flip wait timed out." if choice == "timeout" else None
+                    ) or self._phase_note
+                    log.info("[Scanner] Flip %s: finishing with the first side only.", choice)
+
             # Every photo of the scan is in the manifest, i.e. both files were validated and queued
             if not self._cancel_event.is_set() and self._manifest_photo_count() != self.total_photos:
                 raise ScannerError(
@@ -2124,6 +2233,122 @@ class Scanner:
             if self.state == ScannerState.RUNNING:
                 self.state = finish_state
 
+    def _await_flip(self, timeout_s: float) -> str:
+        """
+        The pause between the two sides of a flip scan (state AWAITING_FLIP). The lights, the cameras and their
+        exposure lock stay as they are, the motors are off (the lead screw holds the carriage; the platter may move, the
+        object is turned over anyway). Returns "continue" / "skip" (`flip_decision`), "timeout" or "cancelled".
+        """
+        with self._lock:
+            if self._cancel_event.is_set() or self.state != ScannerState.RUNNING:
+                return "cancelled"
+            self._flip_choice = None
+            self._flip_event.clear()
+            self._flip_deadline = time.monotonic() + max(0.0, timeout_s)
+            self.state = ScannerState.AWAITING_FLIP
+            self._set_phase(ScanPhase.AWAITING_FLIP,
+                            "First side done: turn the object over, then continue (or finish with one side).")
+        log.info("[Scanner] First side done (%d photo(s)); waiting up to %.0f s for the object to be turned over.",
+                 self.total_photos, timeout_s)
+        choice = "timeout"
+        try:
+            while not self._cancel_event.is_set():
+                remaining = self._flip_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._flip_event.wait(min(0.2, remaining)):
+                    choice = self._flip_choice or "skip"
+                    break
+            with self._lock:
+                # flip_decision() already moved the state back to RUNNING; the timeout does it here
+                if self._cancel_event.is_set() or self.state not in (ScannerState.AWAITING_FLIP, ScannerState.RUNNING):
+                    return "cancelled"
+                if self._flip_choice is not None:
+                    choice = self._flip_choice
+                self.state = ScannerState.RUNNING
+                self._set_phase(ScanPhase.SCANNING)
+            return choice
+        finally:
+            self._flip_deadline = None
+
+    def flip_decision(self, proceed: bool) -> None:
+        """
+        Answers the flip wait: `proceed` True (POST /scanner/flip/continue, the object was turned over) photographs the
+        second side; False (POST /scanner/flip/skip) finishes with the first side only.
+
+        :raises ScannerModeError: the scanner is not waiting for a flip (400).
+        """
+        with self._lock:
+            if self.state != ScannerState.AWAITING_FLIP:
+                raise ScannerModeError(f"The scanner is not waiting for the object to be turned over (state {self.state}).")
+            self._flip_choice = "continue" if proceed else "skip"
+            # RUNNING at once (the answer and the next /status show it); the scan thread wakes up on the event
+            self.state = ScannerState.RUNNING
+            self._set_phase(ScanPhase.SCANNING)
+            self._flip_event.set()
+
+    def _scan_second_side(self, top_level: int, z_steps: int, delay_z_motor: float, z_acceleration: bool,
+                          z_start_delay: Optional[float], z_ramp_percent: float, z_decel_percent: Optional[float],
+                          z_end_delay: Optional[float], ring_kwargs: dict) -> None:
+        """
+        Second side of a flip scan: one ring at each level of the first side, from `top_level` down to 1 (same photo
+        names, in `flip_images_dir`, keys below input/session_1/rig/). The end of the object is not checked (no ToF):
+        the levels are those of the first side. Returns early on a cancel.
+
+        :raises ScannerError: a ring failed or a descent was aborted.
+        """
+        images_dir = self.flip_images_dir
+        try:
+            fc.create_clean_dir(images_dir)
+        except Exception as e:
+            raise ScannerError(f"Could not create the photo directory of the second side {images_dir}: {e}")
+        self.session = 1
+        self._cloud_prefix = f"{FLIP_SESSION_NAME}/{CLOUD_KEY_PREFIX}"
+        log.info("[Scanner] Second side: %d ring(s) on the way down.", top_level)
+
+        self.turntable_motor.enable()
+        level = top_level
+        while level >= 1 and not self._cancel_event.is_set():
+            self._level = level
+            self._set_phase(ScanPhase.SCANNING, f"Second side: ring {top_level - level + 1} of {top_level}")
+            self._capture_turntable_slice(images_dir=images_dir, level_label=level, check_tof=False, **ring_kwargs)
+            if self._cancel_event.is_set() or level == 1:
+                break
+            self.z_axis_motor.enable()
+            if self._cancel_event.is_set():
+                break
+            try:
+                moved = self.move_z_down(
+                    steps=z_steps,
+                    delay=delay_z_motor,
+                    acceleration=z_acceleration,
+                    start_delay=z_start_delay,
+                    ramp_percent=z_ramp_percent,
+                    decel_percent=z_decel_percent,
+                    end_delay=z_end_delay,
+                )
+            except BottomEndstopTriggered:
+                # Steps were lost on the way up or down: the carriage is lower than the first side's ring. One last
+                # ring here, then the side ends.
+                self.z_axis_motor.disable()
+                log.warning("[Scanner] Bottom endstop reached on the second side above level 1; last ring here.")
+                self.tof_warnings.append(
+                    f"Second side: the bottom endstop was reached before level {level - 1}; it is the last ring."
+                )
+                level -= 1
+                self._level = level
+                self._capture_turntable_slice(images_dir=images_dir, level_label=level, check_tof=False,
+                                              **ring_kwargs)
+                break
+            self.z_axis_motor.disable(interrupt=self._cancel_event)
+            if self._cancel_event.is_set():
+                break
+            if not moved:
+                raise ScannerError("The Z-axis descent of the second side was aborted before the next level.")
+            self.turntable_motor.enable()
+            level -= 1
+        self.turntable_motor.disable()
+
     # Strategies of the face capture: search the height ("sweep_best_score", "direct_stop") or photograph at once
     FACE_STRATEGIES = ("sweep_best_score", "direct_stop", "none")
     # Below this score (sum of both cameras, see StereoFramingAnalyzer) no camera saw a usable face
@@ -2159,8 +2384,8 @@ class Scanner:
         def check_state() -> None:
             if self._stopping:
                 raise ScannerStoppingError("Cannot start face scan. An emergency stop is still in progress.")
-            if self.state in (ScannerState.RUNNING, ScannerState.PREPARING, ScannerState.PROCESSING,
-                              ScannerState.DOWNLOADING):
+            if self.state in (ScannerState.RUNNING, ScannerState.AWAITING_FLIP, ScannerState.PREPARING,
+                              ScannerState.PROCESSING, ScannerState.DOWNLOADING):
                 raise ScannerBusyError(f"Cannot start face scan. Scanner is currently {self.state}")
             if self.state != ScannerState.PREPARED or self.mode != ScanMode.FACE:
                 raise ScannerModeError(
@@ -2210,7 +2435,8 @@ class Scanner:
             self._reset_status()
             self._set_phase(ScanPhase.SCANNING, "Face scan: positioning the carriage")
 
-    def _capture_face_burst(self, images_dir: str, stem: str) -> Tuple[list, Optional[float]]:
+    def _capture_face_burst(self, images_dir: str, stem: str,
+                            detector: Optional[Any] = None) -> Tuple[list, Optional[float]]:
         """
         Takes FACE_BURST_SHOTS photo pairs back to back, keeps the pair with the eyes most open (renamed to
         ``<stem>.jpg`` in each camera folder) and deletes the others. Returns the kept paths and their eye openness
@@ -2227,7 +2453,7 @@ class Scanner:
                 raise ScannerError("Face scan cancelled during the photo burst.")
             shots.append(list(self.dual_cameras.capture_photo(output_prefix=f"{stem}_b{i}", output_dir=images_dir,
                                                               meshroom_rig=True)))
-        scores = self._score_eyes(shots)
+        scores = self._score_eyes(shots, detector) if detector is not None else self._score_eyes(shots)
         best = max(range(len(shots)), key=lambda i: (scores[i] if scores[i] is not None else -1.0, -i))
         log.info("[Scanner Face] Eye openness of the burst: %s -> pair %d kept",
                  ["-" if s is None else f"{s:.2f}" for s in scores], best)
@@ -2245,11 +2471,13 @@ class Scanner:
                         log.warning("[Scanner Face] Could not delete burst photo %s: %s", path, e)
         return kept, scores[best]
 
-    def _score_eyes(self, shots: list) -> list:
+    def _score_eyes(self, shots: list, detector: Optional[Any] = None) -> list:
         """
         Eye openness of each pair (0 closed .. 1 open): 1 - the larger ``eyeBlinkLeft`` / ``eyeBlinkRight`` blendshape
         of MediaPipe, the lower of the two cameras (a blink in either one spoils the pair); None when no camera of the
         pair shows a face. All None when MediaPipe cannot run.
+
+        :param detector: a FaceScanner to use (the one of the height search, FACE-FAST); None builds and closes one.
         """
         try:
             import cv2
@@ -2259,7 +2487,8 @@ class Scanner:
             return [None] * len(shots)
         scores = []
         try:
-            with FaceScanner(num_faces=1, output_facial_transformation_matrixes=False) as detector:
+            with contextlib.nullcontext(detector) if detector is not None else \
+                    FaceScanner(num_faces=1, output_facial_transformation_matrixes=False) as detector:
                 for pair in shots:
                     per_cam = []
                     for path in pair:
@@ -2288,6 +2517,69 @@ class Scanner:
         except Exception as e:   # the module itself needs cv2 / numpy
             return f"Face detection could not be loaded: {e}"
         return face_detection_problem()
+
+    def _preload_face_detector(self) -> None:
+        """
+        FACE-FAST: starts loading the MediaPipe detector on a background thread (the face prepare calls it), so the
+        capture does not wait 1-2 s for the model. Nothing happens when face detection cannot run here; a failure is
+        only logged (the capture then builds its own detector).
+        """
+        self._release_face_detector()
+        if not FACE_PRELOAD_DETECTOR or self._face_detection_problem():
+            return
+        holder: dict = {"lock": threading.Lock(), "detector": None, "abandoned": False}
+
+        def load() -> None:
+            try:
+                from face_scan.face_scanner import FaceScanner
+                detector = FaceScanner(num_faces=1)
+            except Exception as e:
+                log.warning("[Scanner Face] The face detector could not be preloaded: %s", e)
+                return
+            with holder["lock"]:
+                if not holder["abandoned"]:
+                    holder["detector"] = detector
+                    detector = None
+            if detector is not None:   # nobody wants it any more (cancel, new prepare)
+                self._close_face_detector(detector)
+
+        thread = threading.Thread(target=load, name="face-detector-preload", daemon=True)
+        self._face_detector_loader = (thread, holder)
+        thread.start()
+
+    def _take_face_detector(self, timeout_s: float = FACE_DETECTOR_WAIT_S) -> Optional[Any]:
+        """
+        The preloaded detector (waits up to `timeout_s` for the loading to end); None when none was preloaded or it
+        failed. The caller owns it from now on and closes it.
+        """
+        loader, self._face_detector_loader = getattr(self, "_face_detector_loader", None), None
+        if loader is None:
+            return None
+        thread, holder = loader
+        thread.join(timeout_s)
+        with holder["lock"]:
+            holder["abandoned"] = True
+            detector, holder["detector"] = holder["detector"], None
+        return detector
+
+    def _release_face_detector(self) -> None:
+        """Drops the preloaded detector without waiting (closed now, or by the loader when it finishes)."""
+        loader, self._face_detector_loader = getattr(self, "_face_detector_loader", None), None
+        if loader is None:
+            return
+        _, holder = loader
+        with holder["lock"]:
+            holder["abandoned"] = True
+            detector, holder["detector"] = holder["detector"], None
+        if detector is not None:
+            self._close_face_detector(detector)
+
+    @staticmethod
+    def _close_face_detector(detector: Any) -> None:
+        try:
+            detector.close()
+        except Exception as e:
+            log.warning("[Scanner Face] Could not close the face detector: %s", e)
 
     def _face_z_move(self, up: bool, distance_mm: float) -> None:
         """
@@ -2363,17 +2655,113 @@ class Scanner:
             boxes.append((x0, y0, x1 - x0, y1 - y0))
         return tuple(boxes)
 
+    @staticmethod
+    def _face_is_framed(evaluation: Optional[dict]) -> bool:
+        """
+        FACE-FAST: both cameras see the whole face (FACE_FRAMED_MIN_VISIBLE of the mesh inside each frame), the nose is
+        within FACE_FRAMED_NOSE_BAND of the vertical centre and the score reaches FACE_FRAMED_MIN_SCORE.
+        """
+        if not evaluation or not evaluation.get("both_detected"):
+            return False
+        nose_y = evaluation.get("avg_nose_y")
+        if nose_y is None or abs(float(nose_y) - 0.5) > FACE_FRAMED_NOSE_BAND:
+            return False
+        if float(evaluation.get("total_score", 0.0) or 0.0) < FACE_FRAMED_MIN_SCORE:
+            return False
+        for side in ("left", "right"):
+            visible = (evaluation.get(side) or {}).get("visible_ratio")
+            if not isinstance(visible, (int, float)) or visible < FACE_FRAMED_MIN_VISIBLE:
+                return False
+        return True
+
+    @staticmethod
+    def _face_jump_mm(evaluation: Optional[dict]) -> Optional[float]:
+        """
+        FACE-FAST: how far the carriage must move (mm, + = up) to bring the nose to the vertical centre: the nose
+        offset in frame heights times the mm one frame height covers at the face (FACE_HEIGHT_MM over the face box
+        height). None when the face or its box is not known in both cameras.
+        """
+        if not evaluation or not evaluation.get("both_detected") or evaluation.get("avg_nose_y") is None:
+            return None
+        heights = []
+        for side in ("left", "right"):
+            box = (evaluation.get(side) or {}).get("bbox_norm")
+            if not box or len(box) != 4 or not isinstance(box[3], (int, float)) or box[3] <= 0.05:
+                return None
+            heights.append(float(box[3]))
+        mm_per_frame = FACE_HEIGHT_MM / (sum(heights) / len(heights))
+        # Upright cameras: a nose below the centre (y > 0.5) means the cameras are too high, so the carriage goes down
+        return -FACE_JUMP_SIGN * (float(evaluation["avg_nose_y"]) - 0.5) * mm_per_frame
+
+    def _evaluate_face_here(self, analyzer: Any) -> dict:
+        frame_left, frame_right = self._fresh_face_frames()
+        evaluation = analyzer.evaluate_stereo_pair(frame_left, frame_right)
+        log.info("[Scanner Face | Z=%5.1f mm] Score: %4.2f | Nose Y: %s | both: %s", float(self.z_position_mm),
+                 float(evaluation.get("total_score", 0.0) or 0.0), evaluation.get("avg_nose_y"),
+                 evaluation.get("both_detected"))
+        return evaluation
+
+    def _fast_face_height(self, start_z: float, search_range_mm: float,
+                          analyzer: Any) -> Tuple[Optional[tuple], Optional[dict]]:
+        """
+        FACE-FAST, before the sweep: (1) the face is already framed at the prepared height: nothing moves; (2) a jump
+        computed from the nose position, checked on fresh frames, at most FACE_JUMP_ATTEMPTS times, inside the search
+        range. Returns (result, None) like `_search_face_height` when it framed the face; otherwise (None, the
+        evaluation at the start height when the carriage is still there, for the sweep to reuse). After failed jumps
+        the carriage is back at `start_z`.
+        """
+        evaluation = self._evaluate_face_here(analyzer)
+        if self._face_is_framed(evaluation):
+            log.info("[Scanner Face] The face is already framed at Z=%.1f mm: no height search.", start_z)
+            summary = {"face_detected": True, "both_cameras": True, "framing": "already_framed"}
+            return (start_z, float(evaluation.get("total_score", 0.0) or 0.0), evaluation, summary), None
+        first, moved = evaluation, False
+        top = min(start_z + search_range_mm, float(Z_TRAVEL_MAX_MM))
+        for attempt in range(FACE_JUMP_ATTEMPTS):
+            if self._cancel_applies():
+                raise ScannerError("Face scan cancelled during the framing.")
+            jump = self._face_jump_mm(evaluation)
+            if jump is None:
+                break
+            current = float(self.z_position_mm)
+            # Whole millimetres are whole Z steps; the jump stays inside the search range
+            target = float(min(max(round(current + jump), math.ceil(start_z)), math.floor(top)))
+            if abs(target - current) < 1.0:
+                break
+            log.info("[Scanner Face] Jump %d: %.1f mm -> %.1f mm (computed %+.1f mm from the nose position)",
+                     attempt + 1, current, target, jump)
+            self._face_go_to(target)
+            moved = True
+            evaluation = self._evaluate_face_here(analyzer)
+            if self._face_is_framed(evaluation):
+                summary = {"face_detected": True, "both_cameras": True, "framing": "jump"}
+                return (target, float(evaluation.get("total_score", 0.0) or 0.0), evaluation, summary), None
+        if moved:
+            log.info("[Scanner Face] The computed jump did not frame the face; sweeping from Z=%.1f mm.", start_z)
+            self._face_go_to(start_z)
+            return None, None
+        return None, first
+
     def _search_face_height(self, strategy: str, search_range_mm: float, step_mm: float,
-                            analyzer: Any) -> Tuple[float, Optional[float], Optional[dict], dict]:
+                            analyzer: Any, fast: bool = True) -> Tuple[float, Optional[float], Optional[dict], dict]:
         """
         Climbs from the prepared height through `search_range_mm`, scoring each stop on fresh preview frames, then goes
         to the best height (from below). Returns (best_z, best_score, evaluation at best_z, detection summary).
+
+        With `fast` (FACE-FAST) the face is first checked where it is and, if needed, a computed jump is tried
+        (`_fast_face_height`); the sweep runs only when that did not frame it. The summary says which way the height
+        was found (``framing``: ``already_framed``, ``jump`` or ``sweep``).
 
         The score of a stop is the framing score of `StereoFramingAnalyzer` (centering, size, cheek profile and the
         share of the face mesh inside the frame). When no camera ever saw a face, the photo is still taken at the start
         height and the summary says so (FACE-11: a warning, not an error).
         """
         start_z = float(self.z_position_mm)
+        pending = None
+        if fast:
+            found, pending = self._fast_face_height(start_z, search_range_mm, analyzer)
+            if found is not None:
+                return found
         max_z = start_z + search_range_mm
         best_score, best_z, best_eval = -1.0, start_z, None
         seen_any = seen_both = False
@@ -2386,8 +2774,11 @@ class Scanner:
             if self._cancel_applies():
                 raise ScannerError("Face scan cancelled during the framing sweep.")
             current_z = float(self.z_position_mm)
-            frame_left, frame_right = self._fresh_face_frames()
-            eval_res = analyzer.evaluate_stereo_pair(frame_left, frame_right)
+            if pending is not None:   # the start height was already evaluated by the fast check
+                eval_res, pending = pending, None
+            else:
+                frame_left, frame_right = self._fresh_face_frames()
+                eval_res = analyzer.evaluate_stereo_pair(frame_left, frame_right)
             score = float(eval_res.get("total_score", 0.0) or 0.0)
             avg_nose_y = eval_res.get("avg_nose_y")
             both = bool(eval_res.get("both_detected"))
@@ -2429,7 +2820,8 @@ class Scanner:
             # The top endstop stopped the last step somewhere: home is far, the best height is relative to the start
             raise ScannerError("The carriage position was lost at the top endstop during the face search.")
 
-        summary = {"face_detected": seen_any and best_score >= self.FACE_MIN_SCORE, "both_cameras": seen_both}
+        summary = {"face_detected": seen_any and best_score >= self.FACE_MIN_SCORE, "both_cameras": seen_both,
+                   "framing": "sweep"}
         if not summary["face_detected"]:
             best_z, best_eval = start_z, None
         if not direct_stop_hit:
@@ -2449,6 +2841,7 @@ class Scanner:
         z_delay: Optional[float] = None,
         reconstruct: bool = True,
         title: Optional[str] = None,
+        fast_framing: bool = True,
     ) -> dict:
         """
         Face capture, after a face prepare (`POST /scanner/face/prepare`: homing, climb to the start height, lights,
@@ -2465,7 +2858,11 @@ class Scanner:
            ends the scan in ERROR (state PROCESSING while it runs); the photos are kept and
            ``face_result.reconstruction_error`` says why.
 
-        The MediaPipe detector exists only during the search and is closed after it (FACE-14).
+        FACE-FAST: the MediaPipe detector is loaded in the background by the face prepare and serves the search and
+        the eye check; it is closed after the photo (FACE-14: not kept for the reconstruction). With ``fast_framing``
+        the search first checks the face where it is and tries a computed jump (`_fast_face_height`). The autofocus of
+        a face starts around the lens positions of the previous face (``autofocus_hint``, drivers with
+        ``supports_autofocus_hint``).
 
         :param strategy: ``sweep_best_score``, ``direct_stop`` or ``none``.
         :param search_range_mm: How far above the prepared height the search goes.
@@ -2478,7 +2875,8 @@ class Scanner:
         :param z_delay: Step delay of this capture's Z moves (None keeps the face prepare's value, FACE-19).
         :param reconstruct: Build the 3D face model on the Pi after the photo (FACE-20).
         :param title: Name of the face model in object.json (None = the job id).
-        :return: Dict with status, optimal_z_mm, best_score, face_detected, warning, photos and r2_uploaded.
+        :param fast_framing: FACE-FAST: no sweep when the face is already framed or a computed jump frames it.
+        :return: Dict with status, optimal_z_mm, best_score, face_detected, warning, photos, r2_uploaded and framing.
         :raises ScannerError: the face scan failed (the state is then ERROR).
         """
         if not begun:
@@ -2496,6 +2894,9 @@ class Scanner:
         face_detected: Optional[bool] = None
         warning: Optional[str] = None
         eyes_open: Optional[float] = None
+        framing: Optional[str] = None
+        # The detector preloaded by the face prepare (None: not loaded; one is built for the search if needed)
+        detector = self._take_face_detector()
 
         self._tls.automated = True
         try:
@@ -2520,16 +2921,16 @@ class Scanner:
                 elif strategy != "none":
                     if hasattr(self.dual_cameras, "_framing_active"):
                         self.dual_cameras._framing_active = True
-                    if analyzer is not None:
-                        _, best_score, best_eval, summary = self._search_face_height(
-                            strategy, search_range_mm, step_mm, analyzer)
-                    else:
+                    if analyzer is None:
                         from face_scan.core.framing_analyzer import StereoFramingAnalyzer
-                        from face_scan.face_scanner import FaceScanner
-                        with FaceScanner(num_faces=1) as detector:
-                            _, best_score, best_eval, summary = self._search_face_height(
-                                strategy, search_range_mm, step_mm, StereoFramingAnalyzer(detector))
+                        if detector is None:
+                            from face_scan.face_scanner import FaceScanner
+                            detector = FaceScanner(num_faces=1)
+                        analyzer = StereoFramingAnalyzer(detector)
+                    _, best_score, best_eval, summary = self._search_face_height(
+                        strategy, search_range_mm, step_mm, analyzer, fast=fast_framing)
                     face_detected = summary["face_detected"]
+                    framing = summary.get("framing")
                     if not face_detected:
                         warning = ("No face was found in the search range; the photo was taken at the start height. "
                                    "Check the subject's height against the prepared start height and search range.")
@@ -2549,8 +2950,14 @@ class Scanner:
                 roi = self._face_af_roi(best_eval)
                 if roi is not None:
                     lock_kwargs["autofocus_roi"] = roi
+                auto_focus = str(lock_kwargs.get("focus", "")).strip().lower() == "auto"
+                if auto_focus and self._face_af_positions \
+                        and getattr(self.dual_cameras, "supports_autofocus_hint", False) is True:
+                    lock_kwargs["autofocus_hint"] = tuple(self._face_af_positions)
                 self._sound("hold_still")
                 self._lock_cameras(lock_kwargs, copy_colour_gains, f"face at Z={target_z:g} mm")
+                if auto_focus:
+                    self._remember_face_focus()
 
                 # Stabilization pause (a cancel ends it at once). With a buzzer it is also the "eyes open" warning:
                 # the countdown plays and the photo follows FACE_PHOTO_WARNING_S after it starts.
@@ -2571,7 +2978,7 @@ class Scanner:
                 stem = f"f_{int(round(target_z))}"
                 log.info("[Scanner Face] Capturing %d stereo pair(s) at Z=%.1f mm with prefix %s...",
                          FACE_BURST_SHOTS, target_z, stem)
-                paths, eyes_open = self._capture_face_burst(images_dir, stem)
+                paths, eyes_open = self._capture_face_burst(images_dir, stem, detector)
                 if eyes_open is not None and eyes_open < FACE_EYES_OPEN_MIN:
                     eyes_warning = (f"The eyes may be closed in the photo (openness {eyes_open:.2f}); "
                                     "take it again if the model looks wrong.")
@@ -2604,6 +3011,8 @@ class Scanner:
                 raise ScannerError(message)
         finally:
             self._tls.automated = False
+            if detector is not None:   # FACE-14: never kept for the reconstruction
+                self._close_face_detector(detector)
             if hasattr(self.dual_cameras, "_framing_active"):
                 self.dual_cameras._framing_active = False
             completed = scan_ok and not self._cancel_event.is_set()
@@ -2621,7 +3030,7 @@ class Scanner:
                 "best_score": float(best_score) if best_score is not None and best_score >= 0 else None,
                 "face_detected": face_detected, "warning": warning,
                 "photos": list(paths), "r2_uploaded": uploaded,
-                "eyes_open": eyes_open,
+                "eyes_open": eyes_open, "framing": framing,
             }
 
         if self._cancel_event.is_set() or not scan_ok:
@@ -2641,7 +3050,7 @@ class Scanner:
         def publish() -> None:
             self.face_result = {k: result.get(k) for k in
                                 ("optimal_z_mm", "best_score", "face_detected", "warning", "photos", "r2_uploaded",
-                                 "eyes_open", "result_id", "metrics", "reconstruction_error")}
+                                 "eyes_open", "framing", "result_id", "metrics", "reconstruction_error")}
 
         if reconstruct:
             # The rig is free (motors, lights and cameras are off): the run is now PROCESSING until the model is saved
@@ -2668,6 +3077,13 @@ class Scanner:
             if self.state in (ScannerState.RUNNING, ScannerState.PROCESSING):
                 self.state = finish_state
         return result
+
+    def _remember_face_focus(self) -> None:
+        """FACE-FAST: keeps the lens positions of this face's autofocus as the hint of the next face capture."""
+        positions = getattr(self.dual_cameras, "autofocus_positions", None)
+        if isinstance(positions, (list, tuple)) and len(positions) == 2 \
+                and all(isinstance(p, int) and not isinstance(p, bool) for p in positions):
+            self._face_af_positions = list(positions)
 
     def _reconstruct_face(self, paths: list, title: Optional[str] = None) -> dict:
         """
@@ -2824,6 +3240,7 @@ class Scanner:
 
             # 4. Shut down cameras if running
             self._close_cameras()
+            self._release_face_detector()
 
             # 5. Final STOP: catches a move a straggler thread managed to start while the above was running
             for name, motor in motors:
@@ -2858,6 +3275,7 @@ class Scanner:
 
     def _teardown_hardware(self) -> None:
         """Releases motors, lights and cameras (every step exception-safe). Does not touch the state."""
+        self._release_face_detector()
         self._try_step("turntable stop", self.turntable_motor.stop, release_torque=True)
         self._try_step("z stop", self.z_axis_motor.stop, release_torque=True)
         self._try_step("lights unlock_brightness", self.lights.unlock_brightness)

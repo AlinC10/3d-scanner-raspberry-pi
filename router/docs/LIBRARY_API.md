@@ -98,7 +98,7 @@ An object scan without `cloud.title` and a face capture without `title` are name
 
 ## Scan photos
 
-The photos an object was built from are copied into `results/<id>/photos/rig/0|1/` (with `manifest.json`) once the model
+The photos an object was built from are copied into `results/<id>/photos/rig/0|1/` (with `manifest.json`; the second side of a flip scan into `results/<id>/photos/session_1/rig/0|1/`) once the model
 is saved. They are not served by the API and not part of the USB export.
 
 ## USB export
@@ -138,3 +138,29 @@ no byte progress (OBEX push does not report it): show a spinner while `sending`.
 ### `POST /library/usb/eject`
 
 Safe removal: unmounts every partition of the stick and powers it off (`udisksctl power-off`). Body optional `{"device": "/dev/sda1"}` (default: the first stick). `200` `{"device": "/dev/sda1", "disk": "/dev/sda", "powered_off": true, "safe_to_remove": true}` (`powered_off: false`: unmounted only, still safe to pull out); `503` no stick, `409` an export is running, `500` it could not be unmounted. The export already unmounts the stick when it ends; use this as the "Eject" button (or after the stick was mounted some other way).
+
+## Download on a phone with a QR code (`/library/.../export/qr`)
+
+The object's archive `<id>.zip` (the model files: obj, glb, stl, 3mf, and object.json) is uploaded to a Cloudflare R2 bucket used only
+for exports (`R2_EXPORT_BUCKET`, default `scanner-exports`) and a signed download link valid for 24 h is made. The phone
+scans the QR code and downloads from Cloudflare directly (Wi-Fi or mobile data); nothing on the Pi is opened to the
+network.
+
+1. `POST /library/objects/{id}/export/qr` (no body) → `202` + the status. `404` unknown object, `409` an export is
+   running, `503` Cloudflare R2 is not configured on the Pi, `400` the object has no model files.
+2. Poll `GET /library/export/qr/status` every second:
+   ```json
+   {"state": "uploading", "object_id": "20261027-202750-21d2de", "archive": "20261027-202750-21d2de.zip",
+    "url": null, "expires_at": null, "bytes_total": 52428800, "bytes_done": 10485760, "reused": false, "error": null,
+    "started_at": 1761990000.0, "finished_at": null}
+   ```
+   `state`: `idle` → `archiving` → `uploading` → `done` (or `error` with `error`). Progress bar from
+   `bytes_done / bytes_total` (archiving, then uploading). At `done`: `url` (the link) and `expires_at` (Unix time).
+   `expired` (and `url: null`) once the link is past its 24 h. `reused: true` when the same models were already
+   uploaded: only a new link was made, `done` comes at once.
+3. Show the QR code: `<img src="/library/export/qr/image.svg">` (SVG made on the Pi; `?scale=2..20`, default 8).
+   `404` when no link is ready, `503` when the QR library is missing on the Pi. Optionally show `url` as text too.
+
+The archive stays in the bucket until the bucket's lifecycle rule deletes it (1 day); a new export of the same object
+reuses it. One export at a time (USB, Bluetooth and QR exports are separate; `DELETE` of the object answers `409`
+while its QR export runs).

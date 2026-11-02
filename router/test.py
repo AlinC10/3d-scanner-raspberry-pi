@@ -67,7 +67,7 @@ class MotorTarget(str, Enum):
 from schemas.scanner import ZMoveRequest, TurntableRotateRequest
 
 # The sounds the scanner plays (hardware/buzzer.py PATTERNS; tests check that both lists are the same)
-BuzzerPattern = Literal["ready", "start", "hold_still", "photo_countdown", "success", "error"]
+BuzzerPattern = Literal["ready", "start", "hold_still", "photo_countdown", "flip", "success", "error"]
 
 
 class BuzzerPlayRequest(BaseModel):

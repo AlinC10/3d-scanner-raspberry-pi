@@ -300,7 +300,7 @@ The scanner needs a network connection to upload photos. A single status panel s
 
 ### 10.1 Rules during a scan
 
-While the scanner is preparing, running, processing, downloading or still uploading, these actions are **blocked** and report that the scanner is busy: Wi-Fi scan, switch on/off, connect and forget; Bluetooth scan, switch on/off, connect and send file; Ethernet connect. Reading the status is always allowed.
+While the scanner is preparing, running, waiting for the object to be turned over, processing, downloading or still uploading, these actions are **blocked** and report that the scanner is busy: Wi-Fi scan, switch on/off, connect and forget; Bluetooth scan, switch on/off, connect and send file; Ethernet connect. Reading the status is always allowed.
 
 ### 10.2 Ethernet
 
