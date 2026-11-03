@@ -1,29 +1,5 @@
 # Automated 3D Scanner - Comprehensive User Manual
 
-
-## Table of contents
-
-1. [System overview](#1-system-overview)
-2. [Safety and ground rules](#2-safety-and-ground-rules)
-3. [Hardware environment and object placement](#3-hardware-environment-and-object-placement)
-4. [Quick start: your first object scan](#4-quick-start-your-first-object-scan)
-5. [Preparation and acquisition phase in detail](#5-preparation-and-acquisition-phase-in-detail)
-6. [Scan settings explained](#6-scan-settings-explained)
-7. [Face scan](#7-face-scan)
-8. [Cloud processing and asset delivery](#8-cloud-processing-and-asset-delivery)
-9. [The Library](#9-the-library)
-10. [Network, Wi-Fi and Bluetooth](#10-network-wi-fi-and-bluetooth)
-11. [AI assistant](#11-ai-assistant)
-12. [Service and calibration tools](#12-service-and-calibration-tools)
-13. [Understanding the status screen](#13-understanding-the-status-screen)
-14. [Troubleshooting](#14-troubleshooting)
-15. [Tips for better scans](#15-tips-for-better-scans)
-16. [Technical specifications at a glance](#16-technical-specifications-at-a-glance)
-17. [Glossary](#17-glossary)
-18. [Known limitations and open points](#18-known-limitations-and-open-points)
-
----
-
 ## 1. System Overview
 
 The automated 3D scanner is an advanced, edge-to-cloud photogrammetric device designed to acquire geometrically complete and photometrically consistent image sets without operator intervention. It uses an elastic cloud computing model: the heavy photogrammetric reconstruction runs on remote, dynamically provisioned GPU instances instead of an expensive local workstation. The entire system is operated autonomously through an integrated **11.6" capacitive touchscreen** Human-Machine Interface (HMI) with an HDMI and USB touch interface.

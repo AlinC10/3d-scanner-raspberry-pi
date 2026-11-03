@@ -1,29 +1,5 @@
 # Automated 3D Scanner - Technical Documentation
 
-
-## Table of contents
-
-1. [System overview](#1-system-overview)
-2. [Hardware architecture](#2-hardware-architecture)
-3. [Electro-mechanical and kinematic systems](#3-electro-mechanical-and-kinematic-systems)
-4. [Vision and synchronization](#4-vision-and-synchronization)
-5. [Active illumination and sensing](#5-active-illumination-and-sensing)
-6. [Automated photometric stabilization](#6-automated-photometric-stabilization)
-7. [Edge software: state machine and scan modes](#7-edge-software-state-machine-and-scan-modes)
-8. [REST API reference](#8-rest-api-reference)
-9. [Cloud orchestration and photogrammetry](#9-cloud-orchestration-and-photogrammetry)
-10. [Outputs and model library](#10-outputs-and-model-library)
-11. [Network and system management](#11-network-and-system-management)
-12. [AI assistant](#12-ai-assistant)
-13. [Manual hardware tests and calibration](#13-manual-hardware-tests-and-calibration)
-14. [Front-end integration guide](#14-front-end-integration-guide)
-15. [Reliability, safety and error handling](#15-reliability-safety-and-error-handling)
-16. [Key figures and formulas](#16-key-figures-and-formulas)
-17. [Known limitations, planned work, open points](#17-known-limitations-planned-work-open-points)
-18. [Change log](#18-change-log)
-
----
-
 ## 1. System overview
 
 The scanner is a hybrid **edge-to-cloud Internet of Things (IoT)** system. Local acquisition hardware (turntable, Z carriage, two cameras, lights, sensors) is decoupled from the compute-intensive photogrammetric reconstruction, which runs on ephemeral cloud GPUs.
