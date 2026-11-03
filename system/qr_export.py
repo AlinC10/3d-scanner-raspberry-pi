@@ -27,8 +27,11 @@ log = logging.getLogger(__name__)
 
 EXPORT_BUCKET_ENV = "R2_EXPORT_BUCKET"
 DEFAULT_EXPORT_BUCKET = "scanner-exports"
-# Validity of a download link; R2 accepts at most 7 days for a signed URL
-LINK_TTL_S = min(float(os.environ.get("EXPORT_LINK_TTL_S", str(24 * 3600))), 7 * 24 * 3600.0)
+# Validity of a download link; R2 accepts at most 7 days for a signed URL (default 1 h)
+def link_ttl_s() -> float:
+    return min(float(os.environ.get("EXPORT_LINK_TTL_S", str(3600))), 7 * 24 * 3600.0)
+
+LINK_TTL_S = link_ttl_s()
 RUNNING_STATES = ("archiving", "uploading")
 
 
@@ -123,6 +126,21 @@ def _is_missing(error: Exception) -> bool:
     return code in ("404", "NoSuchBucket", "NoSuchKey", "NotFound")
 
 
+def _schedule_auto_delete(client, bucket: str, key: str, delay_s: float) -> None:
+    """Schedules the deletion of an export archive after its download link expires."""
+    def _delete():
+        try:
+            client.delete_object(Bucket=bucket, Key=key)
+            log.info("[QR export] Auto-deleted expired archive %s/%s after %.0f seconds.", bucket, key, delay_s)
+        except Exception as e:
+            log.warning("[QR export] Could not auto-delete expired archive %s/%s: %s", bucket, key, e)
+
+    t = threading.Timer(max(0.01, float(delay_s)), _delete)
+    t.daemon = True
+    t.name = f"qr-expire-{key}"
+    t.start()
+
+
 def ensure_bucket(client, bucket: str) -> None:
     """
     Makes sure the export bucket exists: created when missing (needs an R2 key with "Admin Read & Write").
@@ -133,6 +151,12 @@ def ensure_bucket(client, bucket: str) -> None:
         client.head_bucket(Bucket=bucket)
         return
     except Exception as e:
+        code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
+        # Cloudflare R2 returns 403 on HeadBucket for tokens with "Object Read & Write"
+        # (normal for non-admin tokens). If the bucket exists, object operations will succeed.
+        if code in ("403", "AccessDenied", "Forbidden"):
+            log.info("[QR export] HeadBucket returned %s (expected for R2 Object Read & Write tokens); proceeding directly to object operations.", code)
+            return
         if not _is_missing(e):
             raise QrExportError(f"The R2 key has no access to the export bucket {bucket!r} ({e}); give the key "
                                 f"access to it in the Cloudflare dashboard.") from e
@@ -176,12 +200,14 @@ def _export(client, folder: Path, files: list[tuple[Path, str]]) -> None:
 
             client.upload_file(str(part), bucket, key, Callback=progress,
                                ExtraArgs={"ContentType": "application/zip", "Metadata": {"fingerprint": fp}})
+        ttl = link_ttl_s()
         url = client.generate_presigned_url(
-            "get_object", ExpiresIn=int(LINK_TTL_S),
+            "get_object", ExpiresIn=int(ttl),
             Params={"Bucket": bucket, "Key": key, "ResponseContentDisposition": f'attachment; filename="{key}"'},
         )
-        _set(state="done", url=url, expires_at=time.time() + LINK_TTL_S, reused=reused, finished_at=time.time())
-        log.info("[QR export] %s ready in %s/%s (%s).", name, bucket, key, "reused" if reused else "uploaded")
+        _set(state="done", url=url, expires_at=time.time() + ttl, reused=reused, finished_at=time.time())
+        log.info("[QR export] %s ready in %s/%s (%s, valid %.0fs).", name, bucket, key, "reused" if reused else "uploaded", ttl)
+        _schedule_auto_delete(client, bucket, key, ttl)
     except Exception as e:
         log.error("[QR export] Export of %s failed: %s", name, e)
         _set(state="error", error=str(e), finished_at=time.time())

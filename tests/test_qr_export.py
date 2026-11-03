@@ -57,6 +57,9 @@ class FakeS3:
     def generate_presigned_url(self, op, Params, ExpiresIn):
         return f"https://r2.example/{Params['Bucket']}/{Params['Key']}?expires={ExpiresIn}"
 
+    def delete_object(self, Bucket, Key):
+        self.objects.pop((Bucket, Key), None)
+
 
 class QrExportTest(unittest.TestCase):
     def setUp(self):
@@ -83,7 +86,7 @@ class QrExportTest(unittest.TestCase):
         status = self.run_export(s3)
         self.assertEqual(status["state"], "done")
         self.assertTrue(status["url"].startswith("https://r2.example/scanner-exports/20261101-120000-abcdef.zip"))
-        self.assertGreater(status["expires_at"], time.time() + 23 * 3600)
+        self.assertGreater(status["expires_at"], time.time() + 3500)
         data = s3.objects[("scanner-exports", "20261101-120000-abcdef.zip")]["data"]
         with zipfile.ZipFile(__import__("io").BytesIO(data)) as zf:
             names = sorted(zf.namelist())
@@ -128,6 +131,23 @@ class QrExportTest(unittest.TestCase):
         self.qr._status.update(state="uploading", object_id="x")
         with self.assertRaises(self.qr.QrExportBusyError):
             self.qr.start_export(self.folder, client_factory=FakeS3, files_fn=self.usb.export_files)
+
+    def test_head_bucket_403_proceeds_to_object_operations(self):
+        class NonAdminS3(FakeS3):
+            def head_bucket(self, Bucket):
+                raise FakeError("403")
+
+        s3 = NonAdminS3()
+        status = self.run_export(s3)
+        self.assertEqual(status["state"], "done")
+        self.assertIn(("scanner-exports", "20261101-120000-abcdef.zip"), s3.objects)
+
+    def test_auto_delete_removes_archive(self):
+        s3 = FakeS3()
+        s3.objects[("scanner-exports", "test.zip")] = {"data": b"123", "meta": {}}
+        self.qr._schedule_auto_delete(s3, "scanner-exports", "test.zip", 0.05)
+        time.sleep(0.12)
+        self.assertNotIn(("scanner-exports", "test.zip"), s3.objects)
 
     def test_expired_link_is_not_offered(self):
         self.qr._status.update(state="done", url="https://x", expires_at=time.time() - 1)
