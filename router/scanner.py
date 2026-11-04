@@ -383,11 +383,7 @@ def _cloud_stage_body(cloud_job, options: dict, job_id: str) -> None:
 
     job_rec = jobs_manager.get_job(job_id) if hasattr(jobs_manager, "get_job") else None
     job_cancel = getattr(job_rec, "cancel_event", None)
-    active_cancel = getattr(scanner, "_cancel_event", None)
-    events = [active_cancel]
-    if isinstance(job_cancel, threading.Event):
-        events.append(job_cancel)
-    cancel_ev = cloud_job.AnyEvent(*events) if hasattr(cloud_job, "AnyEvent") else active_cancel
+    cancel_ev = job_cancel if isinstance(job_cancel, threading.Event) else None
 
     job_img_dir = Path("input_images") / job_id / "rig"
     retry_img_dir = Path(_cloud_retry.get("images_dir") or "") if _cloud_retry else None
@@ -527,8 +523,7 @@ class _StreamCloudStage:
         _progress, _phase = _cloud_callbacks(self.job_id)
         job_rec = jobs_manager.get_job(self.job_id) if hasattr(jobs_manager, "get_job") else None
         job_cancel = getattr(job_rec, "cancel_event", None)
-        active_cancel = getattr(scanner, "_cancel_event", None)
-        events = [active_cancel, self.abort]
+        events = [self.abort]
         if isinstance(job_cancel, threading.Event):
             events.append(job_cancel)
         cancel_ev = self.cloud_job.AnyEvent(*events) if hasattr(self.cloud_job, "AnyEvent") else self.abort

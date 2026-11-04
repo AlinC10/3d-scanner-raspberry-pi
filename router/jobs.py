@@ -65,7 +65,15 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
 
     try:
         from router.scanner import scanner
-        if getattr(scanner, "job_id", None) == job_id:
+        active_rig_states = {"preparing", "prepared", "running", "awaiting_flip"}
+        is_active_on_rig = (
+            getattr(scanner, "job_id", None) == job_id
+            and (
+                getattr(scanner, "state", None) in active_rig_states
+                or getattr(scanner, "is_moving", False)
+            )
+        )
+        if is_active_on_rig:
             scanner.emergency_stop()
     except Exception as e:
         log.warning("Could not stop active scanner for cancelled job %s: %s", job_id, e)

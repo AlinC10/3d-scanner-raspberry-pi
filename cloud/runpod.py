@@ -199,14 +199,26 @@ def terminate_pod_reliably(client: RunPodClient, pod_id: str) -> bool:
 SCANNER_POD_PREFIX = "turntable-pi-"
 
 
-def terminate_stale_pods(client: RunPodClient, name_prefix: str = SCANNER_POD_PREFIX, keep: tuple = ()) -> List[str]:
+def terminate_stale_pods(
+    client: RunPodClient,
+    name_prefix: str = SCANNER_POD_PREFIX,
+    keep: tuple = (),
+    keep_job_ids: tuple = (),
+) -> List[str]:
     """
     Terminates every pod of the account whose name starts with `name_prefix` (pods of earlier jobs left alive by a
     crash, a power cut or a lost termination). Called before a new job starts a pod, so at most one job's pod bills.
     Returns the ids it terminated; raises RunPodError when the pods cannot be listed or one cannot be terminated.
     """
-    stale = [p.get("id") for p in client.list_pods()
-             if str(p.get("name") or "").startswith(name_prefix) and p.get("id") and p.get("id") not in keep]
+    keep_set = set(keep or ())
+    keep_names = {f"{name_prefix}{jid}" for jid in (keep_job_ids or ())}
+    stale = [
+        p.get("id") for p in client.list_pods()
+        if str(p.get("name") or "").startswith(name_prefix)
+        and p.get("id")
+        and p.get("id") not in keep_set
+        and str(p.get("name") or "") not in keep_names
+    ]
     failed = [pod_id for pod_id in stale if not terminate_pod_reliably(client, pod_id)]
     if failed:
         raise RunPodError(f"Old pod(s) could not be terminated: {', '.join(failed)}")

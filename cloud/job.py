@@ -368,10 +368,14 @@ def run_cloud_job(
     rp_client = rp.RunPodClient()
     if terminate_old_pods:
         keep_pods = tuple(active_pod_ids or ())
+        keep_jids = tuple(active_job_ids or ())
         try:
-            old_pods = rp.terminate_stale_pods(rp_client, keep=keep_pods)
+            old_pods = rp.terminate_stale_pods(rp_client, keep=keep_pods, keep_job_ids=keep_jids)
         except TypeError:
-            old_pods = rp.terminate_stale_pods(rp_client)
+            try:
+                old_pods = rp.terminate_stale_pods(rp_client, keep=keep_pods)
+            except TypeError:
+                old_pods = rp.terminate_stale_pods(rp_client)
         if old_pods:
             say(f"Terminated {len(old_pods)} pod(s) left by older jobs: {', '.join(old_pods)}")
 
