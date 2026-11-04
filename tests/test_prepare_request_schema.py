@@ -66,7 +66,7 @@ out = {
     "focus": {k: focus(v) for k, v in {
         "int": 300, "low": -5, "high": 5000, "zero": 0, "max": 1023,
         "pair": [10, 20], "pair_tuple": (30, 40), "pair_clamped": [-1, 2000],
-        "null": None, "null_pair": [None, None], "auto": "auto",
+        "null": None, "null_pair": [None, None], "auto": "auto", "optim": "optim",
         "word": "near", "one": [1], "three": [1, 2, 3], "empty": [], "half_null": [300, None], "bool": True,
         "whole_float": 300.0, "fraction": 300.5,
     }.items()},
@@ -112,7 +112,7 @@ class PrepareRequestSchemaTest(unittest.TestCase):
         self.assertTrue(sw["in_openapi"])
         cam = sw["prepare"]["example"]["camera_config"]
         # defaults of the schema are shown; the fields that default to null are left out, not shown as 0
-        self.assertEqual((cam["quality"], cam["focus"], cam["photo_resolution"], cam["settle_time"]), (95, "auto", [4056, 3040], 2.0))
+        self.assertEqual((cam["quality"], cam["focus"], cam["photo_resolution"], cam["settle_time"]), (95, "optim", [4056, 3040], 2.0))
         self.assertEqual(sw["prepare"]["example"]["z_start_mm"], 30.0)
         for null_default in ("exposure_time", "analogue_gain", "colour_gains", "brightness", "contrast", "saturation", "sharpness"):
             self.assertNotIn(null_default, cam)
@@ -146,9 +146,9 @@ class PrepareRequestSchemaTest(unittest.TestCase):
         self.assertIs(self.r["default_copy_colour_gains"], False)
         self.assertIs(self.r["copy_colour_gains_true"], True)
 
-    def test_focus_defaults_to_auto(self):
-        self.assertEqual(self.r["default_focus"], "auto")
-        self.assertEqual(self.r["prepare_only_led"], "auto")
+    def test_focus_defaults_to_optim(self):
+        self.assertEqual(self.r["default_focus"], "optim")
+        self.assertEqual(self.r["prepare_only_led"], "optim")
 
     def test_integer_focus_is_kept_and_clamped_to_the_vcm_range(self):
         self.assertEqual(self.focus["int"]["value"], 300)
@@ -175,6 +175,7 @@ class PrepareRequestSchemaTest(unittest.TestCase):
 
     def test_auto_is_accepted_other_words_booleans_and_fractions_are_not(self):
         self.assertEqual(self.focus["auto"]["value"], "auto")
+        self.assertEqual(self.focus["optim"]["value"], "optim")
         for name in ("word", "bool", "fraction"):
             self.assertFalse(self.focus[name]["ok"], name)
 
@@ -182,7 +183,7 @@ class PrepareRequestSchemaTest(unittest.TestCase):
         defaults = self.r["prepare_without_camera_config"]
         self.assertEqual(defaults["quality"], 95)
         self.assertEqual(defaults["photo_resolution"], [4056, 3040])
-        self.assertEqual(defaults["focus"], "auto")
+        self.assertEqual(defaults["focus"], "optim")
         self.assertEqual(defaults["awb_mode"], "auto")
         self.assertIsNone(defaults["exposure_time"])
         partial = self.r["partial_camera_config"]

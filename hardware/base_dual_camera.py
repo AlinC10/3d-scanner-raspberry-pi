@@ -348,6 +348,9 @@ class BaseDualCamera(ABC):
         """
         k = kwargs.copy()
         focus_val = k.pop("focus", None)
+        if isinstance(focus_val, str) and focus_val.strip().lower() in ("optim", "optimal"):
+            from hardware.camera.config import get_optimal_focus
+            focus_val = get_optimal_focus(k.get("scan_mode"))
         rotation_val = k.pop("rotation", None)
         kw1, kw2 = k.copy(), k.copy()
         if isinstance(focus_val, (tuple, list)) and len(focus_val) == 2:

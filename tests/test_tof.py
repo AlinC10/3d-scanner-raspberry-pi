@@ -94,9 +94,20 @@ class ToFSensorTests(unittest.TestCase):
         tof, fake = make_sensor()
         names = [e[1] for e in fake.events if e[0] == "set"]
         self.assertEqual(names, ["distance_mode", "timing_budget", "roi_xy", "roi_center"])
-        self.assertLess(fake.events.index(("set", "roi_center", 199)), fake.events.index(("start_ranging",)))
-        self.assertIn(("set", "roi_xy", (4, 4)), fake.events)
+        self.assertLess(fake.events.index(("set", "roi_center", tof._settings[2])), fake.events.index(("start_ranging",)))
+        self.assertIn(("set", "roi_xy", (8, 4)), fake.events)
         self.assertIn(("set", "timing_budget", 200), fake.events)
+        self.assertEqual(tof._settings[2], 196)  # downward center by default
+
+    def test_roi_center_respects_env_override(self):
+        with patch.dict(os.environ, {"TOF_ROI_CENTER": "61"}):
+            tof, fake = make_sensor()
+            self.assertEqual(tof._settings[2], 61)
+
+    def test_roi_size_respects_env_override(self):
+        with patch.dict(os.environ, {"TOF_ROI_SIZE": "4,4"}):
+            tof, fake = make_sensor()
+            self.assertEqual(tof._settings[1], (4, 4))
 
     def test_constructor_failure_leaves_sensor_unavailable(self):
         class Broken:

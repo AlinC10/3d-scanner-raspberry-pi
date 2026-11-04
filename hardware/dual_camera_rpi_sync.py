@@ -735,9 +735,12 @@ class DualCameraRPISync(BaseDualCamera):
 
         kw1, kw2 = self._split_camera_kwargs(kwargs)
         focus_arg = kwargs.get("focus")
+        if isinstance(focus_arg, str) and focus_arg.strip().lower() in ("optim", "optimal"):
+            from hardware.camera.config import get_optimal_focus
+            focus_arg = get_optimal_focus(kwargs.get("scan_mode"))
         auto_focus = isinstance(focus_arg, str)
         if auto_focus and focus_arg.strip().lower() != "auto":
-            raise ValueError(f"focus must be an integer position, a pair of them or 'auto' (got {focus_arg!r})")
+            raise ValueError(f"focus must be an integer position, a pair of them, 'auto' or 'optim' (got {focus_arg!r})")
         if focus_arg is not None and not auto_focus:
             self.focus_set(focus_arg)
         else:

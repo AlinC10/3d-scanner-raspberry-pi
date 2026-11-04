@@ -505,9 +505,14 @@ class ArducamIMX477:
         if settle_time < 0:
             raise ValueError("settle_time must be non-negative")
         if not isinstance(focus, (type(None), int, str)):
-            raise TypeError("focus must be None, an integer, or 'auto'")
-        if isinstance(focus, str) and focus.lower() != "auto":
-            raise ValueError("focus string must be 'auto'")
+            raise TypeError("focus must be None, an integer, 'auto', or 'optim'")
+        if isinstance(focus, str):
+            norm = focus.strip().lower()
+            if norm in ("optim", "optimal"):
+                from hardware.camera.config import get_optimal_focus
+                focus = get_optimal_focus()[0]
+            elif norm != "auto":
+                raise ValueError("focus string must be 'auto' or 'optim'")
         if quality is not None:
             self.quality = quality
         if photo_resolution is not None:

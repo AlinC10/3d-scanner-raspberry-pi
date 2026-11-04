@@ -1,10 +1,28 @@
 import math
+import os
 import time
 import logging
 import threading
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# Default SPAD array window: 8x4 (8 columns horizontal ~20 deg FOV, 4 rows vertical ~15 deg FOV)
+# with center downward (196 = Row 4, Col 8 on the SPAD array, which angles the cone downwards
+# physically due to optical lens inversion per ST AN5191).
+def _parse_roi_size(env_val: Optional[str], default: tuple[int, int] = (8, 4)) -> tuple[int, int]:
+    if not env_val:
+        return default
+    try:
+        parts = [int(p.strip()) for p in env_val.replace("x", ",").split(",") if p.strip()]
+        if len(parts) == 2 and 4 <= parts[0] <= 16 and 4 <= parts[1] <= 16:
+            return (parts[0], parts[1])
+    except Exception:
+        pass
+    return default
+
+DEFAULT_ROI_SIZE: tuple[int, int] = _parse_roi_size(os.environ.get("TOF_ROI_SIZE", "8,4"))
+DEFAULT_ROI_CENTER: int = int(os.environ.get("TOF_ROI_CENTER", "196"))
 
 # The Pi-only libraries are imported defensively: a missing library (or Blinka refusing to run on a
 # non-Pi platform) must disable the sensor, not make `import hardware.scanner` fail.
@@ -20,12 +38,16 @@ except Exception as _e:  # ImportError, or a platform error raised by Blinka
 
 class ToFSensor:
     def __init__(self, timing_budget_ms: int = 200, distance_mode: int = 1,
-                 roi_size: tuple[int, int] = (4, 4), roi_center: int = 199):
+                 roi_size: tuple[int, int] = DEFAULT_ROI_SIZE,
+                 roi_center: int = DEFAULT_ROI_CENTER):
         """
         :param timing_budget_ms: One of 15 (short mode only), 20, 33, 50, 100, 200, 500.
         :param distance_mode: 1 = short (up to ~136 cm), 2 = long (up to ~360 cm).
         :param roi_size: (x, y) SPAD window, 4..16. Smaller means a narrower cone and less signal.
-        :param roi_center: SPAD index of the window centre (199 = optical centre of the array).
+        :param roi_center: SPAD index of the window centre. Default 196 (Row 4, Col 8 on SPAD array,
+            which angles the cone downwards by ~5-6 deg to detect the top of small objects cleanly,
+            accounting for optical lens inversion per ST AN5191; optical center is 199, inverted PCB mounting is 61).
+            Configurable via TOF_ROI_CENTER environment variable.
         """
         self.available = False
         self._timing_budget_ms = timing_budget_ms

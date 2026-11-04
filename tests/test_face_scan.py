@@ -83,7 +83,7 @@ class TestFaceScanSchemas(unittest.TestCase):
             "enable_stream": True, "illumination_brightness": 0.5, "start_z_mm": 180.0, "upload_r2": False,
             "z_delay": 0.005,
         })
-        self.assertEqual(self.r["prepare_focus"], "auto")
+        self.assertEqual(self.r["prepare_focus"], "optim")
 
     def test_capture_validation(self):
         self.assertTrue(self.r["strategy_none"])
@@ -431,6 +431,22 @@ class TestFaceScanScanner(unittest.TestCase):
             self.assertIs(call.kwargs.get("strict"), True)
         for call in up.call_args_list + down.call_args_list:
             self.assertIs(call.kwargs.get("acceleration"), False, call)
+
+    def test_face_scan_with_focus_optim_locks_calibrated_focus(self):
+        from hardware.camera.config import OPTIMAL_FOCUS_FACE
+        scanner = self._scanner(focus="optim")
+        analyzer = MagicMock()
+        analyzer.evaluate_stereo_pair.return_value = {
+            "total_score": 0.8, "both_detected": True, "any_detected": True,
+            "avg_nose_y": 0.5, "face_detected": True,
+            "best_detection": {"cam0": {"box": (0.1, 0.2, 0.3, 0.4)}, "cam1": {"box": (0.1, 0.2, 0.3, 0.4)}},
+        }
+        with patch.object(scanner, "move_z_up_distance", return_value=True), \
+                patch.object(scanner, "move_z_down_distance", return_value=True):
+            result, _ = self._run(scanner, analyzer=analyzer)
+        self.assertEqual(result["status"], "success")
+        lock = scanner.cams.prepare_scan.call_args.kwargs
+        self.assertEqual(lock["focus"], OPTIMAL_FOCUS_FACE)
 
     def test_no_face_is_a_warning_and_the_photo_is_taken_at_the_start_height(self):
         # FACE-11: not an error; best_score null instead of 0.0

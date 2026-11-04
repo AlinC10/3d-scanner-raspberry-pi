@@ -970,6 +970,24 @@ class TestToFPolicy(ScannerTestCase):
         self.assertIs(self.slice(check_tof=False), False)
         self.s.tof.probe_object.assert_not_called()
 
+    def test_potential_last_level_notified_on_shot_0_when_no_object(self):
+        called = []
+        self.probe_results([False] * 20)
+        self.s._capture_turntable_slice(
+            images_dir=self.s.images_dir, angle=18.0, steps=160, delay_turntable=0.001,
+            check_tof=True, on_potential_last_level=lambda lvl: called.append(lvl),
+        )
+        self.assertEqual(called, [self.s._level])
+
+    def test_potential_last_level_not_notified_when_object_seen_on_shot_0(self):
+        called = []
+        self.probe_results([True] + [False] * 19)
+        self.s._capture_turntable_slice(
+            images_dir=self.s.images_dir, angle=18.0, steps=160, delay_turntable=0.001,
+            check_tof=True, on_potential_last_level=lambda lvl: called.append(lvl),
+        )
+        self.assertEqual(called, [])
+
     def test_valid_backdrop_ends_the_scan_early_and_reports_it_at_the_first_ring(self):
         self.verdicts = {1: False}
         self.s.scan()
@@ -1347,6 +1365,25 @@ class TestLifecycle(ScannerTestCase):
             self.s.finish_preparation(focus="auto")
         self.assertEqual([c["focus"] for c in cams.prepare_calls], ["auto", "auto"])
         self.assertEqual([c["lock_auto"] for c in cams.prepare_calls], [False, True])
+
+    def test_focus_optim_resolves_to_calibrated_values_for_object_and_face(self):
+        from hardware.camera.config import OPTIMAL_FOCUS_OBJECT, OPTIMAL_FOCUS_FACE
+        # Object scan
+        with patch.object(scanner_module, "DualCameraRPISync", RecordingCameras):
+            self.s.setup_and_stream(enable_stream=False, camera_mode="rpi_sync", focus="optim", preflight=False)
+            cams = self.s.dual_cameras
+            self.s.down_endstop.is_active = True
+            self.s.wait_for_light_stable = lambda **kwargs: True
+            self.s.finish_preparation(focus="optim")
+        self.assertEqual([c["focus"] for c in cams.prepare_calls], [OPTIMAL_FOCUS_OBJECT, OPTIMAL_FOCUS_OBJECT])
+
+        # Face scan
+        self.s.state = scanner_module.ScannerState.IDLE
+        with patch.object(scanner_module, "DualCameraRPISync", RecordingCameras):
+            self.s.setup_and_stream(enable_stream=False, camera_mode="rpi_sync", focus="optim",
+                                    scan_mode=scanner_module.ScanMode.FACE, preflight=False)
+            cams_face = self.s.dual_cameras
+        self.assertEqual(cams_face.prepare_calls[0]["focus"], OPTIMAL_FOCUS_FACE)
 
     def test_photo_root_is_the_rig_folder(self):
         root = os.path.normpath(scanner_module.INPUT_IMAGES_DIR)

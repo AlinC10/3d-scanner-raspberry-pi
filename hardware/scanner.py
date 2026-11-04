@@ -16,7 +16,7 @@ from queue import Queue
 import queue
 
 from hardware.camera.config import DEFAULT_PHOTO_RESOLUTION, DEFAULT_PREVIEW_RESOLUTION, DEFAULT_QUALITY, \
-    DEFAULT_VIDEO_RESOLUTION, CAMERA_CALL_TIMEOUT_S
+    DEFAULT_VIDEO_RESOLUTION, CAMERA_CALL_TIMEOUT_S, get_optimal_focus, OPTIMAL_FOCUS_OBJECT, OPTIMAL_FOCUS_FACE
 import os
 from .base_dual_camera import BaseDualCamera
 from .dual_camera import DualCamera
@@ -1223,6 +1223,15 @@ class Scanner:
         log.warning("[Light] Thermal stabilization window timed out.")
         return False
 
+    def _resolve_focus(self, focus: Any, scan_mode: Optional[str] = None) -> Any:
+        """Resolves symbolic focus modes like 'optim' to calibrated (cam1, cam2) positions."""
+        if isinstance(focus, str) and focus.strip().lower() in ("optim", "optimal"):
+            mode = scan_mode or getattr(self, "mode", None)
+            resolved = get_optimal_focus(mode)
+            log.info("[Scanner] Resolved focus mode 'optim' to %s (mode=%s)", resolved, mode)
+            return resolved
+        return focus
+
     def setup_and_stream(
         self,
         enable_stream: bool = True,
@@ -1348,6 +1357,8 @@ class Scanner:
 
             # keep_running=True is required so the livestream can work!
             kwargs["keep_running"] = True
+            if "focus" in kwargs:
+                kwargs["focus"] = self._resolve_focus(kwargs["focus"], scan_mode=scan_mode)
 
             stream_camera_settings = {
                 "camera_mode": selected_mode,
@@ -1583,6 +1594,8 @@ class Scanner:
             camera_kwargs.pop("camera_mode", None)
             camera_kwargs.pop("mode", None)
             copy_colour_gains = bool(camera_kwargs.pop("copy_colour_gains", False))
+            if "focus" in camera_kwargs:
+                camera_kwargs["focus"] = self._resolve_focus(camera_kwargs["focus"], scan_mode=self.mode)
 
             # A cancel that landed before the first command must not start the homing at all
             if self._cancel_event.is_set(): return
@@ -1705,6 +1718,8 @@ class Scanner:
         :raises ScannerError: AE/AWB could not be locked on a camera.
         """
         camera_kwargs = dict(camera_kwargs)
+        if "focus" in camera_kwargs:
+            camera_kwargs["focus"] = self._resolve_focus(camera_kwargs["focus"], scan_mode=self.mode)
         camera_kwargs["keep_running"] = True
         # Only this call locks AE/AWB (after the light has stabilised and in position); the first prepare_scan of
         # setup_and_stream stays unlocked so the stream can adapt.
@@ -1783,6 +1798,7 @@ class Scanner:
         level_label: Optional[Union[int, str]] = None,
         check_tof: bool = True,
         turntable_end_delay: Optional[float] = TURNTABLE_END_DELAY_DEFAULT,
+        on_potential_last_level: Optional[Callable[[Union[int, str]], None]] = None,
     ) -> Optional[bool]:
         """
         Captures a 360-degree slice of photos by rotating the turntable in increments of `angle`.
@@ -1885,6 +1901,14 @@ class Scanner:
                 else:
                     unknown_count += 1
 
+                # If on the first shot of this level the ToF does not find the object (verdict is False or None),
+                # there is a high probability that this is the final level of the scan: notify to start the pod.
+                if shot == 0 and verdict is not True and on_potential_last_level is not None:
+                    try:
+                        on_potential_last_level(level_label)
+                    except Exception as e:
+                        log.warning("[Scanner] on_potential_last_level callback error at level %s: %s", level_label, e)
+
             remaining_settle = TURNTABLE_SETTLE_S - (time.monotonic() - settle_start)
             if remaining_settle > 0:
                 time.sleep(remaining_settle)
@@ -1943,6 +1967,7 @@ class Scanner:
         job_id: Optional[str] = None,
         flip: bool = False,
         flip_timeout_s: Optional[float] = None,
+        on_potential_last_level: Optional[Callable[[Union[int, str]], None]] = None,
     ):
         """
         Capture mode: Loop rotating turntable and moving z-axis while streaming.
@@ -2064,6 +2089,7 @@ class Scanner:
                     level_label=self._level,
                     check_tof=True,
                     turntable_end_delay=turntable_end_delay,
+                    on_potential_last_level=on_potential_last_level,
                 )
 
                 # Exit outer loop if cancelled during the inner loop
@@ -2133,6 +2159,11 @@ class Scanner:
                     self.z_axis_motor.disable()
                     self.turntable_motor.enable()
                     self._level += 1
+                    if on_potential_last_level is not None:
+                        try:
+                            on_potential_last_level(self._level)
+                        except Exception as e:
+                            log.warning("[Scanner] on_potential_last_level callback error on top endstop: %s", e)
                     self._capture_turntable_slice(
                         images_dir=images_dir,
                         angle=angle,
@@ -2145,6 +2176,7 @@ class Scanner:
                         level_label=self._level,
                         check_tof=False,
                         turntable_end_delay=turntable_end_delay,
+                        on_potential_last_level=on_potential_last_level,
                     )
                     self.turntable_motor.disable()
                     break
@@ -2957,6 +2989,8 @@ class Scanner:
                 # Cameras locked on the face, at this height (FACE-7b)
                 self._set_phase(ScanPhase.SCANNING, f"Face scan: focusing and locking the cameras at Z={target_z:.1f} mm")
                 lock_kwargs = dict(self._face_camera_settings)
+                if "focus" in lock_kwargs:
+                    lock_kwargs["focus"] = self._resolve_focus(lock_kwargs["focus"], scan_mode=ScanMode.FACE)
                 copy_colour_gains = bool(lock_kwargs.pop("copy_colour_gains", False))
                 roi = self._face_af_roi(best_eval)
                 if roi is not None:

@@ -499,8 +499,15 @@ class ScannerMock:
             self._set_phase(ScanPhase.SCANNING)
         shots = max(1, angle_to_steps(360, TURNTABLE_STEP_TYPE) // steps)
         self.level = 1
+        on_potential_last_level = kwargs.get("on_potential_last_level")
         while not self._cancel_event.is_set():
             self.phase_message = f"Ring {self.level}: capturing"
+            if on_potential_last_level is not None:
+                try:
+                    if not self.tof.probe_object():
+                        on_potential_last_level(self.level)
+                except Exception:
+                    pass
             for _ in range(shots):
                 if self._cancel_event.wait(_SIM_STEP_S):
                     break

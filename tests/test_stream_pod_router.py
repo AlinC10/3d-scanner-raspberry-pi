@@ -105,6 +105,8 @@ class TestStreamPodRouter(unittest.TestCase):
             order.append(("scan", kw["job_id"], [c["stream"] if "stream" in c else None for c in cloud.calls]))
             self.scanner.state = _State.PROCESSING
             self.scanner.job_id = kw["job_id"] or "20261102-160000-000000"   # scan() makes one when None
+            if kw.get("on_potential_last_level"):
+                kw["on_potential_last_level"](1)
 
         self.scanner.scan.side_effect = scan or default_scan
         t = threading.Thread(target=self.mod._orchestrate_pipeline, args=(req,))
@@ -115,22 +117,26 @@ class TestStreamPodRouter(unittest.TestCase):
 
     def test_pod_starts_with_the_scan_and_gets_capture_done(self):
         cloud = FakeCloudJob()
-        started_before_scan = threading.Event()
+        started_during_scan = threading.Event()
 
         def scan(**kw):
-            # the streaming stage was started before the photos
+            # Verify the streaming stage has NOT been started yet at the beginning of scan()
+            self.assertEqual(len(cloud.calls), 0)
+            self.assertEqual(self.scanner.state, _State.PREPARED)   # nothing changed the scan's state meanwhile
+            # Trigger potential last level callback (e.g. shot 0 ToF does not see object)
+            if kw.get("on_potential_last_level"):
+                kw["on_potential_last_level"](1)
             for _ in range(200):
                 if cloud.calls:
                     break
                 threading.Event().wait(0.01)
             if cloud.calls and cloud.calls[0].get("stream"):
-                started_before_scan.set()
-            self.assertEqual(self.scanner.state, _State.PREPARED)   # nothing changed the scan's state meanwhile
+                started_during_scan.set()
             self.scanner.state = _State.PROCESSING
             self.scanner.job_id = kw["job_id"] or "20261102-160000-000000"   # scan() makes one when None
 
         self.run_pipeline(cloud, _req(), scan)
-        self.assertTrue(started_before_scan.is_set())
+        self.assertTrue(started_during_scan.is_set())
         call = cloud.calls[0]
         self.assertEqual(call["job_id"], "20261102-150000-abcdef")
         self.assertEqual(self.scanner.scan.call_args.kwargs["job_id"], "20261102-150000-abcdef")
@@ -143,10 +149,30 @@ class TestStreamPodRouter(unittest.TestCase):
         self.assertEqual(self.scanner.state, _State.COMPLETED)
         self.mod.copy_photos.assert_called_once()
 
+    def test_pod_starts_early_with_env(self):
+        cloud = FakeCloudJob()
+        started_before_scan = threading.Event()
+
+        def scan(**kw):
+            for _ in range(200):
+                if cloud.calls:
+                    break
+                threading.Event().wait(0.01)
+            if cloud.calls and cloud.calls[0].get("stream"):
+                started_before_scan.set()
+            self.scanner.state = _State.PROCESSING
+            self.scanner.job_id = kw["job_id"] or "20261102-160000-000000"
+
+        with patch.dict(os.environ, {"SCAN_POD_EARLY": "1"}):
+            self.run_pipeline(cloud, _req(), scan)
+        self.assertTrue(started_before_scan.is_set())
+
     def test_failed_scan_cancels_the_pod(self):
         cloud = FakeCloudJob()
 
         def scan(**kw):
+            if kw.get("on_potential_last_level"):
+                kw["on_potential_last_level"](1)
             raise ValueError("camera died")
 
         self.run_pipeline(cloud, _req(), scan)
@@ -158,6 +184,8 @@ class TestStreamPodRouter(unittest.TestCase):
         cloud = FakeCloudJob()
 
         def scan(**kw):
+            if kw.get("on_potential_last_level"):
+                kw["on_potential_last_level"](1)
             self.scanner._cancel_event.set()
             self.scanner.state = _State.CANCELLED
 

@@ -121,7 +121,7 @@ When a driver gains a feature that the scanner or a router uses, declare it in `
 
 ### 4. Abstract Method Contracts
 Subclasses must implement:
-* `prepare_scan(*, lock_auto: bool = False, copy_colour_gains: bool = False, **kwargs) -> List[dict]` (`focus` kwarg: `"auto"` = sweep, an int = both lenses, a pair = (cam1, cam2))
+* `prepare_scan(*, lock_auto: bool = False, copy_colour_gains: bool = False, **kwargs) -> List[dict]` (`focus` kwarg: `"auto"` = sweep, `"optim"` = calibrated mode focus (`(100, 100)` for objects, `(120, 130)` for faces), an int = both lenses, a pair = (cam1, cam2))
 * `start_stream(bitrate: int) -> List[str]`
 * `stop_stream() -> None`
 * `capture_photo(output_prefix, output_dir, meshroom_rig, **kwargs) -> List[str]`

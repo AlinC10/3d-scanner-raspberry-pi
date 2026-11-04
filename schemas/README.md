@@ -39,7 +39,7 @@ Complete image capture and optical parameter block.
 * `photo_resolution`: `(4056, 3040)` (default, full 12MP) or `(2028, 1520)` (2x2 binned, same field of view) — nothing else is accepted.
 * `preview_resolution`: `tuple[int, int]` (default: `(960, 720)`) — size of the live MJPEG preview (even values, `160x120` up to `photo_resolution`; with the supported photo sizes the default `960x720` always fits).
 * `rotation`: `Literal[0, 90, 180, 270]` or a `(cam1, cam2)` pair (default: `0`) — rotation of the saved photos (not of the live preview).
-* `focus`: `int | "auto" | tuple | None` — VCM focus position (`0`–`1023`) or independent pair `(300, 450)`; `null` restores the saved position; `"auto"` sweeps in the in-position recalibration and keeps the best position locked for the scan.
+* `focus`: `int | "auto" | "optim" | tuple | None` (default: `"optim"`) — VCM focus position (`0`–`1023`) or independent pair `(300, 450)`; `null` restores the saved position; `"optim"` (default) uses predefined calibrated focus positions for this scan mode (`OPTIMAL_FOCUS_OBJECT` `(100, 100)` for turntable objects, `OPTIMAL_FOCUS_FACE` `(120, 130)` for faces); `"auto"` sweeps in the in-position recalibration and keeps the best position locked for the scan.
 * `settle_time`: `float` (default: `2.0`s, `0 <= settle_time <= 10`) — Time to allow sensor to meter scene before locking.
 * `copy_colour_gains`: `bool` (default: `false`) — When AE/AWB are locked, `false`: each camera keeps the white-balance gains of its own AWB (exposure time and gain are still copied from camera 1); `true`: camera 1's gains are copied to camera 2 (which gave it a colour cast). `rpi_sync` mode only.
 * `exposure_time`: `int | None` (`> 0`) — Manual exposure in microseconds. `0` is rejected (it gave black photos).
@@ -86,7 +86,7 @@ Payload for `POST /scanner/face/prepare` (`extra="forbid"`).
 * `start_z_mm`: `float` (default `180.0`, `100 <= v <= 350`, whole Z steps): where the carriage waits and the search starts.
 * `z_delay`: `float` (default `0.005`, `0.0001..0.05`) — step delay of every Z move of the face scan (FACE-19); kept for the capture.
 * `upload_r2`: `bool` (default `true`): upload and verify the pair (the bucket is cleaned by the prepare).
-* `camera_config`: `DualCameraConfig`. `focus: "auto"` = saved position during the search, autofocus on the face at the height found; an integer or a pair = that position, no autofocus. Manual `exposure_time` / `analogue_gain` / `colour_gains` are used for the photo; otherwise AE/AWB are locked on the face.
+* `camera_config`: `DualCameraConfig`. `focus: "auto"` = saved position during the search, autofocus on the face at the height found; `"optim"` = calibrated face focus `(120, 130)` without sweep; an integer or a pair = that position, no autofocus. Manual `exposure_time` / `analogue_gain` / `colour_gains` are used for the photo; otherwise AE/AWB are locked on the face.
 
 #### `FaceCaptureRequest`
 Payload for `POST /scanner/face/capture` (`extra="forbid"`; `home`, `start_z_mm`, `upload_r2`, `illumination_brightness` moved to the prepare and are refused here).

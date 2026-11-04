@@ -348,7 +348,7 @@ def _run_cloud_stage(cloud_job, options: dict) -> None:
         dest_folder.mkdir(parents=True, exist_ok=True)
         copied = copy_photos(src_photos, dest_folder, move=True)
         set_category(results_directory(), job_id, "object")
-        if copied > 0 and not src_photos.exists() and _cloud_retry.get("job_id") == job_id:
+        if isinstance(copied, (int, float)) and copied > 0 and not src_photos.exists() and _cloud_retry.get("job_id") == job_id:
             _cloud_retry["images_dir"] = str(dest_folder / "photos" / src_photos.name)
         raise
 
@@ -585,26 +585,42 @@ def _orchestrate_pipeline(req: StartRequest):
     Every state write goes through _set_state_unless_cancelled(): a CANCELLED state is never overwritten.
     """
     stream_stage: Optional[_StreamCloudStage] = None
+    stream_lock = threading.Lock()
     job_id = req.job_id
     try:
-        # 0. Streaming: the pod is requested now, it boots and takes the photos while they are taken
-        if _stream_pod_requested(req):
-            cloud_count = jobs_manager.count_active_cloud_jobs(exclude_job_id=job_id) if hasattr(jobs_manager, "count_active_cloud_jobs") else 0
-            if isinstance(cloud_count, int) and isinstance(MAX_PARALLEL_CLOUD_JOBS, int) and cloud_count >= MAX_PARALLEL_CLOUD_JOBS:
-                log.warning("Active cloud jobs limit reached (%d): streaming pod postponed until after scan.", MAX_PARALLEL_CLOUD_JOBS)
-                stream_stage = None
-            else:
+        try:
+            cloud_job = _load_cloud_job() if getattr(req.cloud, "launch_runpod", False) is True else None
+        except Exception:
+            cloud_job = None
+        job_id = job_id or (cloud_job and getattr(cloud_job, "r2", None) and hasattr(cloud_job.r2, "new_job_id") and cloud_job.r2.new_job_id()) or _new_job_id()
+
+        def _start_stream_pod(trigger_reason: str = "potential_last_level"):
+            nonlocal stream_stage
+            if not _stream_pod_requested(req):
+                return
+            with stream_lock:
+                if stream_stage is not None:
+                    return
+                cloud_count = jobs_manager.count_active_cloud_jobs(exclude_job_id=job_id) if hasattr(jobs_manager, "count_active_cloud_jobs") else 0
+                if isinstance(cloud_count, int) and isinstance(MAX_PARALLEL_CLOUD_JOBS, int) and cloud_count >= MAX_PARALLEL_CLOUD_JOBS:
+                    log.warning("Active cloud jobs limit reached (%d): streaming pod postponed until after scan.", MAX_PARALLEL_CLOUD_JOBS)
+                    return
                 try:
-                    cloud_job = _load_cloud_job()
-                    job_id = job_id or (getattr(cloud_job, "r2", None) and hasattr(cloud_job.r2, "new_job_id") and cloud_job.r2.new_job_id()) or _new_job_id()
-                    n_photos = cloud_job.stream_n_images(req.mechanical.turntable.angle, _stream_max_levels(req))
-                    stream_stage = _StreamCloudStage(cloud_job, _cloud_options(req, job_id), job_id, n_photos).start()
+                    cj = _load_cloud_job()
+                    n_photos = cj.stream_n_images(req.mechanical.turntable.angle, _stream_max_levels(req))
+                    log.info("[Cloud %s] Starting streaming pod on %s (%d photos anticipated).", job_id, trigger_reason, n_photos)
+                    stream_stage = _StreamCloudStage(cj, _cloud_options(req, job_id), job_id, n_photos).start()
+                    if hasattr(jobs_manager, "update_job"):
+                        jobs_manager.update_job(job_id, meta={"streaming": True})
                 except Exception as e:
-                    # The scan goes on; the pod is started after it, as without streaming
-                    log.warning("Could not start the pod with the scan (%s): it starts after the scan.", e)
+                    log.warning("Could not start streaming pod on %s (%s): it will run after the scan.", trigger_reason, e)
                     stream_stage = None
 
-        job_id = job_id or _new_job_id()
+        # 0. Streaming: if eager start requested (SCAN_POD_EARLY=1), launch before photos; otherwise pod launch is deferred
+        # until ToF checks shot 0 of a level and does not detect the object (potential last level).
+        if _stream_pod_requested(req) and _truthy_env("SCAN_POD_EARLY", default="0"):
+            _start_stream_pod("scan_start_early")
+
         jobs_manager.register_job(
             job_id=job_id,
             kind="object",
@@ -636,6 +652,7 @@ def _orchestrate_pipeline(req: StartRequest):
                 z_end_delay=req.mechanical.z_axis.end_delay,
                 finish_state=ScannerState.PROCESSING,  # no IDLE gap between the scan and the cloud pipeline
                 job_id=job_id,
+                on_potential_last_level=lambda lvl: _start_stream_pod(f"potential_last_level_{lvl}"),
                 # [SCAN-FLIP disabled temporarily]
                 # flip=getattr(req.mechanical, "flip", False) is True,
             )

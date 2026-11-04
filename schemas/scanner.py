@@ -68,16 +68,18 @@ class DualCameraConfig(BaseModel):
         ))
     ] = 0
 
-    focus: Annotated[int | Literal["auto"] | tuple[int, int] | None, Field(
+    focus: Annotated[int | Literal["auto", "optim"] | tuple[int, int] | None, Field(
         description=(
-            "\"auto\" (default): a sharpness sweep in front of the lit object (in the recalibration step of the "
+            "\"optim\" (default): uses predefined calibrated focus positions for this scan mode (OPTIMAL_FOCUS_OBJECT (100, 100) "
+            "for turntable objects, OPTIMAL_FOCUS_FACE (120, 130) for faces). "
+            "\"auto\": a sharpness sweep in front of the lit object (in the recalibration step of the "
             "preparation) finds the best position of each lens and keeps it locked for the scan. "
             f"An integer sets both lenses to that position ({VCM_MIN_POS}-{VCM_MAX_POS}; a value outside the range is "
             "moved to the nearest end). A pair [cam1, cam2] sets each lens separately (exactly two integers, "
             "clamped the same way). null uses the last focus positions saved on the Pi (the ones the previous "
             "scan, sweep or manual focus left)."
         )
-    )] = "auto"
+    )] = "optim"
 
     settle_time: Annotated[float, Field(ge=0.0, le=10.0, description="Time in seconds (0 to 10) to wait for auto-exposure/auto-white-balance to settle.")] = 2.0
 
@@ -147,8 +149,13 @@ class DualCameraConfig(BaseModel):
             if len(v) > 0 and all(item is None for item in v):
                 return None
             if len(v) != 2:
-                raise ValueError("focus must be \"auto\", an integer, null or a pair [cam1, cam2] of exactly two integers")
+                raise ValueError("focus must be \"auto\", \"optim\", an integer, null or a pair [cam1, cam2] of exactly two integers")
             return tuple(cls._clamp_focus_position(item) for item in v)
+        if isinstance(v, str):
+            norm = v.strip().lower()
+            if norm in ("auto", "optim", "optimal"):
+                return "optim" if norm in ("optim", "optimal") else "auto"
+            raise ValueError("focus must be \"auto\", \"optim\", an integer, null or a pair [cam1, cam2] of exactly two integers")
         return cls._clamp_focus_position(v)
 
 
