@@ -183,16 +183,22 @@ class JobManager:
                 if rec.status not in TERMINAL_STATUSES
             ]
 
-    def count_active_cloud_jobs(self) -> int:
+    def count_active_cloud_jobs(self, exclude_job_id: Optional[str] = None) -> int:
         """
         Returns the number of active cloud reconstruction jobs.
 
+        :param exclude_job_id: Optional job ID to exclude from the count (e.g. the calling job).
         :return: Count of active cloud jobs.
         """
         with self._lock:
             return sum(
                 1 for rec in self._jobs.values()
-                if rec.kind == "object" and rec.status in ("running", "processing")
+                if rec.kind == "object"
+                and (exclude_job_id is None or rec.job_id != exclude_job_id)
+                and (
+                    rec.status == "processing"
+                    or (rec.status == "running" and (rec.pod_id is not None or rec.meta.get("streaming", False)))
+                )
             )
 
     def cancel_job(self, job_id: str) -> bool:

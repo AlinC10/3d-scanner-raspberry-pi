@@ -3116,9 +3116,14 @@ class Scanner:
         if "0" not in by_camera or "1" not in by_camera:
             return {"reconstruction_error": f"The stereo pair is incomplete: {list(paths)}"}
         self._set_phase(ScanPhase.RECONSTRUCTING_FACE, "Starting the face reconstruction...")
+        target_id = self.job_id or r2.new_job_id()
+        from storage.results import copy_photos
+        dest_folder = Path(results_directory()) / target_id
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        copy_photos(Path(self.images_dir), dest_folder)   # always kept in results/
         try:
             info = reconstruct_face(
-                by_camera["0"], by_camera["1"], Path(results_directory()), self.job_id or r2.new_job_id(),
+                by_camera["0"], by_camera["1"], Path(results_directory()), target_id,
                 cancel_event=self._cancel_event,
                 on_progress=lambda message: self._set_phase(ScanPhase.RECONSTRUCTING_FACE, message),
                 title=title,
@@ -3126,9 +3131,7 @@ class Scanner:
         except Exception as e:
             log.error("[Scanner Face] 3D reconstruction failed: %s", e)
             return {"reconstruction_error": str(e)}
-        self.result_id = self.job_id
-        from storage.results import copy_photos
-        copy_photos(Path(self.images_dir), Path(results_directory()) / self.result_id)   # kept beside the model
+        self.result_id = target_id
         metrics = {k: info.get(k) for k in ("dimensions_mm", "interpupillary_distance_mm", "fit_rms_mm")}
         return {"result_id": self.result_id, "metrics": metrics}
 

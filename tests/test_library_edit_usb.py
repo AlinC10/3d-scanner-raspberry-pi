@@ -76,6 +76,24 @@ class CopyPhotosTest(unittest.TestCase):
             self.assertFalse(any("/photos/" in n for n in names))
             self.assertIsNotNone(results.get_result(root / "results", OID))   # still a valid library entry
 
+    def test_photos_can_be_moved_and_clean_up_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = root / "input_images" / "20261104-000000" / "rig"
+            for cam in ("0", "1"):
+                (images / cam).mkdir(parents=True)
+                (images / cam / "f_1000.jpg").write_bytes(b"jpg")
+            (images / "manifest.json").write_text("{}")
+            folder = make_result(root / "results", OID)
+            self.assertEqual(results.copy_photos(images, folder, move=True), 3)
+            self.assertTrue((folder / "photos" / "rig" / "0" / "f_1000.jpg").is_file())
+            self.assertTrue((folder / "photos" / "rig" / "1" / "f_1000.jpg").is_file())
+            self.assertTrue((folder / "photos" / "rig" / "manifest.json").is_file())
+            self.assertFalse(images.exists())
+            self.assertFalse((root / "input_images" / "20261104-000000").exists())
+            self.assertTrue((root / "input_images").exists())
+
+
 
 LSBLK = {"blockdevices": [
     {"name": "mmcblk0", "path": "/dev/mmcblk0", "tran": None, "type": "disk", "fstype": None,

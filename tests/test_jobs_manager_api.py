@@ -47,6 +47,16 @@ jm.register_job("done-pod-job", status="completed", pod_id="pod-dead")
 out["active_pods"] = jm.get_active_pod_ids()
 out["active_jobs"] = jm.get_active_job_ids()
 
+# Active cloud jobs counting and exclude_job_id
+jm2 = JobManager()
+jm2.register_job("j1", kind="object", status="processing", pod_id="p1")
+jm2.register_job("j2", kind="object", status="running")  # turntable only, no pod
+jm2.register_job("j3", kind="object", status="running", meta={"streaming": True})  # streaming pod
+jm2.register_job("j4", kind="face", status="running")
+out["count_active_all"] = jm2.count_active_cloud_jobs()
+out["count_active_exclude_j1"] = jm2.count_active_cloud_jobs(exclude_job_id="j1")
+out["count_active_exclude_j3"] = jm2.count_active_cloud_jobs(exclude_job_id="j3")
+
 # Cancel job
 with patch("cloud.runpod.RunPodClient") as mock_rpc:
     client_inst = MagicMock()
@@ -136,6 +146,9 @@ class TestJobsManagerAPI(unittest.TestCase):
         self.assertNotIn("done-pod-job", self.r["active_jobs"])
         self.assertEqual(self.r["cancel_job"], [True, "cancelled", True])
         self.assertTrue(self.r["cancel_pod_called"])
+        self.assertEqual(self.r["count_active_all"], 2)
+        self.assertEqual(self.r["count_active_exclude_j1"], 1)
+        self.assertEqual(self.r["count_active_exclude_j3"], 1)
 
     def test_jobs_router_endpoints(self):
         self.assertEqual(self.r["http_get_empty"], [200, []])

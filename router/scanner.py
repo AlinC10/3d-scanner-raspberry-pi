@@ -62,7 +62,7 @@ except Exception:
             def list_jobs(self): return []
             def get_active_pod_ids(self): return []
             def get_active_job_ids(self): return []
-            def count_active_cloud_jobs(self): return 0
+            def count_active_cloud_jobs(self, *a, **k): return 0
             def cancel_job(self, *a, **k): return False
         jobs_manager = _DummyJobManager()
 
@@ -333,11 +333,24 @@ def _run_cloud_stage(cloud_job, options: dict) -> None:
     the job is then remembered in `_cloud_retry` for POST /scanner/cloud/retry.
     """
     job_id = scanner.job_id
+    job_img_dir = Path("input_images") / job_id / "rig"
+    img_dir = job_img_dir if job_img_dir.is_dir() else Path(scanner.images_dir)
     _cloud_retry.clear()
-    _cloud_retry.update(job_id=job_id, options=dict(options), images_dir=str(scanner.images_dir))
-    _cloud_stage_body(cloud_job, options, job_id)
-    if scanner.state == ScannerState.COMPLETED:
-        _cloud_retry.clear()
+    _cloud_retry.update(job_id=job_id, options=dict(options), images_dir=str(img_dir))
+    try:
+        _cloud_stage_body(cloud_job, options, job_id)
+        if scanner.state == ScannerState.COMPLETED:
+            _cloud_retry.clear()
+    except Exception:
+        # Move scan input photos to results/<job_id>/ even if cloud reconstruction fails
+        dest_folder = results_directory() / job_id
+        src_photos = job_img_dir if job_img_dir.is_dir() else Path(scanner.images_dir)
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        copied = copy_photos(src_photos, dest_folder, move=True)
+        set_category(results_directory(), job_id, "object")
+        if copied > 0 and not src_photos.exists() and _cloud_retry.get("job_id") == job_id:
+            _cloud_retry["images_dir"] = str(dest_folder / "photos" / src_photos.name)
+        raise
 
 
 def _cloud_callbacks(job_id: str):
@@ -377,7 +390,13 @@ def _cloud_stage_body(cloud_job, options: dict, job_id: str) -> None:
     cancel_ev = cloud_job.AnyEvent(*events) if hasattr(cloud_job, "AnyEvent") else active_cancel
 
     job_img_dir = Path("input_images") / job_id / "rig"
-    img_dir = job_img_dir if job_img_dir.exists() else Path(scanner.images_dir)
+    retry_img_dir = Path(_cloud_retry.get("images_dir") or "") if _cloud_retry else None
+    if job_img_dir.is_dir():
+        img_dir = job_img_dir
+    elif retry_img_dir is not None and retry_img_dir.is_dir():
+        img_dir = retry_img_dir
+    else:
+        img_dir = Path(scanner.images_dir)
 
     report = cloud_job.run_cloud_job(
         input_dir=str(img_dir.parent),
@@ -416,16 +435,6 @@ def _finish_cloud_report(report: dict, job_id: str) -> None:
         jobs_manager.update_job(job_id, status="failed", phase="error", error=err)
         raise RuntimeError(err)
 
-    # 4. The result is already extracted in results/<job_id>/ (served by /library); the photos are kept beside it
-    # [SCAN-FLIP disabled temporarily]
-    # second_side = getattr(scanner, "flip_images_dir", None)
-    # flipped = getattr(scanner, "session", 0) == 1 and isinstance(second_side, str)
-    # copy_photos(Path(scanner.images_dir), results_directory() / job_id,
-    #             second_side=Path(second_side) if flipped else None)
-    job_img_dir = Path("input_images") / job_id / "rig"
-    src_photos = job_img_dir if job_img_dir.is_dir() else Path(scanner.images_dir)
-    copy_photos(src_photos, results_directory() / job_id)
-    set_category(results_directory(), job_id, "object")
     cost = report.get("cost_estimate")
     jobs_manager.update_job(job_id, status="completed", phase="done", result_id=job_id, cost_estimate=cost)
     if getattr(scanner, "job_id", None) == job_id:
@@ -433,6 +442,12 @@ def _finish_cloud_report(report: dict, job_id: str) -> None:
         if _set_state_unless_cancelled(ScannerState.COMPLETED):
             log.info("Full pipeline completed: model in %s (cost estimate %s).",
                      report.get("results_dir"), cost)
+    dest_folder = results_directory() / job_id
+    job_img_dir = Path("input_images") / job_id / "rig"
+    src_photos = job_img_dir if job_img_dir.is_dir() else Path(scanner.images_dir)
+    dest_folder.mkdir(parents=True, exist_ok=True)
+    copy_photos(src_photos, dest_folder, move=True)
+    set_category(results_directory(), job_id, "object")
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -443,12 +458,12 @@ def _stream_pod_requested(req: StartRequest) -> bool:
     """
     The pod starts with the scan (streaming) when RunPod is requested, the scan is not a flip scan (the pod would
     wait, billed, up to FLIP_TIMEOUT_S for the turn-over) and cloud.start_pod_with_scan says so (null: env
-    SCAN_CLOUD_STREAM, off by default).
+    SCAN_CLOUD_STREAM, defaults to on).
     """
     if getattr(req.cloud, "launch_runpod", False) is not True or getattr(req.mechanical, "flip", False) is True:
         return False
     wanted = getattr(req.cloud, "start_pod_with_scan", None)
-    return _truthy_env("SCAN_CLOUD_STREAM") if wanted is None else bool(wanted)
+    return _truthy_env("SCAN_CLOUD_STREAM", default="1") if wanted is None else bool(wanted)
 
 
 def _stream_max_levels(req: StartRequest) -> int:
@@ -574,7 +589,7 @@ def _orchestrate_pipeline(req: StartRequest):
     try:
         # 0. Streaming: the pod is requested now, it boots and takes the photos while they are taken
         if _stream_pod_requested(req):
-            cloud_count = jobs_manager.count_active_cloud_jobs() if hasattr(jobs_manager, "count_active_cloud_jobs") else 0
+            cloud_count = jobs_manager.count_active_cloud_jobs(exclude_job_id=job_id) if hasattr(jobs_manager, "count_active_cloud_jobs") else 0
             if isinstance(cloud_count, int) and isinstance(MAX_PARALLEL_CLOUD_JOBS, int) and cloud_count >= MAX_PARALLEL_CLOUD_JOBS:
                 log.warning("Active cloud jobs limit reached (%d): streaming pod postponed until after scan.", MAX_PARALLEL_CLOUD_JOBS)
                 stream_stage = None
@@ -595,7 +610,11 @@ def _orchestrate_pipeline(req: StartRequest):
             kind="object",
             status="running",
             phase="scanning",
-            meta={"title": getattr(req.cloud, "title", None), "launch_runpod": getattr(req.cloud, "launch_runpod", True)},
+            meta={
+                "title": getattr(req.cloud, "title", None),
+                "launch_runpod": getattr(req.cloud, "launch_runpod", True),
+                "streaming": stream_stage is not None,
+            },
         )
 
         # 1. Mechanical Scan (scan() returns once the photos are also verified in the bucket)
@@ -666,6 +685,12 @@ def _orchestrate_pipeline(req: StartRequest):
 
         # 2. RunPod is optional: without it the scan is done once the photos are in the bucket
         if getattr(req.cloud, "launch_runpod", False) is not True:
+            job_img_dir = Path("input_images") / job_id / "rig"
+            src_photos = job_img_dir if job_img_dir.is_dir() else Path(scanner.images_dir)
+            dest_folder = results_directory() / job_id
+            dest_folder.mkdir(parents=True, exist_ok=True)
+            copy_photos(src_photos, dest_folder, move=True)
+            set_category(results_directory(), job_id, "object")
             jobs_manager.update_job(job_id, status="completed", phase="done")
             if _set_state_unless_cancelled(ScannerState.COMPLETED):
                 log.info("Scan completed: photos verified in the bucket (RunPod not requested).")
@@ -696,9 +721,11 @@ def _orchestrate_pipeline(req: StartRequest):
 
         options = _cloud_options(req, scanner.job_id)
         if stream_stage is not None:
+            job_img_dir = Path("input_images") / job_id / "rig"
+            img_dir = job_img_dir if job_img_dir.is_dir() else Path(scanner.images_dir)
             _cloud_retry.clear()
             _cloud_retry.update(job_id=stream_stage.job_id, options=dict(options),
-                                images_dir=str(scanner.images_dir))
+                                images_dir=str(img_dir))
             scanner.cloud_message = None
             scanner.phase_message = "3D reconstruction started in the cloud (server already running)"
             stream_stage.wait()
@@ -715,7 +742,7 @@ def _orchestrate_pipeline(req: StartRequest):
         else:
             if hasattr(jobs_manager, "count_active_cloud_jobs"):
                 while True:
-                    cloud_count = jobs_manager.count_active_cloud_jobs()
+                    cloud_count = jobs_manager.count_active_cloud_jobs(exclude_job_id=job_id)
                     if not (isinstance(cloud_count, int) and isinstance(MAX_PARALLEL_CLOUD_JOBS, int) and cloud_count >= MAX_PARALLEL_CLOUD_JOBS):
                         break
                     if _cancel_requested() or scanner.state == ScannerState.CANCELLED:

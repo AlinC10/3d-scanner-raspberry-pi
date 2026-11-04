@@ -224,12 +224,14 @@ def _write_object_json(folder: Path, obj: dict) -> None:
 PHOTOS_DIR = "photos"
 
 
-def copy_photos(images_dir: Path, folder: Path, second_side: Optional[Path] = None) -> int:
+def copy_photos(images_dir: Path, folder: Path, second_side: Optional[Path] = None, move: bool = False) -> int:
     """
-    Copies the scan photos (``rig/0|1/*.jpg`` and ``manifest.json``) into ``folder/photos/rig/``: the layout Turntable
-    Studio reads, so the folder can be reconstructed again. ``second_side`` (the turned-over object of a flip scan,
-    ``input_images/session_1/rig``) goes to ``folder/photos/session_1/rig/``. Returns the number of files copied; never
-    raises (the model is already saved: a failure is logged).
+    Copies (or moves when ``move=True``) the scan photos (``rig/0|1/*.jpg`` and ``manifest.json``) into
+    ``folder/photos/rig/``: the layout Turntable Studio reads, so the folder can be reconstructed again.
+    ``second_side`` (the turned-over object of a flip scan, ``input_images/session_1/rig``) goes to
+    ``folder/photos/session_1/rig/``. When ``move=True``, source files are removed after copying and empty
+    source directories under ``input_images/`` are cleaned up. Returns the number of files copied or moved;
+    never raises (the model is already saved: a failure is logged).
     """
     import shutil
     sources = [(Path(images_dir), Path(folder) / PHOTOS_DIR / Path(images_dir).name)]
@@ -246,6 +248,20 @@ def copy_photos(images_dir: Path, folder: Path, second_side: Optional[Path] = No
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
                 copied += 1
+                if move and ("input_images" in path.parts or "input_images" in path.resolve().parts):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+            if move and source.is_dir() and ("input_images" in source.parts or "input_images" in source.resolve().parts):
+                shutil.rmtree(source, ignore_errors=True)
+                parent = source.parent
+                if parent.name not in ("", "input_images", ".", "..") and parent.parent.name == "input_images":
+                    try:
+                        if not any(parent.iterdir()):
+                            parent.rmdir()
+                    except OSError:
+                        pass
         except OSError as e:
             log.warning("Could not copy the photos of %s into %s: %s", source, dest, e)
     return copied
