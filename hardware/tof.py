@@ -8,8 +8,8 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # Default SPAD array window: 8x4 (8 columns horizontal ~20 deg FOV, 4 rows vertical ~15 deg FOV)
-# with center downward (196 = Row 4, Col 8 on the SPAD array, which angles the cone downwards
-# physically due to optical lens inversion per ST AN5191).
+# with center downward (58 = Row 13, Col 8 on the SPAD array, which angles the cone downwards
+# to the very bottom boundary rows 12-15 per ST UM2555 section 4.1 scene perspective).
 def _parse_roi_size(env_val: Optional[str], default: tuple[int, int] = (8, 4)) -> tuple[int, int]:
     if not env_val:
         return default
@@ -22,7 +22,7 @@ def _parse_roi_size(env_val: Optional[str], default: tuple[int, int] = (8, 4)) -
     return default
 
 DEFAULT_ROI_SIZE: tuple[int, int] = _parse_roi_size(os.environ.get("TOF_ROI_SIZE", "8,4"))
-DEFAULT_ROI_CENTER: int = int(os.environ.get("TOF_ROI_CENTER", "196"))
+DEFAULT_ROI_CENTER: int = int(os.environ.get("TOF_ROI_CENTER", "58"))
 
 # The Pi-only libraries are imported defensively: a missing library (or Blinka refusing to run on a
 # non-Pi platform) must disable the sensor, not make `import hardware.scanner` fail.
@@ -44,9 +44,10 @@ class ToFSensor:
         :param timing_budget_ms: One of 15 (short mode only), 20, 33, 50, 100, 200, 500.
         :param distance_mode: 1 = short (up to ~136 cm), 2 = long (up to ~360 cm).
         :param roi_size: (x, y) SPAD window, 4..16. Smaller means a narrower cone and less signal.
-        :param roi_center: SPAD index of the window centre. Default 196 (Row 4, Col 8 on SPAD array,
-            which angles the cone downwards by ~5-6 deg to detect the top of small objects cleanly,
-            accounting for optical lens inversion per ST AN5191; optical center is 199, inverted PCB mounting is 61).
+        :param roi_center: SPAD index of the window centre. Default 58 (Row 13, Col 8 on SPAD array,
+            which angles the cone downwards by ~10 deg to the very bottom boundary rows 12-15 to detect
+            the top of small objects cleanly, matching ST UM2555 section 4.1 scene perspective where
+            Rows 8-15 map to the lower scene; optical center is 199, while 196 shifts the cone upwards).
             Configurable via TOF_ROI_CENTER environment variable.
         """
         self.available = False

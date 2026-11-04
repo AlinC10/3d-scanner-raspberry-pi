@@ -19,13 +19,13 @@ The VL53L1X communicates via **I2C** (`SDA` and `SCL`, address `0x29`). The driv
 | :--- | :--- | :--- |
 | `distance_mode` | `1` (short) | Best ambient-light immunity, ranges up to ~136 cm. The rig measures 25-65 cm. |
 | `roi_xy` | `(8, 4)` | Wide horizontal receiving window (8 columns, ~20° FOV) with narrow vertical slice (4 rows, ~15° FOV). Gives wide lateral coverage across the turntable without vertical spillover above or below the object. |
-| `roi_center` | `196` | Downward-shifted center on the 16x16 SPAD array (Row 4, Col 8). Due to optical micro-lens inversion (ST AN5191), target photons from physically lower in the scene project to higher SPAD rows (0-7). Shifting from optical center (199, Row 7) to 196 (Row 4) tilts the cone ~5-6° downwards towards the object's top surface, preventing premature scan termination on short pieces. Configurable via `TOF_ROI_CENTER` in `.env` (use `61` if sensor is mounted inverted on PCB, `199` for optical center). |
+| `roi_center` | `58` | Downward-shifted center on the 16x16 SPAD array (Row 13, Col 8). Per ST UM2555 section 4.1 (which defines the SPAD array perspective looking toward the target scene), Rows 0-7 map to the upper scene and Rows 8-15 map to the lower scene. Shifting from optical center (199, Row 7) to 58 (Row 13) tilts the cone ~10° downwards towards the turntable and object top surface, occupying the very bottom boundary rows 12-15. Configurable via `TOF_ROI_CENTER` in `.env` (use `196` to tilt upwards, `199` for optical center). |
 | `timing_budget` | `200` ms | Lower jitter. Not free: a read waits for up to two budgets (about 0.4 s, see section 2) and a stop makes up to two reads, see section 4. |
 
 All four are constructor parameters of `ToFSensor`. They are applied in a fixed order: `distance_mode` → `timing_budget` → `roi_xy` → `roi_center` → `start_ranging()`.
 - The distance mode selects the table of valid timing budgets, so it must come first.
 - **Setting `roi_xy` resets the ROI centre** to a corner SPAD whenever both sides are ≤ 10, so `roi_center` must be set *after* it. Otherwise the 4x4 window sits in a corner of the array and the sensor looks off-axis. The values read back from the sensor are logged at start-up.
-- `TOF_ROI_CENTER` environment variable allows overriding `roi_center` without code changes (e.g. `TOF_ROI_CENTER=196` default, `TOF_ROI_CENTER=61` for upside-down sensor mounting).
+- `TOF_ROI_CENTER` environment variable allows overriding `roi_center` without code changes (e.g. `TOF_ROI_CENTER=58` default, `TOF_ROI_CENTER=199` for optical center, `TOF_ROI_CENTER=196` to tilt upwards).
 
 ### The Field of View (FOV) Cone
 The receiving cone is set by the ROI size. The nominal figure for 4x4 is about **15°** (about 27° at 16x16 and 20° at 8x8). These angles come from ST's documentation and are **to be confirmed on the rig** (see "Calibration").

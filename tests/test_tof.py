@@ -97,12 +97,12 @@ class ToFSensorTests(unittest.TestCase):
         self.assertLess(fake.events.index(("set", "roi_center", tof._settings[2])), fake.events.index(("start_ranging",)))
         self.assertIn(("set", "roi_xy", (8, 4)), fake.events)
         self.assertIn(("set", "timing_budget", 200), fake.events)
-        self.assertEqual(tof._settings[2], 196)  # downward center by default
+        self.assertEqual(tof._settings[2], 58)  # downward center by default
 
     def test_roi_center_respects_env_override(self):
-        with patch.dict(os.environ, {"TOF_ROI_CENTER": "61"}):
+        with patch.dict(os.environ, {"TOF_ROI_CENTER": "199"}):
             tof, fake = make_sensor()
-            self.assertEqual(tof._settings[2], 61)
+            self.assertEqual(tof._settings[2], 199)
 
     def test_roi_size_respects_env_override(self):
         with patch.dict(os.environ, {"TOF_ROI_SIZE": "4,4"}):
