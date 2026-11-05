@@ -1417,6 +1417,7 @@ class Scanner:
         self.cloud_message = None
         self.face_result = None
         self.result_id = None
+        self.job_id = None
 
     def _lights_on_unless_cancelled(self) -> bool:
         """

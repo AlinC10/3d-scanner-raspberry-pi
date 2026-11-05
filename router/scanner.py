@@ -980,7 +980,7 @@ def face_capture(req: FaceCaptureRequest, background_tasks: BackgroundTasks):
             raise
 
     params = req.model_dump()
-    face_job_id = getattr(scanner, "job_id", None) or _new_job_id()
+    face_job_id = _new_job_id()
     scanner.job_id = face_job_id
     with _start_lock:
         if _start_state["pending"]:

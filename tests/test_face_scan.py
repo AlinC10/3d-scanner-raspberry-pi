@@ -770,6 +770,12 @@ class TestFaceFast(unittest.TestCase):
         self._run(fixed, strategy="none")
         self.assertNotIn("autofocus_hint", fixed.cams.prepare_scan.call_args.kwargs)
 
+    def test_reset_status_clears_job_id(self):
+        scanner = self._scanner()
+        scanner.job_id = "20261105-111600-abcdef"
+        scanner._reset_status()
+        self.assertIsNone(scanner.job_id)
+
 
 ROUTER_PROGRAM = r"""
 import json, os, sys, time
