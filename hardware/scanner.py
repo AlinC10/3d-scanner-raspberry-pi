@@ -3153,8 +3153,6 @@ class Scanner:
         target_id = self.job_id or r2.new_job_id()
         from storage.results import copy_photos
         dest_folder = Path(results_directory()) / target_id
-        dest_folder.mkdir(parents=True, exist_ok=True)
-        copy_photos(Path(self.images_dir), dest_folder)   # always kept in results/
         try:
             info = reconstruct_face(
                 by_camera["0"], by_camera["1"], Path(results_directory()), target_id,
@@ -3162,8 +3160,14 @@ class Scanner:
                 on_progress=lambda message: self._set_phase(ScanPhase.RECONSTRUCTING_FACE, message),
                 title=title,
             )
+            copy_photos(Path(self.images_dir), dest_folder, move=True)
         except Exception as e:
             log.error("[Scanner Face] 3D reconstruction failed: %s", e)
+            try:
+                dest_folder.mkdir(parents=True, exist_ok=True)
+                copy_photos(Path(self.images_dir), dest_folder, move=True)
+            except Exception as copy_err:
+                log.warning("Could not preserve face photos after reconstruction error: %s", copy_err)
             return {"reconstruction_error": str(e)}
         self.result_id = target_id
         metrics = {k: info.get(k) for k in ("dimensions_mm", "interpupillary_distance_mm", "fit_rms_mm")}

@@ -934,3 +934,20 @@ class TestFaceReconstruction(unittest.TestCase):
         with self.assertRaises(self.fr.FaceReconstructionError) as ctx:
             self.run_it("hang", cancel_event=cancel)
         self.assertIn("cancelled", str(ctx.exception))
+
+    def test_existing_completed_folder_raises_error(self):
+        folder = self.results / "20261030-101500-abcdef"
+        folder.mkdir(parents=True)
+        (folder / "status.json").write_text(json.dumps({"state": "ok"}), encoding="utf-8")
+        with self.assertRaises(self.fr.FaceReconstructionError) as ctx:
+            self.run_it("ok")
+        self.assertIn("already exists", str(ctx.exception))
+
+    def test_existing_incomplete_folder_is_cleaned_and_succeeds(self):
+        folder = self.results / "20261030-101500-abcdef"
+        folder.mkdir(parents=True)
+        (folder / "photos").mkdir()
+        (folder / "photos" / "test.jpg").write_text("photo")
+        info = self.run_it("ok")
+        self.assertEqual(json.loads((folder / "status.json").read_text())["state"], "ok")
+        self.assertTrue((folder / "glb" / "low_model.glb").is_file())

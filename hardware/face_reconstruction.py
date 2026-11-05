@@ -73,7 +73,17 @@ def reconstruct_face(
     final_dir = results_root / result_id
     work_dir = results_root / f".{result_id}.partial"
     if final_dir.exists():
-        raise FaceReconstructionError(f"The result folder {final_dir} already exists.")
+        status_file = final_dir / "status.json"
+        is_completed = False
+        if status_file.is_file():
+            try:
+                is_completed = json.loads(status_file.read_text(encoding="utf-8")).get("state") == "ok"
+            except Exception:
+                pass
+        if is_completed:
+            raise FaceReconstructionError(f"The result folder {final_dir} already exists.")
+        # If final_dir was an incomplete/failed directory, clean it up so this run can complete
+        shutil.rmtree(final_dir, ignore_errors=True)
     shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True)
 
